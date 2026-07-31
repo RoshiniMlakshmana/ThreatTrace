@@ -1,0 +1,59 @@
+evidence/evtx/*
+!evidence/evtx/.gitkeep
+
+output/hayabusa/*
+!output/hayabusa/.gitkeep
+
+tools/hayabusa/*.zip
+
+__pycache__/
+*.pyc
+
+# Local secrets and configuration
+.env
+.env.*
+!.env.example
+.mcp.json
+.claude/settings.local.json
+
+# Private telemetry and generated results
+*.evtx
+*.csv
+evidence/evtx/*
+!evidence/evtx/.gitkeep
+output/hayabusa/*
+!output/hayabusa/.gitkeep
+
+# Downloaded binaries and archives
+*.exe
+*.zip
+tools/hayabusa/
+
+# Third-party repositories
+references/atomic-red-team/
+references/hayabusa-sample-evtx/
+
+# Python-generated files
+__pycache__/
+*.pyc
+
+# Logs
+*.log
+logs/
+
+# Python virtual environments
+.venv/
+venv/
+env/
+
+# Python tool caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# All generated content anywhere under output/, keep placeholders
+output/**
+!output/**/
+!output/**/.gitkeep
