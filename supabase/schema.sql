@@ -47,7 +47,12 @@ comment on column investigations.confidence is
 -- ----------------------------------------------------------------------------
 -- Individual pieces of telemetry or observations collected during an
 -- investigation, and whether each one supports or contradicts the working
--- hypothesis.
+-- hypothesis. Includes a normalized evidence envelope (source_type through
+-- provenance) so records from different origins (analyst entry, Hayabusa,
+-- threat intelligence, query results, Threat Hunter findings) share a common,
+-- queryable shape without displacing the original free-form `details`
+-- payload. All envelope fields are nullable so existing rows and existing
+-- insert paths remain fully compatible.
 -- ============================================================================
 create table if not exists evidence (
     id uuid primary key default gen_random_uuid(),
@@ -58,7 +63,35 @@ create table if not exists evidence (
     observed_at timestamptz,
     details jsonb,
     supports_hypothesis boolean,
-    created_at timestamptz not null default now()
+    created_at timestamptz not null default now(),
+
+    -- Normalized evidence envelope (nullable; populated incrementally).
+    source_type text
+        check (source_type is null or source_type in (
+            'analyst', 'hayabusa', 'threat_intelligence', 'query_result',
+            'threat_hunter', 'system', 'unknown'
+        )),
+    source_identifier text,
+    source_location text,
+    ingested_at timestamptz default now(),
+    assertion_type text
+        check (assertion_type is null or assertion_type in (
+            'observation', 'derived_fact', 'hypothesis', 'interpretation',
+            'recommendation', 'unknown'
+        )),
+    trust_level text
+        check (trust_level is null or trust_level in ('high', 'medium', 'low', 'unknown')),
+    confidence text
+        check (confidence is null or confidence in ('high', 'medium', 'low', 'unknown')),
+    event_id text,
+    host_name text,
+    user_name text,
+    process_name text,
+    command_line text,
+    ip_address text,
+    file_hash text,
+    provenance jsonb default '{}'::jsonb
+        check (provenance is null or jsonb_typeof(provenance) = 'object')
 );
 
 comment on table evidence is
@@ -67,6 +100,24 @@ comment on column evidence.supports_hypothesis is
     'true = supports the malicious/primary hypothesis, false = contradicts it, null = undetermined/neutral.';
 comment on column evidence.details is
     'Raw or structured evidence payload (e.g. log fields, query results) stored as JSONB.';
+comment on column evidence.observed_at is
+    'When the underlying activity actually occurred, per the source.';
+comment on column evidence.source_type is
+    'Category that produced this evidence record.';
+comment on column evidence.source_identifier is
+    'Identifier of the specific report, file, event, query, or analyst record this evidence came from.';
+comment on column evidence.source_location is
+    'Original project-relative file or external reference for this evidence.';
+comment on column evidence.ingested_at is
+    'When ThreatTrace received the evidence, as distinct from when the activity occurred.';
+comment on column evidence.assertion_type is
+    'Separates observations from interpretations and recommendations.';
+comment on column evidence.trust_level is
+    'Confidence in the source that produced this evidence.';
+comment on column evidence.confidence is
+    'Confidence in this individual evidence record.';
+comment on column evidence.provenance is
+    'Where and how this evidence record was produced.';
 
 -- ============================================================================
 -- Table: attack_mappings
