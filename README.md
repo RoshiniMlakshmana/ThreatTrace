@@ -133,9 +133,25 @@ ThreatTrace ships a walkthrough built around **PurpleShadow**, an entirely ficti
 
 ## Local Setup
 
-> Dependency installation instructions are not finalized because ThreatTrace does not currently include a Python dependency manifest. A portable dependency and installation process will be added during the remaining foundation work.
+ThreatTrace requires Python 3.10 or later.
 
-1. Clone the repository and install the Python dependencies used by the Hayabusa MCP server (`mcp/hayabusa_server.py`, built on `fastmcp`).
+### Windows PowerShell
+
+```powershell
+py -m pip install -r requirements.txt
+```
+
+### macOS or Linux
+
+```bash
+python3 -m pip install -r requirements.txt
+```
+
+`requirements.txt` contains exactly one dependency, `mcp>=1.28,<2`, which is required by `mcp/hayabusa_server.py`. That file's other imports — `os`, `subprocess`, `datetime`, and `pathlib` — are Python standard library and need no installation. `requirements.txt` does not install Hayabusa itself; the Hayabusa binary must still be placed manually (see below).
+
+**Portability note:** Windows commonly uses the `py` launcher, while macOS and Linux commonly use `python3`. `.mcp.example.json`'s Hayabusa entry (`"command": "python"`) may need to be adjusted to whichever command actually resolves on your system — `py`, `python3`, or `python` — after you copy it to `.mcp.json`.
+
+1. Clone the repository and install the Python dependencies listed in `requirements.txt` (used by the Hayabusa MCP server, `mcp/hayabusa_server.py`).
 2. Place the Hayabusa binary and rule files under `tools/hayabusa/` (not committed — see `.gitignore`).
 3. Copy `.mcp.example.json` to `.mcp.json` and fill in your own Supabase project reference and access token. **Never commit `.mcp.json`.**
 4. Apply `supabase/schema.sql` to your own Supabase project manually (via the Supabase CLI or dashboard) — it is not applied automatically.
