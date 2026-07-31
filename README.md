@@ -4,6 +4,24 @@ ThreatTrace is an AI-powered Purple Team investigation system that traces threat
 
 ThreatTrace is built for **authorized lab environments only**. It does not run attacks, does not touch production or third-party systems, and never takes an action that changes a system state without a human approving it first.
 
+For the current architecture, approval boundary, filesystem boundaries, security limitations, and planned improvements, see [docs/architecture.md](docs/architecture.md).
+
+## Project Structure
+
+```text
+ThreatTrace/
+├── .claude/
+│   ├── agents/          # Purple Team coordinator and Atomic mapper
+│   ├── commands/        # Investigation and Purple Team commands
+│   ├── hooks/           # Post-write validation
+│   └── skills/          # Detection-engineering guidance
+├── docs/                # Architecture and demonstration documentation
+├── evidence/evtx/       # Local raw EVTX evidence; excluded from Git
+├── mcp/                 # Hayabusa MCP server
+├── output/hayabusa/     # Generated analysis results; excluded from Git
+└── supabase/            # Investigation database schema
+```
+
 ## Investigation Entry Points
 
 ThreatTrace supports three ways into an investigation, each led by a different role:
@@ -42,6 +60,17 @@ All writes to Supabase (opening a case, adding evidence, updating status) requir
 
 ThreatTrace integrates [Hayabusa](https://github.com/Yamato-Security/hayabusa) as a local MCP server (`mcp/hayabusa_server.py`) for offline Windows Event Log (EVTX) triage — timeline generation, log metrics, and event-ID metrics. It only ever reads `.evtx` files placed under `evidence/evtx/`, validates every input path against traversal and symlink tricks, and requires an explicit authorization phrase before running. It never reaches outside the local evidence directory and never runs automatically as part of any other workflow.
 
+### Hayabusa Plan and Execute Boundary
+
+- `hayabusa_status`, `list_evtx_files`, and `plan_evtx_analysis` are read-only or planning tools — none of them execute Hayabusa.
+- `run_evtx_analysis` is the only Hayabusa tool that executes a process and writes a CSV result.
+- Execution currently requires the configured authorization phrase.
+- EVTX input paths must remain under `evidence/evtx/`.
+- CSV output paths must remain under `output/hayabusa/`.
+- Analysis types are selected from a fixed allowlist, not arbitrary input.
+- Existing output files cannot be overwritten.
+- The authorization phrase is only an initial safeguard — it is not the final human-approval workflow.
+
 ## MITRE ATT&CK Mapping
 
 Every supported finding — from Threat Hunter evidence, Red Team intelligence, or Blue Team telemetry — is mapped to MITRE ATT&CK technique IDs, stored with a rationale, and labeled provisional or supported depending on how strong the evidence is. Mappings are never invented; they are only ever tied to a technique the evidence actually justifies.
@@ -52,15 +81,17 @@ The `atomic-mapper` agent matches evidence-supported ATT&CK techniques against a
 
 ## Human Approval and Safety Controls
 
-- Operates only in an explicitly authorized lab environment.
-- Never targets public or third-party systems.
-- Never performs destructive actions.
-- Never executes attack simulations automatically — proposals only.
-- Never modifies or deploys detection rules automatically.
-- Never performs automatic containment or response actions.
-- Requires explicit confirmation before any action that changes a system or writes to Supabase.
+- Operates only in an explicitly authorized lab environment; never targets public or third-party systems; never performs destructive actions.
+- **Read-only investigation and planning** (evidence review, hypothesis-forming, ATT&CK mapping, Hayabusa/Atomic planning tools) may proceed without changing any system.
+- **Supabase database writes** (opening a case, adding evidence, updating status) require explicit human confirmation before they happen.
+- **Red Team or Atomic test execution** requires explicit human approval and is never triggered automatically.
+- **Detection rules** must not be modified or deployed automatically, under any circumstance.
+- **Other system-changing operations** (e.g. Hayabusa execution) require explicit human confirmation, not just a planning step.
+- Approval does not automatically mean execution — each remains a distinct, separately confirmed step.
 - Never exposes credentials, API keys, or other sensitive information.
 - Clearly separates confirmed evidence from assumptions throughout every workflow.
+
+The following controls are **planned but not yet implemented**: verified approval IDs, evidence hashes, action hashes, approval expiry, reviewer identity validation, and tamper-evident audit history. Today's authorization phrase (see Hayabusa Plan and Execute Boundary, above) is an initial safeguard, not a substitute for these.
 
 ## Available Slash Commands
 
@@ -89,6 +120,8 @@ ThreatTrace ships a walkthrough built around **PurpleShadow**, an entirely ficti
 - Atomic Red Team mapping is limited to whatever catalog content is locally available under `references/`.
 - There is no automated response, containment, or detection-rule deployment by design — every risky step is a human decision.
 - Confidence and severity scoring are qualitative (low/medium/high), not statistically derived.
+- **Detection Engineering** is currently guidance provided through the `detection-engineering` skill, not a complete, dedicated workflow command.
+- **Dedicated validation and retest orchestration** is not yet implemented as its own command — today it is covered only generically (e.g. via `/update-case`).
 
 ## Future Enterprise Improvements
 
@@ -99,6 +132,8 @@ ThreatTrace ships a walkthrough built around **PurpleShadow**, an entirely ficti
 - Role-based access control aligned to Red Team / Blue Team / SOC analyst boundaries.
 
 ## Local Setup
+
+> Dependency installation instructions are not finalized because ThreatTrace does not currently include a Python dependency manifest. A portable dependency and installation process will be added during the remaining foundation work.
 
 1. Clone the repository and install the Python dependencies used by the Hayabusa MCP server (`mcp/hayabusa_server.py`, built on `fastmcp`).
 2. Place the Hayabusa binary and rule files under `tools/hayabusa/` (not committed — see `.gitignore`).
