@@ -2023,6 +2023,313 @@ def test_264_module_uses_only_stdlib_and_approval_request():
 
 
 # ---------------------------------------------------------------------------
+# Trim-equality correction: persisted current-record lifecycle identities
+# and rejection_reason must already be stored in their outer-trimmed form
+# -- a padded stored value is rejected, never silently trimmed and
+# accepted. This mirrors the approvals schema's own
+# chk_approvals_*_nonblank / chk_approvals_lifecycle_rejected CHECK
+# constraints, which require `column = btrim(column)`.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    "padded_value",
+    [
+        " Security Reviewer",
+        "Security Reviewer ",
+        " Security Reviewer ",
+        "\tSecurity Reviewer\t",
+        "\nSecurity Reviewer\n",
+    ],
+)
+def test_265_approved_by_outer_whitespace_rejected(padded_value):
+    record = _approved_record(approved_by=padded_value)
+
+    with pytest.raises(ApprovalTransitionError):
+        validate_approval_transition(record, _consume_request())
+
+
+@pytest.mark.parametrize(
+    "padded_value",
+    [
+        " Security Reviewer",
+        "Security Reviewer ",
+        " Security Reviewer ",
+        "\tSecurity Reviewer\t",
+        "\nSecurity Reviewer\n",
+    ],
+)
+def test_266_rejected_by_outer_whitespace_rejected(padded_value):
+    record = _rejected_record(rejected_by=padded_value)
+
+    with pytest.raises(ApprovalTransitionError):
+        validate_approval_transition(record, _approve_request())
+
+
+@pytest.mark.parametrize(
+    "padded_value",
+    [
+        " Update Case Operator",
+        "Update Case Operator ",
+        " Update Case Operator ",
+        "\tUpdate Case Operator\t",
+        "\nUpdate Case Operator\n",
+    ],
+)
+def test_267_consumed_by_outer_whitespace_rejected(padded_value):
+    record = _consumed_record(consumed_by=padded_value)
+
+    with pytest.raises(ApprovalTransitionError):
+        validate_approval_transition(record, _approve_request())
+
+
+@pytest.mark.parametrize(
+    "padded_value",
+    [
+        " Additional evidence is still required.",
+        "Additional evidence is still required. ",
+        " Additional evidence is still required. ",
+        "\tAdditional evidence is still required.\t",
+        "\nAdditional evidence is still required.\n",
+    ],
+)
+def test_268_rejection_reason_outer_whitespace_rejected(padded_value):
+    record = _rejected_record(rejection_reason=padded_value)
+
+    with pytest.raises(ApprovalTransitionError):
+        validate_approval_transition(record, _approve_request())
+
+
+def test_269_consumed_record_carried_forward_approved_by_outer_whitespace_rejected():
+    record = _consumed_record(approved_by=" Security Reviewer ")
+
+    with pytest.raises(ApprovalTransitionError):
+        validate_approval_transition(record, _approve_request())
+
+
+def test_270_exact_trim_approved_by_accepted():
+    record = _approved_record(approved_by="Jordan Reviewer")
+
+    result = validate_approval_transition(record, _consume_request())
+    assert result["to_status"] == "consumed"
+
+
+def test_271_exact_trim_rejected_by_accepted():
+    record = _rejected_record(rejected_by="Jordan Reviewer")
+
+    with pytest.raises(ApprovalTransitionError):
+        # rejected -> approve is itself an invalid transition; this proves
+        # the current_record was accepted (parsed past lifecycle checks)
+        # and the failure is purely the state-machine rule, not a
+        # trim-related rejection.
+        validate_approval_transition(record, _approve_request())
+
+
+def test_272_exact_trim_consumed_by_accepted():
+    record = _consumed_record(consumed_by="Update Case Operator")
+
+    # A well-formed consumed record is accepted by current-record
+    # validation; consumed -> consume is rejected only by the state
+    # machine (terminal state), never by a trim-related error.
+    with pytest.raises(ApprovalTransitionError) as exc_info:
+        validate_approval_transition(record, _consume_request())
+    assert "trimmed" not in str(exc_info.value)
+
+
+def test_273_exact_trim_rejection_reason_accepted():
+    record = _rejected_record(rejection_reason="Additional evidence is still required.")
+
+    with pytest.raises(ApprovalTransitionError) as exc_info:
+        validate_approval_transition(record, _approve_request())
+    assert "trimmed" not in str(exc_info.value)
+
+
+def test_274_internal_spaces_in_identities_preserved():
+    record = _approved_record(approved_by="Security Review Team")
+
+    result = validate_approval_transition(record, _consume_request())
+    assert result["to_status"] == "consumed"
+
+
+def test_275_internal_spaces_in_rejection_reason_preserved():
+    record = _rejected_record(rejection_reason="Additional evidence is still required.")
+
+    with pytest.raises(ApprovalTransitionError) as exc_info:
+        validate_approval_transition(record, _approve_request())
+    assert "trimmed" not in str(exc_info.value)
+
+
+def test_276_unicode_identity_without_outer_whitespace_accepted():
+    record = _approved_record(approved_by="Straße Reviewer")
+
+    result = validate_approval_transition(record, _consume_request())
+    assert result["to_status"] == "consumed"
+
+
+def test_277_original_casing_preserved_for_approved_by():
+    record = _approved_record(approved_by="Security Reviewer")
+
+    result = validate_approval_transition(record, _consume_request())
+    assert result["set_fields"]["consumed_by"] == "Update Case Operator"
+    # The current_record's own approved_by casing is not altered by this
+    # module -- confirmed by re-inspecting the untouched input record.
+    assert record["approved_by"] == "Security Reviewer"
+
+
+def test_278_self_approval_behavior_unchanged():
+    record = _pending_record(requested_by="analyst-jane")
+
+    with pytest.raises(ApprovalTransitionError):
+        validate_approval_transition(record, _approve_request(reviewed_by="analyst-jane"))
+
+
+def test_279_self_rejection_still_allowed():
+    record = _pending_record(requested_by="analyst-jane")
+
+    result = validate_approval_transition(record, _reject_request(reviewed_by="analyst-jane"))
+    assert result["to_status"] == "rejected"
+
+
+def test_280_approve_output_shape_unchanged():
+    result = validate_approval_transition(_pending_record(), _approve_request())
+    assert set(result.keys()) == {"approval_id", "from_status", "to_status", "set_fields"}
+    assert list(result["set_fields"].keys()) == ["status", "approved_by", "approved_at"]
+
+
+def test_281_reject_output_shape_unchanged():
+    result = validate_approval_transition(_pending_record(), _reject_request())
+    assert list(result["set_fields"].keys()) == ["status", "rejected_by", "rejected_at", "rejection_reason"]
+
+
+def test_282_consume_output_shape_unchanged():
+    result = validate_approval_transition(_approved_record(), _consume_request())
+    assert list(result["set_fields"].keys()) == ["status", "consumed_by", "consumed_at"]
+
+
+def test_283_expiry_behavior_unchanged():
+    record = _pending_record(expires_at="2026-08-01T10:30:00Z")
+
+    with pytest.raises(ApprovalTransitionError):
+        validate_approval_transition(record, _approve_request(reviewed_at="2026-08-01T11:00:00Z"))
+
+
+def test_284_transition_request_inputs_unmutated():
+    request = _approve_request()
+    snapshot = copy.deepcopy(request)
+
+    validate_approval_transition(_pending_record(), request)
+
+    assert request == snapshot
+
+
+def test_285_current_record_unmutated_by_stricter_validation():
+    record = _approved_record()
+    snapshot = copy.deepcopy(record)
+
+    validate_approval_transition(record, _consume_request())
+
+    assert record == snapshot
+
+
+def test_286_successful_output_independent():
+    record = _pending_record()
+
+    result = validate_approval_transition(record, _approve_request())
+    result["set_fields"]["approved_by"] = "mutated"
+
+    second_result = validate_approval_transition(record, _approve_request())
+    assert second_result["set_fields"]["approved_by"] == "Security Reviewer"
+
+
+def test_287_regression_padded_value_fails_exact_trim_value_succeeds():
+    padded_record = _approved_record(approved_by=" Jordan Reviewer ")
+    exact_record = _approved_record(approved_by="Jordan Reviewer")
+
+    with pytest.raises(ApprovalTransitionError):
+        validate_approval_transition(padded_record, _consume_request())
+
+    result = validate_approval_transition(exact_record, _consume_request())
+    assert result["to_status"] == "consumed"
+
+
+def test_288_validator_does_not_silently_return_trimmed_padded_value():
+    padded_record = _approved_record(approved_by=" Jordan Reviewer ")
+
+    try:
+        validate_approval_transition(padded_record, _consume_request())
+        assert False, "expected ApprovalTransitionError for a padded stored approved_by"
+    except ApprovalTransitionError as exc:
+        # The error must not have silently trimmed and accepted the
+        # padded value -- confirmed both by the raised exception and by
+        # the error message never echoing the rejected value itself.
+        assert "Jordan Reviewer" not in str(exc)
+
+
+def test_289_error_message_does_not_leak_rejected_value():
+    secret_marker = " SECRET-PADDED-IDENTITY-MARKER "
+    record = _approved_record(approved_by=secret_marker)
+
+    try:
+        validate_approval_transition(record, _consume_request())
+    except ApprovalTransitionError as exc:
+        assert secret_marker.strip() not in str(exc)
+        assert secret_marker not in str(exc)
+
+
+def test_290_no_new_exception_class_introduced():
+    import ast
+
+    tree = ast.parse(_module_source_text())
+    defined_class_names = [node.name for node in ast.walk(tree) if isinstance(node, ast.ClassDef)]
+    assert defined_class_names == ["ApprovalTransitionError"]
+
+
+def test_291_helper_still_used_for_all_four_current_record_fields():
+    import ast
+
+    tree = ast.parse(_module_source_text())
+    fields_passed_to_helper = set()
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "_validate_optional_identity"
+            and node.args
+            and isinstance(node.args[0], ast.Subscript)
+            and isinstance(node.args[0].value, ast.Name)
+            and node.args[0].value.id == "current_record"
+        ):
+            key_node = node.args[0].slice
+            if isinstance(key_node, ast.Constant):
+                fields_passed_to_helper.add(key_node.value)
+
+    assert fields_passed_to_helper == {"approved_by", "rejected_by", "consumed_by", "rejection_reason"}
+
+
+def test_292_no_public_approval_record_validator_added():
+    import core.approval_transition as module
+
+    assert not hasattr(module, "validate_approval_record")
+    assert not hasattr(module, "ValidateApprovalRecord")
+
+
+def test_293_validate_current_record_remains_private():
+    import core.approval_transition as module
+
+    assert not hasattr(module, "validate_current_record")
+    assert hasattr(module, "_validate_current_record")
+
+
+def test_294_no_requested_by_validation_logic_duplicated():
+    source = _module_source_text()
+    # requested_by continues to be validated exclusively through the
+    # composed core.approval_request.validate_approval_request call --
+    # no separate, duplicated trim-equality check for requested_by exists
+    # in this module.
+    assert 'current_record["requested_by"]' in source
+    assert source.count('_validate_optional_identity(current_record["requested_by"]') == 0
+
+
+# ---------------------------------------------------------------------------
 # Source-boundary checks on the test module itself
 # ---------------------------------------------------------------------------
 

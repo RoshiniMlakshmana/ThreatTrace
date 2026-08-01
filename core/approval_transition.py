@@ -173,6 +173,17 @@ def _validate_status(value: Any) -> str:
 
 
 def _validate_optional_identity(value: Any, field_name: str) -> str | None:
+    """Validate a persisted (current-record) lifecycle identity or
+    rejection-reason value.
+
+    Unlike a transition-request value (which is trimmed and normalized on
+    the way in, since it is analyst-authored input), a persisted value is
+    expected to already be stored in its canonical, outer-trimmed form --
+    matching the approvals schema's own `chk_approvals_*_nonblank` and
+    `chk_approvals_lifecycle_rejected` CHECK constraints, which require
+    `column = btrim(column)`. A padded stored value is therefore rejected
+    outright, never silently trimmed and accepted.
+    """
     if value is None:
         return None
     if not isinstance(value, str):
@@ -180,6 +191,8 @@ def _validate_optional_identity(value: Any, field_name: str) -> str | None:
     stripped = value.strip()
     if not stripped:
         raise ApprovalTransitionError(f"{field_name} must not be blank when present")
+    if value != stripped:
+        raise ApprovalTransitionError(f"{field_name} must already be stored in trimmed form")
     return stripped
 
 
