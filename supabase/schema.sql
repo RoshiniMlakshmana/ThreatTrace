@@ -207,6 +207,190 @@ comment on table retests is
     'Retest plans for validating detection improvements after a gap is remediated; requires explicit approval before execution and records the eventual result.';
 
 -- ============================================================================
+-- Table: approvals
+-- ----------------------------------------------------------------------------
+-- Persists the request-and-lifecycle contract already validated in pure
+-- Python by core/approval_request.py and core/approval_transition.py: an
+-- analyst-proposed action envelope (currently only update_investigation_state)
+-- moving through pending -> approved -> consumed, or pending -> rejected.
+-- This table stores exactly that contract -- it introduces no new fields,
+-- vocabulary, or lifecycle rules beyond what those validators already define
+-- and test. No trigger, RLS policy, or authenticated-identity enforcement
+-- exists yet for this table.
+-- ============================================================================
+create table if not exists approvals (
+    id uuid primary key default gen_random_uuid(),
+    investigation_id uuid not null
+        references investigations (id) on delete cascade,
+    action_type text not null,
+    action_payload jsonb not null,
+    requested_by text not null,
+    requested_at timestamptz not null,
+    status text not null default 'pending',
+    approved_by text,
+    approved_at timestamptz,
+    rejected_by text,
+    rejected_at timestamptz,
+    rejection_reason text,
+    expires_at timestamptz,
+    consumed_by text,
+    consumed_at timestamptz,
+    created_at timestamptz not null default now(),
+
+    constraint chk_approvals_status
+        check (status in ('pending', 'approved', 'rejected', 'consumed')),
+
+    constraint chk_approvals_action_type
+        check (action_type in ('update_investigation_state')),
+
+    constraint chk_approvals_action_payload_object
+        check (jsonb_typeof(action_payload) = 'object'),
+
+    constraint chk_approvals_requested_by_nonblank
+        check (
+            requested_by = btrim(requested_by)
+            and btrim(requested_by) <> ''
+        ),
+
+    constraint chk_approvals_approved_by_nonblank
+        check (
+            approved_by is null
+            or (
+                approved_by = btrim(approved_by)
+                and btrim(approved_by) <> ''
+            )
+        ),
+
+    constraint chk_approvals_rejected_by_nonblank
+        check (
+            rejected_by is null
+            or (
+                rejected_by = btrim(rejected_by)
+                and btrim(rejected_by) <> ''
+            )
+        ),
+
+    constraint chk_approvals_consumed_by_nonblank
+        check (
+            consumed_by is null
+            or (
+                consumed_by = btrim(consumed_by)
+                and btrim(consumed_by) <> ''
+            )
+        ),
+
+    constraint chk_approvals_lifecycle_pending
+        check (
+            status <> 'pending'
+            or (
+                approved_by is null
+                and approved_at is null
+                and rejected_by is null
+                and rejected_at is null
+                and rejection_reason is null
+                and consumed_by is null
+                and consumed_at is null
+            )
+        ),
+
+    constraint chk_approvals_lifecycle_approved
+        check (
+            status <> 'approved'
+            or (
+                approved_by is not null
+                and approved_at is not null
+                and rejected_by is null
+                and rejected_at is null
+                and rejection_reason is null
+                and consumed_by is null
+                and consumed_at is null
+            )
+        ),
+
+    -- rejection_reason must already be outer-trimmed and nonblank; internal
+    -- whitespace and case are preserved (matching the reject-transition
+    -- rules already enforced by core.approval_transition).
+    constraint chk_approvals_lifecycle_rejected
+        check (
+            status <> 'rejected'
+            or (
+                rejected_by is not null
+                and rejected_at is not null
+                and rejection_reason is not null
+                and rejection_reason = btrim(rejection_reason)
+                and btrim(rejection_reason) <> ''
+                and approved_by is null
+                and approved_at is null
+                and consumed_by is null
+                and consumed_at is null
+            )
+        ),
+
+    constraint chk_approvals_lifecycle_consumed
+        check (
+            status <> 'consumed'
+            or (
+                approved_by is not null
+                and approved_at is not null
+                and consumed_by is not null
+                and consumed_at is not null
+                and rejected_by is null
+                and rejected_at is null
+                and rejection_reason is null
+            )
+        ),
+
+    constraint chk_approvals_created_after_requested
+        check (created_at >= requested_at),
+
+    constraint chk_approvals_expires_after_requested
+        check (expires_at is null or expires_at > requested_at),
+
+    constraint chk_approvals_approved_after_requested
+        check (approved_at is null or approved_at >= requested_at),
+
+    -- Rejection is deliberately never compared against expires_at --
+    -- rejecting an expired-but-still-pending request remains valid.
+    constraint chk_approvals_rejected_after_requested
+        check (rejected_at is null or rejected_at >= requested_at),
+
+    constraint chk_approvals_consumed_after_approved
+        check (
+            consumed_at is null
+            or (
+                approved_at is not null
+                and consumed_at >= approved_at
+            )
+        ),
+
+    -- Approval or consumption exactly at expires_at is rejected (strict <).
+    constraint chk_approvals_approved_before_expires
+        check (
+            approved_at is null
+            or expires_at is null
+            or approved_at < expires_at
+        ),
+
+    constraint chk_approvals_consumed_before_expires
+        check (
+            consumed_at is null
+            or expires_at is null
+            or consumed_at < expires_at
+        )
+);
+
+comment on table approvals is
+    'Persists the pure-Python-validated approval request/lifecycle contract (core/approval_request.py, core/approval_transition.py): a proposed action envelope moving through pending -> approved -> consumed, or pending -> rejected.';
+comment on column approvals.action_payload is
+    'The frozen proposed action envelope, validated by core.approval_request.validate_approval_request. This table checks only that it is a JSON object -- exact shape/vocabulary validation remains Python-only, to avoid duplicating (and drifting from) that logic in SQL.';
+comment on column approvals.requested_by is
+    'Claimed, not authenticated, requester identity.';
+comment on column approvals.approved_by is
+    'Claimed, not authenticated, reviewer identity. Two-person separation (reviewed_by != requested_by) is enforced only by core.approval_transition.validate_approval_transition using a trimmed Unicode casefold comparison -- PostgreSQL lower() is not equivalent (e.g. it does not fold characters such as German ß the way Python str.casefold() does), so this schema intentionally does not approximate that rule in SQL.';
+comment on column approvals.consumed_by is
+    'Claimed, not authenticated, identity of whatever executed the approved action.';
+
+-- ============================================================================
 -- Indexes
 -- ============================================================================
 create index if not exists idx_investigations_status on investigations (status);
@@ -228,6 +412,10 @@ create index if not exists idx_detection_results_created_at on detection_results
 
 create index if not exists idx_retests_investigation_id on retests (investigation_id);
 create index if not exists idx_retests_created_at on retests (created_at);
+
+create index if not exists idx_approvals_investigation_id on approvals (investigation_id);
+create index if not exists idx_approvals_status on approvals (status);
+create index if not exists idx_approvals_created_at on approvals (created_at);
 
 -- ============================================================================
 -- Trigger: auto-update investigations.updated_at
@@ -266,3 +454,4 @@ alter table attack_mappings enable row level security;
 alter table handoffs enable row level security;
 alter table detection_results enable row level security;
 alter table retests enable row level security;
+alter table approvals enable row level security;
