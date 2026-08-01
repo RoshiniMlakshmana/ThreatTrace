@@ -5,7 +5,7 @@ argument-hint: "[investigation UUID and evidence details]"
 
 # ThreatTrace Add Evidence Workflow
 
-You attach structured, normalized evidence records to an existing investigation in the connected ThreatTrace Supabase database. This command is the **only** evidence write path in ThreatTrace. Every proposed record must pass through the shared normalizer (`core/evidence_normalizer.py`) before it is previewed or inserted — that module, not this command, is the single source of truth for field rules.
+You attach structured, normalized evidence records to an existing investigation in the connected ThreatTrace Supabase database. This command is the **only** evidence write path in ThreatTrace. Every proposed record must pass through the official evidence-normalization CLI adapter (`core.evidence_cli`, wrapping `core/evidence_normalizer.py`) before it is previewed or inserted — that adapter, not this command, is the single source of truth for field rules.
 
 ## Evidence Input
 
@@ -67,75 +67,87 @@ If any suspected secret is found:
 - Do not write to Supabase.
 - Tell the analyst which field category must be cleaned up (e.g. "the `details` field appears to contain a credential") without displaying the suspected secret value itself, and ask them to resubmit.
 
-5. Validate and normalize the assembled payload by calling `core.evidence_normalizer.normalize_evidence`. Treat that module as the single source of truth for required fields, allowed top-level fields, controlled vocabularies, timestamp validation, string trimming, default values, `details`/`provenance` validation, and the Boolean `supports_hypothesis` check — do not re-implement or duplicate any of those rules here.
+5. Validate and normalize the assembled payload by invoking the official evidence-normalization CLI adapter, `core.evidence_cli`. Treat it — and the `core.evidence_normalizer.normalize_evidence` function it wraps — as the single source of truth for required fields, allowed top-level fields, controlled vocabularies, timestamp validation, string trimming, default values, `details`/`provenance` validation, and the Boolean `supports_hypothesis` check. Do not re-implement, duplicate, or write custom inline Python for any of those rules here.
 
-Invoke it as a short-lived, read-only local Python subprocess (never a long-running process), run from the project root so `core` imports as a normal package:
+Invoke it as a short-lived, read-only local Python module run from the project root (never a long-running process):
 
-- Prefer `py` (the Windows launcher) when available.
-- Otherwise prefer `python3` (typical on macOS/Linux) when available.
-- Only fall back to plain `python` if it is confirmed to resolve to Python 3.10 or later.
+- Windows: `py -m core.evidence_cli`
+- macOS or Linux: `python3 -m core.evidence_cli`
+- Only fall back to plain `python -m core.evidence_cli` if it is confirmed to resolve to Python 3.10 or later.
 - Never install Python or any package to satisfy this step.
 
-Pass the assembled payload as JSON on stdin and read a single JSON result from stdout, for example:
+Send exactly one JSON object — containing only the assembled payload's supported evidence fields and nothing else — through the adapter's **stdin**. Do not:
 
-```
-<python-launcher> -c "
-import json, sys
-from core.evidence_normalizer import normalize_evidence, EvidenceValidationError
-try:
-    result = normalize_evidence(json.loads(sys.stdin.read()))
-except EvidenceValidationError as exc:
-    print(json.dumps({\"ok\": False, \"error\": str(exc)}))
-else:
-    print(json.dumps({\"ok\": True, \"result\": result}, default=str))
-"
-```
+- pass evidence through command-line arguments;
+- place evidence in a temporary repository file;
+- include any suspected secret (secrets are handled in step 4, before this step ever runs);
+- add unsupported fields, `id`, or `created_at`.
 
-If no suitable launcher is found, the `core` package cannot be imported, or the subprocess fails or returns anything other than the expected JSON shape: **fail closed**. Do not display a preview, do not request confirmation, do not write to Supabase, and report the error clearly to the analyst.
+Then read the adapter's result strictly by its exit code:
 
-6. If the normalizer reports failure (`EvidenceValidationError`), display a concise message beginning with:
+- **Exit code 0**: stderr must be empty. Parse stdout as JSON. Use that parsed dictionary — and only that dictionary — for the preview and the eventual insert.
+- **Exit code 2**: input or evidence validation failed. Display the adapter's concise stderr message (it already begins with either `Evidence validation failed:` or `Invalid JSON input:`). Do not preview. Do not request confirmation. Do not write.
+- **Exit code 1**: an unexpected normalization failure occurred. Display the adapter's generic stderr message. Do not preview. Do not request confirmation. Do not write.
+- **Any other exit code**: fail closed. Do not write. Report that normalization could not be completed safely.
 
-Evidence validation failed:
+Treat malformed output as failure even after exit code 0, without attempting to repair it. Fail closed if:
 
-- Include only the human-readable validation message the normalizer returned.
-- Do not display a preview.
-- Do not ask for confirmation.
-- Do not insert anything.
+- stdout is empty;
+- stdout is not valid JSON;
+- stdout contains more than one JSON value;
+- the parsed result is not a JSON object;
+- stderr contains any unexpected content.
 
-7. After successful normalization, display:
+6. After successful normalization, display:
 
 ## Normalized Evidence Preview
 
-Show exactly the normalized dictionary that will be inserted, including every one of:
+Show exactly the parsed JSON object `core.evidence_cli` returned on stdout — do not reconstruct, re-normalize, or silently change it after the adapter returns it. It will include every one of:
 
 `investigation_id`, `evidence_type`, `source`, `observed_at`, `details`, `supports_hypothesis`, `source_type`, `source_identifier`, `source_location`, `ingested_at`, `assertion_type`, `trust_level`, `confidence`, `event_id`, `host_name`, `user_name`, `process_name`, `command_line`, `ip_address`, `file_hash`, `provenance`.
 
 Clearly label any value that defaulted to `unknown`, `None`, or an empty object, so the analyst can see what the normalizer filled in versus what they supplied.
 
-8. Do not insert the record until the user explicitly confirms with exactly:
+7. Do not insert the record until the user explicitly confirms with exactly:
 
 Add evidence
 
 - Displaying the normalized preview performs no database write by itself.
-- Any response other than the exact phrase — including general agreement such as "yes", "continue", or "looks good" — cancels or pauses the write. Do not treat it as confirmation.
+- Any response other than the exact phrase — including "yes", "continue", "approved", "looks good", or similar wording — cancels or pauses the write. Do not treat it as confirmation.
 
-9. After exact confirmation, use the connected Supabase MCP server to insert **one** record into the `evidence` table:
+8. After exact confirmation, use the connected Supabase MCP server to insert **one** record into the `evidence` table:
 
-- Insert the normalized dictionary produced in step 5 — never the original raw payload.
+- Insert exactly the parsed normalized dictionary the CLI returned in step 5 — never the original raw payload.
 - Do not add `id` or `created_at`; both are database-generated.
-- Do not add any field the normalizer did not return.
-- Do not re-run normalization with different values at this point. Insert exactly what was previewed and approved.
+- Do not add any field the CLI did not return.
+- Do not invoke `core.evidence_cli` again or re-run normalization with different values at this point. Insert exactly what was previewed and approved.
 
-10. Read the new record back using its generated UUID.
+9. Read the new record back using its generated UUID.
 
-11. Compare the stored evidence fields against the exact approved normalized preview.
+10. Compare the stored evidence fields against the exact approved normalized preview, accounting only for database-generated fields (`id`, `created_at`).
 
 - Report any mismatch clearly.
 - Never silently correct or overwrite a mismatch.
 
 ## Example
 
-Input:
+Adapter flow:
+
+```
+Evidence payload JSON
+        ↓
+py -m core.evidence_cli
+        ↓
+Normalized JSON
+        ↓
+Preview
+        ↓
+Exact "Add evidence" confirmation
+        ↓
+Supabase insert
+```
+
+Input JSON sent to the adapter's stdin:
 
 - `evidence_type`: `windows_event`
 - `source`: `Hayabusa CSV`
@@ -145,7 +157,7 @@ Input:
 - `trust_level`: `high`
 - `confidence`: `medium`
 
-Normalized result:
+Normalized result the adapter returns on stdout:
 
 - `event_id` becomes the string `"4104"`
 - controlled values (`source_type`, `assertion_type`, `trust_level`, `confidence`) are lowercase
@@ -172,8 +184,8 @@ Produce:
 ## Safety Rules
 
 - Never store passwords, API keys, access tokens, private keys, credentials, or connection strings — scan every supplied field, including nested `details` and `provenance`, before normalization.
-- `core.evidence_normalizer.normalize_evidence` is the single source of truth for field validation; do not duplicate or reimplement its rules in this command.
-- If the normalizer cannot be loaded or executed, fail closed: no preview, no confirmation prompt, no insert.
+- `core.evidence_cli` (wrapping `core.evidence_normalizer.normalize_evidence`) is the single source of truth for field validation; do not duplicate, reimplement, or write inline Python for its rules in this command.
+- Fail closed on any adapter problem: a non-zero or unrecognized exit code, empty stdout, non-JSON stdout, more than one JSON value on stdout, a non-object result, or unexpected stderr content on success. In every such case: no preview, no confirmation prompt, no insert.
 - Do not modify or delete existing evidence.
 - Do not modify or delete the parent investigation.
 - Do not modify database tables, policies, indexes, triggers, or constraints.
