@@ -212,6 +212,15 @@ def normalize_evidence(
     compute a hash. The input `payload` is never mutated; a new,
     independently-owned dictionary is always returned.
 
+    `ingested_at` behavior: when `payload` omits `ingested_at` (or supplies
+    it as None), this function generates the current UTC timestamp (or uses
+    `now`, when supplied) as the ingestion time. When `payload` supplies a
+    valid `ingested_at`, that value is validated and canonicalized (not
+    replaced) -- so a valid, already-supplied `ingested_at` is preserved
+    across repeated normalization passes, and re-normalizing an
+    already-normalized record does not overwrite it with a new current
+    timestamp.
+
     Raises EvidenceValidationError if `payload` is not a mapping, is missing
     a required field, contains a blank required field, contains an unknown
     top-level field (including database-generated fields like `id` or

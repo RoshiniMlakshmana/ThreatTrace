@@ -153,6 +153,8 @@ Explain plainly:
 - It does not calculate confidence.
 - It does not modify the evidence automatically.
 
+`/add-evidence` recomputes this assessment from the exact normalized candidate every time it runs — it does not trust or reuse advisory state produced by `/prepare-hayabusa-evidence` or any other command. If the record was already previewed elsewhere, the analyst may see the same recommendation again here; this repetition is intentional, because `/add-evidence` is the final, self-contained write boundary and must independently re-verify everything before a Supabase write can occur. Seeing the same recommendation twice does not indicate a second independent source or additional corroboration — it is the same deterministic policy re-run on the same data. The recommendation remains advisory, and `trust_level` is never changed automatically.
+
 ## Analyst Decision
 
 If `recommended_trust_level` matches the normalized record's current `trust_level`:
