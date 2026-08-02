@@ -53,10 +53,33 @@ If the investigation does not exist, stop and report this clearly.
 - /blue-team
 - /query
 - /add-evidence
-- /update-case
+- /request-case-update
+- /review-approval
+- /apply-case-update
 - /case-summary
 
-7. Never execute another command automatically. Only name the recommended command for the user to run themselves.
+Case-update routing follows this lifecycle:
+
+```
+Proposed change
+→ /request-case-update
+
+Pending approval
+→ /review-approval
+
+Approved approval
+→ /apply-case-update
+
+Rejected approval
+→ cannot apply; create a new request when needed
+
+Consumed approval
+→ replay prohibited
+```
+
+`/update-case` is deprecated static guidance and must never be recommended as a way to change status or confidence.
+
+7. Never execute, invoke, or chain another command automatically. Only name the recommended command for the user to run themselves.
 
 8. Never execute attack simulations, modify detection rules, or change any database record.
 
@@ -91,6 +114,8 @@ Produce:
 - Never modify database schema, policies, indexes, triggers, or constraints.
 - Never execute attack simulations, modify detection rules, or change security controls.
 - Never execute another slash command automatically — only recommend one.
+- Never invoke or chain `/request-case-update`, `/review-approval`, or `/apply-case-update` automatically — recommend only.
+- Never update an investigation or an approval directly, call Supabase or MCP, execute SQL, or treat typed confirmation as authorization.
 - Never recommend Red Team testing without evidence supporting a specific ATT&CK technique.
 - Never recommend Blue Team validation without existing test evidence, telemetry, or an alert.
 - Never escalate a Low-confidence finding out of the Threat Hunter workflow without supporting evidence.

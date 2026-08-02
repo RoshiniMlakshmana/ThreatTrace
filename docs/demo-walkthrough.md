@@ -26,7 +26,43 @@ Both mappings are stored as `provisional` initially and promoted to `supported` 
 
 ## 4. Confidence and Severity
 
-After both evidence records and both ATT&CK mappings are in place, the investigation's confidence is updated to **medium** via `/update-case`. Medium reflects that the behavior pattern is consistent with known attacker tradecraft, but that Blue Team validation has not yet occurred — it is not treated as high confidence until detection results are on record. Severity is likewise assessed as **medium**, consistent with a persistence + execution pairing rather than a confirmed high-impact outcome.
+After both evidence records and both ATT&CK mappings are in place, the analyst proposes raising the investigation's confidence to **medium** — reflecting that the behavior pattern is consistent with known attacker tradecraft, but that Blue Team validation has not yet occurred. This proposed change goes through the approval-gated case-update workflow rather than any direct write.
+
+### Step 1 — Request
+
+```
+/request-case-update {"investigation_id":"11111111-1111-4111-8111-111111111111","requested_by":"analyst@example.com","confidence":"medium"}
+```
+
+This creates exactly one pending approval. **The investigation is not updated at this point.** `requested_by` above is a claimed requester identity, not an authenticated one.
+
+### Step 2 — Review
+
+```
+/review-approval {"approval_id":"22222222-2222-4222-8222-222222222222","decision":"approve","reviewed_by":"reviewer@example.com"}
+```
+
+This changes only the approval record to `approved`. **The investigation is still not updated.** `reviewed_by` above is a claimed reviewer identity, not an authenticated one.
+
+### Step 3 — Apply
+
+```
+/apply-case-update {"approval_id":"22222222-2222-4222-8222-222222222222","consumed_by":"operator@example.com"}
+```
+
+`/apply-case-update` accepts no `status` or `confidence` of its own — the applied value comes only from the approval's own stored `action_payload` (`confidence: medium`, in this case). This single atomic operation marks the approval `consumed` and updates the investigation's confidence together, in the same database transaction. `consumed_by` above is a claimed consumer identity, not an authenticated one. The approval's final status becomes `consumed`, and **it cannot be consumed again** — any replay attempt fails closed.
+
+Severity is likewise assessed as **medium**, consistent with a persistence + execution pairing rather than a confirmed high-impact outcome. Severity itself is a separate analyst judgment recorded outside the approval-gated `status`/`confidence` workflow described above.
+
+### If the Reviewer Had Rejected Instead
+
+Had the reviewer instead run:
+
+```
+/review-approval {"approval_id":"22222222-2222-4222-8222-222222222222","decision":"reject","reviewed_by":"reviewer@example.com","rejection_reason":"Blue Team validation has not yet occurred; confidence should remain unknown until detection results are on record."}
+```
+
+the approval's status would become `rejected`, **the investigation would remain completely unchanged**, and the rejected approval could never be applied — the analyst would need to submit a new `/request-case-update` for any different proposed change.
 
 ## 5. Red Team Routing
 

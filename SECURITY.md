@@ -35,6 +35,22 @@ ThreatTrace is designed to operate **only within explicitly authorized lab envir
 - Execution currently requires an authorization phrase.
 - The authorization phrase is an initial safeguard, not the final approval system.
 
+## Approval-Gated Case Updates
+
+Investigation `status`/`confidence` changes are never applied directly.
+
+- A proposed change becomes one pending approval via `/request-case-update`. No investigation update occurs at request time.
+- `/review-approval` changes only the approval record — approved or rejected. It never updates the investigation.
+- `/apply-case-update` applies the change through exactly one atomic PostgreSQL RPC, `consume_approval_and_update_investigation_state`, which consumes the approval and updates the investigation together in the same database transaction.
+- The applied `status`/`confidence` values come only from the approval's own stored `action_payload` — never from a value supplied directly to `/apply-case-update`.
+- The atomic RPC is the final authority against TOCTOU (time-of-check to time-of-use) changes: it independently re-checks the approval's status, expiry, and stored bindings against the live database row inside its own transaction, not against whatever an earlier lookup returned.
+- An approved request can be consumed successfully exactly once. Every replay attempt fails closed as a persistence conflict, never as a silent success.
+- Expiry is checked at the moment of atomic consumption, not only at request or review time.
+- `PUBLIC`, `anon`, and `authenticated` cannot execute the atomic RPC. Only `service_role` (and the function owner) retain `EXECUTE` permission on it.
+- `requested_by`, `reviewed_by`, and `consumed_by` are caller-supplied **claimed identities** — none of them is authenticated, verified, cryptographically proven, or derived from Supabase Auth.
+
+This workflow does not implement Supabase Auth, cryptographic identity verification, action hashing, immutable history, risk-tiered approval, full two-person approval for every action, or credential management — those remain planned for later blocks.
+
 ## Current Security Limitations
 
 - The validation hook runs after `Write` or `Edit` operations and is advisory rather than a preventive `PreToolUse` gateway.

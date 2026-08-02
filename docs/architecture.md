@@ -68,6 +68,49 @@ The components below exist in this repository today and back the flow described 
 - The current authorization phrase is an initial safeguard, not the final approval system.
 - A verified approval ID, evidence hash, action hash, expiry, reviewer validation, and audit trail are planned but not implemented yet.
 
+## Approval-Gated Case Update Architecture (Block 5)
+
+Investigation `status`/`confidence` changes flow through a validated, atomic, approval-gated pipeline:
+
+```
+Analyst
+→ /request-case-update
+→ approval request validator
+→ approval bridge prepare
+→ MCP adapter prepare
+→ pending approvals insert
+→ /review-approval
+→ transition validator
+→ conditional approvals update
+→ /apply-case-update
+→ consume transition validator
+→ approval bridge prepare
+→ MCP adapter prepare
+→ atomic Supabase RPC
+→ consumed approval + updated investigation
+```
+
+### Two-Phase Tool Architecture
+
+Every database lookup and mutation in this pipeline follows the same four-step pattern:
+
+```
+Prepare
+→ execute through mcp__supabase__execute_sql
+→ normalize
+→ verify
+```
+
+- Command Markdown never generates arbitrary SQL.
+- The approval bridge (`core.approval_bridge`) creates the canonical persistence descriptor for each operation — an insert, a select, a conditional update, or an RPC call — by re-running the same pre-executor validation the real persistence function itself uses.
+- The MCP adapter (`core.approval_mcp_adapter`) converts only an already-verified, allowlisted descriptor into one fixed SQL template. It never accepts arbitrary caller-supplied SQL, table names, or function names.
+- The raw response from `mcp__supabase__execute_sql` is normalized (its untrusted-data block is parsed and its PostgreSQL timestamps canonicalized) before it is ever handed to verification — command Markdown never parses the raw response directly.
+- Zero rows, multiple rows, a malformed row, a persistence conflict, and a transport error all fail closed. None of them is ever treated as success.
+- The approval record loaded at the start of `/apply-case-update` is used for display and preparation only — it is **not final authorization**. The atomic RPC, `consume_approval_and_update_investigation_state`, is the final authority: it independently re-checks the approval's status, expiry, and stored bindings against the live row inside its own transaction.
+- The stored `action_payload` on the approval record is the exclusive source of the applied `status`/`confidence` — `/apply-case-update` never accepts either value as direct input, and it never updates `public.investigations` through any other path.
+- The atomic RPC returns exactly nineteen fields: the sixteen approval-record fields, plus `investigation_status`, `investigation_confidence`, and `investigation_updated_at`.
+- `/update-case` is not part of this mutation architecture. It is a deprecated, static compatibility notice that performs no database operation of any kind.
+
 ## Data and Filesystem Boundaries
 
 - Raw EVTX files remain under `evidence/evtx/`.

@@ -93,6 +93,43 @@ The `atomic-mapper` agent matches evidence-supported ATT&CK techniques against a
 
 The following controls are **planned but not yet implemented**: verified approval IDs, evidence hashes, action hashes, approval expiry, reviewer identity validation, and tamper-evident audit history. Today's authorization phrase (see Hayabusa Plan and Execute Boundary, above) is an initial safeguard, not a substitute for these.
 
+## Approval-Gated Case Updates
+
+Investigation `status`/`confidence` changes are never applied directly — the old direct-write behavior is unavailable. They go through a three-command, approval-gated workflow instead:
+
+```
+/request-case-update
+→ /review-approval
+→ /apply-case-update
+```
+
+- `/request-case-update` creates one pending approval for a proposed `status`/`confidence` change. **It does not update the investigation.**
+- `/review-approval` lets a reviewer approve or reject that pending approval. It changes only the approval record. **It does not update the investigation.**
+- `/apply-case-update` atomically consumes an approved, unconsumed approval and applies its stored change to the investigation. **This is the only command that updates the investigation**, and it does so through one atomic database operation.
+- `/update-case` is a deprecated, static compatibility command. It performs no lookup, no validation, and no database operation of any kind — typed confirmation was never authorization, and it is no longer accepted at all. The command only redirects the caller to `/request-case-update`.
+
+`requested_by`, `reviewed_by`, and `consumed_by` are caller-supplied **claimed identities** — none of them is authenticated, verified, cryptographically proven, or derived from Supabase Auth.
+
+### Examples
+
+Request a pending approval:
+
+```
+/request-case-update {"investigation_id":"11111111-1111-4111-8111-111111111111","requested_by":"analyst@example.com","status":"investigating"}
+```
+
+Approve the pending approval:
+
+```
+/review-approval {"approval_id":"22222222-2222-4222-8222-222222222222","decision":"approve","reviewed_by":"reviewer@example.com"}
+```
+
+Atomically apply the approved request:
+
+```
+/apply-case-update {"approval_id":"22222222-2222-4222-8222-222222222222","consumed_by":"operator@example.com"}
+```
+
 ## Available Slash Commands
 
 | Command | Purpose |
@@ -103,7 +140,10 @@ The following controls are **planned but not yet implemented**: verified approva
 | `/triage-case` | Evidence-grounded SOC analyst triage of an existing investigation |
 | `/open-case` | Open and store a new investigation in Supabase (requires confirmation) |
 | `/add-evidence` | Attach a new evidence record to an investigation (requires confirmation) |
-| `/update-case` | Update an investigation's status and/or confidence (requires confirmation) |
+| `/request-case-update` | Request a pending approval to change an investigation's status and/or confidence |
+| `/review-approval` | Approve or reject a pending case-update approval |
+| `/apply-case-update` | Atomically apply an approved, unconsumed case-update approval |
+| `/update-case` | Deprecated — static guidance only; performs no update and redirects to `/request-case-update` |
 | `/case-summary` | Read-only summary and timeline of an investigation |
 | `/query` | Generate read-only SIEM queries (KQL/SPL) — never executes them |
 | `/ingest-ti` | Read-only, structured preview of ingested threat intelligence |
@@ -121,7 +161,7 @@ ThreatTrace ships a walkthrough built around **PurpleShadow**, an entirely ficti
 - There is no automated response, containment, or detection-rule deployment by design — every risky step is a human decision.
 - Confidence and severity scoring are qualitative (low/medium/high), not statistically derived.
 - **Detection Engineering** is currently guidance provided through the `detection-engineering` skill, not a complete, dedicated workflow command.
-- **Dedicated validation and retest orchestration** is not yet implemented as its own command — today it is covered only generically (e.g. via `/update-case`).
+- **Dedicated validation and retest orchestration** is not yet implemented as its own command.
 
 ## Future Enterprise Improvements
 

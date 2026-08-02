@@ -381,7 +381,7 @@ Use when:
 - Multiple corroborating indicators support compromise
 - Impact or scope requires incident response
 
-12. Recommend the next ThreatTrace command, but never execute it automatically.
+12. Recommend the next ThreatTrace command, but never execute, invoke, or chain it automatically.
 
 Possible commands include:
 
@@ -390,8 +390,20 @@ Possible commands include:
 - /blue-team
 - /red-team
 - /add-evidence
-- /update-case
+- /request-case-update
+- /review-approval
+- /apply-case-update
 - /case-summary
+
+When triage identifies a proposed `status`/`confidence` change, route through the approval-gated workflow rather than any direct update:
+
+- When the analyst proposes a new status/confidence change and no approval yet exists for it, recommend `/request-case-update`.
+- When a pending approval already exists and requires a decision, recommend `/review-approval`.
+- When an approval has been approved and is ready to apply, recommend `/apply-case-update`.
+- When an approval has been rejected, explain that it cannot be applied and that a new `/request-case-update` is required for any different proposed change.
+- When an approval has already been consumed, explain that it cannot be consumed again.
+
+`/update-case` is deprecated static guidance only — never recommend it as a way to change status or confidence. It may be mentioned only to point an analyst who typed it toward `/request-case-update`.
 
 ## Required Output
 
@@ -422,3 +434,5 @@ Produce:
 - Never claim compromise without corroborating evidence.
 - Clearly label assumptions and provisional conclusions.
 - Never execute another slash command automatically.
+- Never invoke or chain `/request-case-update`, `/review-approval`, or `/apply-case-update` automatically — recommend only.
+- Never update an investigation or an approval directly, call Supabase or MCP, execute SQL, or treat typed confirmation as authorization.
