@@ -478,7 +478,14 @@ def _verify_genuine_review_plan(
     set_fields = transition_plan["set_fields"]
 
     if to_status == "approved":
-        if list(set_fields) != list(_APPROVE_SET_FIELDS_ORDER):
+        # Key *set* membership is the real contract -- mapping insertion
+        # order is never security-significant, exactly as this project's
+        # own sort_keys=True JSON convention already treats it (see
+        # core.approval_bridge._deep_ordered_equal). A genuine plan
+        # round-tripped through core.approval_transition_cli's real
+        # sort_keys=True output always parses back in alphabetical key
+        # order, which must still be accepted here.
+        if set(set_fields) != set(_APPROVE_SET_FIELDS_ORDER):
             raise ApprovalPersistenceError(_INVALID_REVIEW_PLAN_MESSAGE)
         reconstructed_request = {
             "transition": "approve",
@@ -486,7 +493,7 @@ def _verify_genuine_review_plan(
             "reviewed_at": set_fields.get("approved_at"),
         }
     else:
-        if list(set_fields) != list(_REJECT_SET_FIELDS_ORDER):
+        if set(set_fields) != set(_REJECT_SET_FIELDS_ORDER):
             raise ApprovalPersistenceError(_INVALID_REVIEW_PLAN_MESSAGE)
         reconstructed_request = {
             "transition": "reject",
@@ -652,7 +659,12 @@ def _validate_consume_transition_plan(
     if not isinstance(transition_plan, Mapping):
         raise ApprovalPersistenceError(_INVALID_CONSUMPTION_INPUT_MESSAGE)
 
-    if tuple(transition_plan) != _CONSUME_TRANSITION_PLAN_FIELDS:
+    # Key *set* membership is the real contract -- mapping insertion order
+    # is never security-significant (see the matching comments elsewhere in
+    # this module). A genuine plan round-tripped through
+    # core.approval_transition_cli's real sort_keys=True output always
+    # parses back in alphabetical key order, not this tuple's literal order.
+    if set(transition_plan) != set(_CONSUME_TRANSITION_PLAN_FIELDS):
         raise ApprovalPersistenceError(_INVALID_CONSUMPTION_INPUT_MESSAGE)
 
     approval_id = transition_plan["approval_id"]
@@ -690,7 +702,12 @@ def _validate_consume_transition_plan(
     set_fields = transition_plan["set_fields"]
     if not isinstance(set_fields, Mapping):
         raise ApprovalPersistenceError(_INVALID_CONSUMPTION_INPUT_MESSAGE)
-    if tuple(set_fields) != _CONSUME_SET_FIELDS_ORDER:
+    # Key *set* membership is the real contract -- mapping insertion order
+    # is never security-significant (see the matching comment in
+    # _verify_genuine_review_plan above). A genuine plan round-tripped
+    # through core.approval_transition_cli's real sort_keys=True output
+    # always parses back in alphabetical key order.
+    if set(set_fields) != set(_CONSUME_SET_FIELDS_ORDER):
         raise ApprovalPersistenceError(_INVALID_CONSUMPTION_INPUT_MESSAGE)
     if set_fields.get("status") != "consumed":
         raise ApprovalPersistenceError(_INVALID_CONSUMPTION_INPUT_MESSAGE)

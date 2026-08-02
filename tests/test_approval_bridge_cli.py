@@ -19,6 +19,7 @@ from pathlib import Path
 import pytest
 
 from core import approval_bridge_cli
+from core import approval_transition_cli
 import core.approval_transition as approval_transition
 
 APPROVAL_ID = "51111111-1111-4111-8111-111111111111"
@@ -557,6 +558,163 @@ def test_038_existing_validator_clis_remain_unchanged():
 
     assert callable(approval_request_cli.main)
     assert callable(approval_transition_cli.main)
+
+
+# ---------------------------------------------------------------------------
+# Step 39 regression: the real core.approval_transition_cli boundary
+# (its own sort_keys=True JSON output, parsed back with json.loads) must
+# hand off cleanly into core.approval_bridge_cli's prepare phase, with no
+# manual reordering in between -- exactly as /review-approval and
+# /apply-case-update do in production. main() is called directly (never
+# subprocess), per this file's own established convention.
+# ---------------------------------------------------------------------------
+
+
+def _run_transition_cli(raw_stdin_text):
+    stdin = StringIO(raw_stdin_text)
+    stdout = StringIO()
+    stderr = StringIO()
+    exit_code = approval_transition_cli.main(stdin=stdin, stdout=stdout, stderr=stderr)
+    return exit_code, stdout.getvalue(), stderr.getvalue()
+
+
+def test_regression_007_real_transition_cli_approve_output_into_bridge_prepare():
+    pending = _pending_row()
+    transition_exit, transition_stdout, transition_stderr = _run_transition_cli(
+        json.dumps({
+            "current_record": pending,
+            "transition_request": {"transition": "approve", "reviewed_by": "Security Reviewer", "reviewed_at": REVIEWED_AT},
+        })
+    )
+    assert transition_exit == 0
+    assert transition_stderr == ""
+    plan = json.loads(transition_stdout)
+
+    bridge_exit, bridge_stdout, bridge_stderr = _run(
+        json.dumps(_prepare_envelope("apply_approval_review_transition", {"current_record": pending, "transition_plan": plan}))
+    )
+    assert bridge_exit == 0
+    assert bridge_stderr == ""
+    assert "approval_persistence_error" not in bridge_stderr
+    assert "Traceback" not in bridge_stderr
+    result = json.loads(bridge_stdout)
+    assert set(result) == {"phase", "operation", "descriptor"}
+    assert result["descriptor"]["operation"] == "update"
+
+
+def test_regression_008_real_transition_cli_reject_output_into_bridge_prepare():
+    pending = _pending_row()
+    transition_exit, transition_stdout, transition_stderr = _run_transition_cli(
+        json.dumps({
+            "current_record": pending,
+            "transition_request": {
+                "transition": "reject",
+                "reviewed_by": "Security Reviewer",
+                "rejection_reason": "Needs more evidence before approval.",
+                "reviewed_at": REVIEWED_AT,
+            },
+        })
+    )
+    assert transition_exit == 0
+    assert transition_stderr == ""
+    plan = json.loads(transition_stdout)
+
+    bridge_exit, bridge_stdout, bridge_stderr = _run(
+        json.dumps(_prepare_envelope("apply_approval_review_transition", {"current_record": pending, "transition_plan": plan}))
+    )
+    assert bridge_exit == 0
+    assert bridge_stderr == ""
+    assert "approval_persistence_error" not in bridge_stderr
+    assert "Traceback" not in bridge_stderr
+    result = json.loads(bridge_stdout)
+    assert set(result) == {"phase", "operation", "descriptor"}
+    assert result["descriptor"]["operation"] == "update"
+
+
+def test_regression_009_real_transition_cli_consume_output_into_bridge_prepare():
+    approved = _approved_record()
+    transition_exit, transition_stdout, transition_stderr = _run_transition_cli(
+        json.dumps({
+            "current_record": approved,
+            "transition_request": {
+                "transition": "consume",
+                "consumed_by": "Update Case Operator",
+                "expected_investigation_id": approved["investigation_id"],
+                "expected_action_type": "update_investigation_state",
+                "consumed_at": CONSUMED_AT,
+            },
+        })
+    )
+    assert transition_exit == 0
+    assert transition_stderr == ""
+    plan = json.loads(transition_stdout)
+
+    bridge_exit, bridge_stdout, bridge_stderr = _run(
+        json.dumps(_prepare_envelope("apply_approval_consumption", {"current_record": approved, "transition_plan": plan}))
+    )
+    assert bridge_exit == 0
+    assert bridge_stderr == ""
+    assert "approval_persistence_error" not in bridge_stderr
+    assert "Traceback" not in bridge_stderr
+    result = json.loads(bridge_stdout)
+    assert set(result) == {"phase", "operation", "descriptor"}
+    assert result["descriptor"]["operation"] == "rpc"
+
+
+def test_regression_010_approve_descriptor_identical_across_sort_keys_round_trip():
+    pending = _pending_row()
+    plan = _genuine_approve_plan(pending)
+    round_tripped_plan = json.loads(json.dumps(plan, sort_keys=True))
+
+    exit_a, stdout_a, _ = _run(
+        json.dumps(_prepare_envelope("apply_approval_review_transition", {"current_record": pending, "transition_plan": plan}))
+    )
+    exit_b, stdout_b, _ = _run(
+        json.dumps(_prepare_envelope("apply_approval_review_transition", {"current_record": pending, "transition_plan": round_tripped_plan}))
+    )
+    assert exit_a == 0
+    assert exit_b == 0
+    assert json.loads(stdout_a)["descriptor"] == json.loads(stdout_b)["descriptor"]
+
+
+def test_regression_011_reject_descriptor_identical_across_sort_keys_round_trip():
+    pending = _pending_row()
+    plan = approval_transition.validate_approval_transition(
+        pending,
+        {
+            "transition": "reject",
+            "reviewed_by": "Security Reviewer",
+            "rejection_reason": "Needs more evidence before approval.",
+            "reviewed_at": REVIEWED_AT,
+        },
+    )
+    round_tripped_plan = json.loads(json.dumps(plan, sort_keys=True))
+
+    exit_a, stdout_a, _ = _run(
+        json.dumps(_prepare_envelope("apply_approval_review_transition", {"current_record": pending, "transition_plan": plan}))
+    )
+    exit_b, stdout_b, _ = _run(
+        json.dumps(_prepare_envelope("apply_approval_review_transition", {"current_record": pending, "transition_plan": round_tripped_plan}))
+    )
+    assert exit_a == 0
+    assert exit_b == 0
+    assert json.loads(stdout_a)["descriptor"] == json.loads(stdout_b)["descriptor"]
+
+
+def test_regression_012_consume_descriptor_identical_across_sort_keys_round_trip():
+    approved = _approved_record()
+    plan = _genuine_consume_plan(approved)
+    round_tripped_plan = json.loads(json.dumps(plan, sort_keys=True))
+
+    exit_a, stdout_a, _ = _run(
+        json.dumps(_prepare_envelope("apply_approval_consumption", {"current_record": approved, "transition_plan": plan}))
+    )
+    exit_b, stdout_b, _ = _run(
+        json.dumps(_prepare_envelope("apply_approval_consumption", {"current_record": approved, "transition_plan": round_tripped_plan}))
+    )
+    assert exit_a == 0
+    assert exit_b == 0
+    assert json.loads(stdout_a)["descriptor"] == json.loads(stdout_b)["descriptor"]
 
 
 # ---------------------------------------------------------------------------

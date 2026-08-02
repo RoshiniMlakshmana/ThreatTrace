@@ -18,6 +18,7 @@ function; every input is a plain in-memory mapping.
 import ast
 import copy
 import inspect
+import json
 import os
 import socket
 import subprocess
@@ -2653,7 +2654,12 @@ def test_consume_unknown_plan_field_fails():
     assert executor.calls == []
 
 
-def test_consume_reordered_plan_fails():
+def test_consume_reordered_plan_accepted():
+    # Step 39: mapping insertion order is never part of the security
+    # contract -- a genuine plan's top-level keys, reordered exactly as
+    # they are after round-tripping through core.approval_transition_cli's
+    # own sort_keys=True JSON output, must still be accepted. Only key
+    # membership and values are checked, never insertion order.
     record = _canonical_approved_record()
     plan = _genuine_consume_plan(record)
     reordered_plan = {
@@ -2664,10 +2670,9 @@ def test_consume_reordered_plan_fails():
         "expected_investigation_id": plan["expected_investigation_id"],
         "expected_action_type": plan["expected_action_type"],
     }
-    executor = _RecordingExecutor(response=[{}])
-    with pytest.raises(ApprovalPersistenceError):
-        apply_approval_consumption(executor, record, reordered_plan)
-    assert executor.calls == []
+    executor = _consumption_executor_for(record, reordered_plan)
+    result = apply_approval_consumption(executor, record, reordered_plan)
+    assert result["updated_record"]["status"] == "consumed"
 
 
 def test_consume_approve_plan_fails():
@@ -2802,7 +2807,9 @@ def test_consume_set_fields_exact_three_key_shape_required():
     assert set(plan["set_fields"].keys()) == {"status", "consumed_by", "consumed_at"}
 
 
-def test_consume_set_fields_exact_order_required():
+def test_consume_set_fields_reordered_accepted():
+    # Step 39: same principle applied to the nested set_fields mapping --
+    # a genuine plan's set_fields, reordered, must still be accepted.
     record = _canonical_approved_record()
     plan = dict(_genuine_consume_plan(record))
     reordered_set_fields = {
@@ -2811,10 +2818,9 @@ def test_consume_set_fields_exact_order_required():
         "consumed_at": plan["set_fields"]["consumed_at"],
     }
     plan["set_fields"] = reordered_set_fields
-    executor = _RecordingExecutor(response=[{}])
-    with pytest.raises(ApprovalPersistenceError):
-        apply_approval_consumption(executor, record, plan)
-    assert executor.calls == []
+    executor = _consumption_executor_for(record, plan)
+    result = apply_approval_consumption(executor, record, plan)
+    assert result["updated_record"]["status"] == "consumed"
 
 
 def test_consume_set_fields_status_must_equal_consumed():
@@ -4372,6 +4378,85 @@ def test_consume_no_red_team_execution_exists_module_wide():
     identifiers = _referenced_identifiers(tree)
     for forbidden in ("execute_simulation", "run_atomic"):
         assert forbidden not in identifiers
+
+
+# ---------------------------------------------------------------------------
+# Step 39 regression: genuine plans must survive the real
+# sort_keys=True JSON round-trip core.approval_transition_cli actually
+# produces -- mapping insertion order is never part of the security
+# contract. These plans always come from validate_approval_transition
+# itself, never hand-built, exactly like the rest of this module's own
+# "genuine plan" fixtures.
+# ---------------------------------------------------------------------------
+
+
+def test_persistence_regression_001_approve_plan_survives_sort_keys_round_trip():
+    record = _canonical_pending_record()
+    plan = _genuine_approve_plan(record)
+    round_tripped_plan = json.loads(json.dumps(plan, sort_keys=True))
+    before = copy.deepcopy(round_tripped_plan)
+    executor = _review_executor_for(record, round_tripped_plan)
+    result = apply_approval_review_transition(executor, record, round_tripped_plan)
+    assert result["updated_record"]["status"] == "approved"
+    assert round_tripped_plan == before
+
+
+def test_persistence_regression_002_reject_plan_survives_sort_keys_round_trip():
+    record = _canonical_pending_record()
+    plan = _genuine_reject_plan(record)
+    round_tripped_plan = json.loads(json.dumps(plan, sort_keys=True))
+    before = copy.deepcopy(round_tripped_plan)
+    executor = _review_executor_for(record, round_tripped_plan)
+    result = apply_approval_review_transition(executor, record, round_tripped_plan)
+    assert result["updated_record"]["status"] == "rejected"
+    assert round_tripped_plan == before
+
+
+def test_persistence_regression_003_consume_plan_survives_sort_keys_round_trip():
+    record = _canonical_approved_record()
+    plan = _genuine_consume_plan(record)
+    round_tripped_plan = json.loads(json.dumps(plan, sort_keys=True))
+    before = copy.deepcopy(round_tripped_plan)
+    executor = _consumption_executor_for(record, round_tripped_plan)
+    result = apply_approval_consumption(executor, record, round_tripped_plan)
+    assert result["updated_record"]["status"] == "consumed"
+    assert round_tripped_plan == before
+
+
+def test_persistence_regression_004_sorted_approve_plan_extra_key_rejected():
+    record = _canonical_pending_record()
+    plan = _genuine_approve_plan(record)
+    round_tripped_plan = json.loads(json.dumps(plan, sort_keys=True))
+    tampered = copy.deepcopy(round_tripped_plan)
+    tampered["set_fields"]["extra_field"] = "unexpected"
+    executor = _review_executor_for(record, round_tripped_plan)
+    with pytest.raises(ApprovalPersistenceError):
+        apply_approval_review_transition(executor, record, tampered)
+    assert executor.calls == []
+
+
+def test_persistence_regression_005_sorted_reject_plan_missing_key_rejected():
+    record = _canonical_pending_record()
+    plan = _genuine_reject_plan(record)
+    round_tripped_plan = json.loads(json.dumps(plan, sort_keys=True))
+    tampered = copy.deepcopy(round_tripped_plan)
+    del tampered["set_fields"]["rejection_reason"]
+    executor = _review_executor_for(record, round_tripped_plan)
+    with pytest.raises(ApprovalPersistenceError):
+        apply_approval_review_transition(executor, record, tampered)
+    assert executor.calls == []
+
+
+def test_persistence_regression_006_sorted_consume_plan_incorrect_key_rejected():
+    record = _canonical_approved_record()
+    plan = _genuine_consume_plan(record)
+    round_tripped_plan = json.loads(json.dumps(plan, sort_keys=True))
+    tampered = copy.deepcopy(round_tripped_plan)
+    tampered["set_fields"]["consumed_by_wrong"] = tampered["set_fields"].pop("consumed_by")
+    executor = _consumption_executor_for(record, round_tripped_plan)
+    with pytest.raises(ApprovalPersistenceError):
+        apply_approval_consumption(executor, record, tampered)
+    assert executor.calls == []
 
 
 # ---------------------------------------------------------------------------
