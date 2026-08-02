@@ -94,15 +94,35 @@ def _approved_record(**overrides):
     return record
 
 
-def _genuine_approve_plan(record, reviewed_by="Security Reviewer"):
-    return validate_approval_transition(record, {"transition": "approve", "reviewed_by": reviewed_by})
+# Fixed, deterministic default reviewed_at -- strictly after REQUESTED_AT
+# and strictly before EXPIRES_AT for the shared _pending_row() window, so
+# _genuine_approve_plan/_genuine_reject_plan never fall through to
+# validate_approval_transition's own wall-clock (datetime.now(timezone.utc))
+# generation path. Matches the same logical timestamp already used for
+# this purpose in tests/test_approval_persistence.py's own REVIEWED_AT.
+REVIEWED_AT = "2026-08-01T16:00:00Z"
+
+
+def _genuine_approve_plan(record, reviewed_by="Security Reviewer", reviewed_at=REVIEWED_AT):
+    return validate_approval_transition(
+        record, {"transition": "approve", "reviewed_by": reviewed_by, "reviewed_at": reviewed_at}
+    )
 
 
 def _genuine_reject_plan(
-    record, reviewed_by="Security Reviewer", rejection_reason="Needs more evidence before approval."
+    record,
+    reviewed_by="Security Reviewer",
+    rejection_reason="Needs more evidence before approval.",
+    reviewed_at=REVIEWED_AT,
 ):
     return validate_approval_transition(
-        record, {"transition": "reject", "reviewed_by": reviewed_by, "rejection_reason": rejection_reason}
+        record,
+        {
+            "transition": "reject",
+            "reviewed_by": reviewed_by,
+            "rejection_reason": rejection_reason,
+            "reviewed_at": reviewed_at,
+        },
     )
 
 

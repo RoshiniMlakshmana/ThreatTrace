@@ -1565,31 +1565,38 @@ def test_261_validate_approval_record_remains_record_contract_owner():
 # apply_approval_review_transition -- fixtures
 # ---------------------------------------------------------------------------
 
+# Fixed, deterministic default reviewed_at for _genuine_approve_plan/
+# _genuine_reject_plan below -- strictly after REQUESTED_AT and strictly
+# before EXPIRES_AT for the default _canonical_pending_record() window, so
+# these helpers never fall through to validate_approval_transition's own
+# wall-clock (`datetime.now(timezone.utc)`) generation path. Advancing the
+# real system date must never change what these fixtures produce; a caller
+# that needs a different (still explicit) moment passes reviewed_at=...
+# directly, as several tests below already do.
+REVIEWED_AT = "2026-08-01T16:00:00Z"
+
 
 def _canonical_pending_record(**overrides):
     return _pending_row(**overrides)
 
 
-def _genuine_approve_plan(current_record, reviewed_by="Security Reviewer", reviewed_at=None):
-    request = {"transition": "approve", "reviewed_by": reviewed_by}
-    if reviewed_at is not None:
-        request["reviewed_at"] = reviewed_at
+def _genuine_approve_plan(current_record, reviewed_by="Security Reviewer", reviewed_at=REVIEWED_AT):
+    request = {"transition": "approve", "reviewed_by": reviewed_by, "reviewed_at": reviewed_at}
     return validate_approval_transition(current_record, request)
 
 
 def _genuine_reject_plan(
     current_record,
     reviewed_by="Security Reviewer",
-    reviewed_at=None,
+    reviewed_at=REVIEWED_AT,
     rejection_reason="Needs more evidence before approval.",
 ):
     request = {
         "transition": "reject",
         "reviewed_by": reviewed_by,
         "rejection_reason": rejection_reason,
+        "reviewed_at": reviewed_at,
     }
-    if reviewed_at is not None:
-        request["reviewed_at"] = reviewed_at
     return validate_approval_transition(current_record, request)
 
 

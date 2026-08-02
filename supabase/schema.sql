@@ -655,6 +655,14 @@ revoke execute on function public.consume_approval_and_update_investigation_stat
     timestamptz
 ) from public;
 
+revoke execute on function public.consume_approval_and_update_investigation_state(
+    uuid,
+    uuid,
+    text,
+    text,
+    timestamptz
+) from anon, authenticated;
+
 grant execute on function public.consume_approval_and_update_investigation_state(
     uuid,
     uuid,

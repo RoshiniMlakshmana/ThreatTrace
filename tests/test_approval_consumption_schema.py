@@ -333,19 +333,43 @@ def _function_start_index():
 # Permission-statement isolation
 # ---------------------------------------------------------------------------
 
-def _revoke_details():
+def _all_revoke_matches():
+    """Return one dict per REVOKE EXECUTE ON FUNCTION statement for this
+    exact function signature, in source order -- there are now two such
+    statements (FROM PUBLIC, and FROM anon, authenticated), so callers must
+    disambiguate by inspecting each match's own tail rather than assuming
+    there is only one."""
     schema_text = _read_schema_text()
     pattern = re.compile(
         r"revoke\s+execute\s+on\s+function\s+" + re.escape(FUNCTION_NAME) + r"\s*\(",
         re.IGNORECASE,
     )
-    matches = list(pattern.finditer(schema_text))
-    assert len(matches) == 1, "expected exactly one REVOKE EXECUTE statement for this function"
-    match = matches[0]
-    open_paren_index = match.end() - 1
-    args_text, after_index = _extract_parenthesized_block(schema_text, open_paren_index)
-    tail = schema_text[after_index:after_index + 80]
-    return args_text, tail
+    results = []
+    for match in pattern.finditer(schema_text):
+        open_paren_index = match.end() - 1
+        args_text, after_index = _extract_parenthesized_block(schema_text, open_paren_index)
+        tail = schema_text[after_index:after_index + 80]
+        results.append({"start": match.start(), "args_text": args_text, "tail": tail})
+    return results
+
+
+def _revoke_details():
+    """The FROM PUBLIC revoke statement specifically (kept for the
+    pre-existing test_125/test_126, which predate the anon/authenticated
+    revoke added in Step 25)."""
+    matches = [m for m in _all_revoke_matches() if re.match(r"\s*from\s+public\s*;", m["tail"], re.IGNORECASE)]
+    assert len(matches) == 1, "expected exactly one REVOKE EXECUTE ... FROM PUBLIC statement"
+    return matches[0]["args_text"], matches[0]["tail"]
+
+
+def _anon_authenticated_revoke_details():
+    """The FROM anon, authenticated revoke statement added in Step 25."""
+    matches = [
+        m for m in _all_revoke_matches()
+        if re.search(r"\bfrom\s+anon\s*,\s*authenticated\s*;", m["tail"], re.IGNORECASE)
+    ]
+    assert len(matches) == 1, "expected exactly one REVOKE EXECUTE ... FROM anon, authenticated statement"
+    return matches[0]
 
 
 def _grant_details():
@@ -1392,3 +1416,117 @@ def test_162_uses_precise_parsing_not_broad_self_referential_substring_checks():
     tree = ast.parse(_this_module_source())
     function_defs = [node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)]
     assert len(function_defs) > 100
+
+
+# ---------------------------------------------------------------------------
+# 163-177: anon/authenticated RPC execution hardening (Step 25)
+# ---------------------------------------------------------------------------
+
+def test_163_anon_authenticated_revoke_exists_exactly_once():
+    # _anon_authenticated_revoke_details() itself asserts exactly one match;
+    # simply calling it without raising proves the statement exists.
+    match = _anon_authenticated_revoke_details()
+    assert match is not None
+
+
+def test_164_anon_authenticated_revoke_signature_exactly_matches_function():
+    match = _anon_authenticated_revoke_details()
+    assert _arg_type_list(match["args_text"]) == ["uuid", "uuid", "text", "text", "timestamptz"]
+
+
+def test_165_anon_and_authenticated_both_appear_in_revoke_role_list():
+    match = _anon_authenticated_revoke_details()
+    role_list_match = re.search(r"from\s+(.*?)\s*;", match["tail"], re.IGNORECASE | re.DOTALL)
+    assert role_list_match is not None
+    roles = {token.strip().lower() for token in role_list_match.group(1).split(",")}
+    assert roles == {"anon", "authenticated"}
+
+
+def test_166_anon_authenticated_revoke_statement_appears_exactly_once():
+    schema_text = _read_schema_text()
+    matches = list(re.finditer(
+        r"revoke\s+execute\s+on\s+function\s+" + re.escape(FUNCTION_NAME)
+        + r"\s*\([^)]*\)\s*from\s+anon\s*,\s*authenticated\s*;",
+        schema_text,
+        re.IGNORECASE | re.DOTALL,
+    ))
+    assert len(matches) == 1
+
+
+def test_167_anon_authenticated_revoke_appears_after_public_revoke():
+    public_matches = [m for m in _all_revoke_matches() if re.match(r"\s*from\s+public\s*;", m["tail"], re.IGNORECASE)]
+    assert len(public_matches) == 1
+    anon_match = _anon_authenticated_revoke_details()
+    assert public_matches[0]["start"] < anon_match["start"]
+
+
+def test_168_anon_authenticated_revoke_appears_before_service_role_grant():
+    schema_text = _read_schema_text()
+    grant_pattern = re.compile(
+        r"grant\s+execute\s+on\s+function\s+" + re.escape(FUNCTION_NAME) + r"\s*\(",
+        re.IGNORECASE,
+    )
+    grant_match = grant_pattern.search(schema_text)
+    assert grant_match is not None
+    anon_match = _anon_authenticated_revoke_details()
+    assert anon_match["start"] < grant_match.start()
+
+
+def test_169_no_grant_execute_to_anon_exists():
+    _args_text, tail = _grant_details()
+    assert "anon" not in tail.lower()
+
+
+def test_170_no_grant_execute_to_authenticated_exists():
+    _args_text, tail = _grant_details()
+    assert "authenticated" not in tail.lower()
+
+
+def test_171_public_revoke_remains_present():
+    args_text, tail = _revoke_details()
+    assert _arg_type_list(args_text) == ["uuid", "uuid", "text", "text", "timestamptz"]
+    assert re.match(r"\s*from\s+public\s*;", tail, re.IGNORECASE)
+
+
+def test_172_service_role_grant_remains_present():
+    args_text, tail = _grant_details()
+    assert _arg_type_list(args_text) == ["uuid", "uuid", "text", "text", "timestamptz"]
+    assert re.match(r"\s*to\s+service_role\s*;", tail, re.IGNORECASE)
+
+
+def test_173_no_alter_default_privileges_statement_exists():
+    schema_text = _read_schema_text()
+    assert "alter default privileges" not in schema_text.lower()
+
+
+def test_174_no_unrelated_function_permission_statement_changed():
+    schema_text = _read_schema_text()
+    revoke_matches = list(re.finditer(r"revoke\s+execute\s+on\s+function\s+([\w.]+)\s*\(", schema_text, re.IGNORECASE))
+    grant_matches = list(re.finditer(r"grant\s+execute\s+on\s+function\s+([\w.]+)\s*\(", schema_text, re.IGNORECASE))
+    assert revoke_matches and grant_matches
+    for match in revoke_matches + grant_matches:
+        assert match.group(1) == FUNCTION_NAME
+
+
+def test_175_function_body_unchanged_by_permission_hardening():
+    body = _function_body_normalized()
+    assert "returning public.approvals.* into v_approval" in body
+    assert "returning public.investigations.* into v_investigation" in body
+    assert body.count("update public.approvals") == 1
+    assert body.count("update public.investigations") == 1
+
+
+def test_176_return_contract_unchanged_by_permission_hardening():
+    parsed = _parsed_return_columns()
+    assert len(parsed) == 19
+    assert [name for name, _type in parsed[:16]] == list(APPROVAL_RETURN_COLUMN_NAMES)
+    assert parsed[16][0] == "investigation_status"
+    assert parsed[17][0] == "investigation_confidence"
+    assert parsed[18][0] == "investigation_updated_at"
+
+
+def test_177_no_new_rls_policy_or_trigger_added():
+    schema_text = _read_schema_text()
+    assert "create policy" not in schema_text.lower()
+    triggers = re.findall(r"create\s+trigger\s+(\w+)", schema_text, re.IGNORECASE)
+    assert triggers == ["trg_investigations_updated_at"]
