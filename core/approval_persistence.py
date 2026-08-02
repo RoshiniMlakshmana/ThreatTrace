@@ -12,10 +12,13 @@ This module is a dependency-injected adapter, not a Supabase client:
   callable supplied by the caller for each public function -- a future
   bridge (Supabase MCP tool call, Supabase Python client, or any other
   PostgreSQL-compatible implementation) is entirely out of scope here.
-- It never issues an approve, reject, or consume operation, never builds a
-  conditional update, never opens a transaction, and never updates an
-  investigation. Only two operations exist: inserting one pending approval
-  row, and selecting one approval row by `id`.
+- It never issues a consume operation, never opens a database transaction,
+  never calls a PostgreSQL RPC function, and never updates an
+  investigation. Exactly three operations exist: inserting one pending
+  approval row, selecting one approval row by `id`, and a single
+  conditional update that moves one approval from `pending` to `approved`
+  or from `pending` to `rejected` -- guarded by an `id` filter plus a
+  full pending-lifecycle-shape filter, never a bare `id`-only update.
 - It never authenticates anyone, never hashes an action, never enforces
   immutable history, and never performs containment or Red Team execution.
 
@@ -36,7 +39,11 @@ from datetime import datetime, timezone
 from typing import Any, Protocol
 
 from core.approval_request import ApprovalRequestError, validate_approval_request
-from core.approval_transition import ApprovalTransitionError, validate_approval_record
+from core.approval_transition import (
+    ApprovalTransitionError,
+    validate_approval_record,
+    validate_approval_transition,
+)
 
 
 class ApprovalExecutor(Protocol):
@@ -76,6 +83,13 @@ class ApprovalResponseError(ApprovalPersistenceError):
 class ApprovalTransportError(ApprovalPersistenceError):
     """Raised when the supplied executor itself raises. The original
     exception is never exposed -- only this fixed, generic error."""
+
+
+class ApprovalConflictError(ApprovalPersistenceError):
+    """Raised only when a structurally valid, genuinely re-verified
+    approve/reject conditional update matches zero rows -- the approval
+    was concurrently modified (or no longer pending) between load and
+    update. Never retried."""
 
 
 _VALIDATED_REQUEST_FIELDS = frozenset(
@@ -119,6 +133,26 @@ _INSERT_RESPONSE_MESSAGE = "Approval insert response was invalid."
 _LOOKUP_RESPONSE_MESSAGE = "Approval lookup response was invalid."
 _NOT_FOUND_MESSAGE = "Approval was not found."
 _TRANSPORT_MESSAGE = "Approval persistence operation failed."
+_INVALID_REVIEW_INPUT_MESSAGE = "Invalid review transition input."
+_INVALID_REVIEW_PLAN_MESSAGE = "Invalid review transition plan."
+_REVIEW_RESPONSE_MESSAGE = "Approval review response was invalid."
+_REVIEW_CONFLICT_MESSAGE = "Approval review transition conflicted."
+
+_REVIEW_TRANSITION_PLAN_FIELDS = frozenset({"approval_id", "from_status", "to_status", "set_fields"})
+_REVIEW_TARGET_STATUSES = frozenset({"approved", "rejected"})
+
+_APPROVE_SET_FIELDS_ORDER = ("status", "approved_by", "approved_at")
+_REJECT_SET_FIELDS_ORDER = ("status", "rejected_by", "rejected_at", "rejection_reason")
+
+_PENDING_LIFECYCLE_FILTER_FIELDS = (
+    "approved_by",
+    "approved_at",
+    "rejected_by",
+    "rejected_at",
+    "rejection_reason",
+    "consumed_by",
+    "consumed_at",
+)
 
 
 def _validate_validated_request(validated_request: Any) -> dict[str, Any]:
@@ -346,3 +380,214 @@ def load_approval_record(
         raise ApprovalResponseError(_LOOKUP_RESPONSE_MESSAGE)
 
     return record
+
+
+def _validate_current_record_for_review(current_record: Any) -> dict[str, Any]:
+    if not isinstance(current_record, Mapping):
+        raise ApprovalPersistenceError(_INVALID_REVIEW_INPUT_MESSAGE)
+
+    try:
+        validated = validate_approval_record(current_record)
+    except ApprovalTransitionError:
+        raise ApprovalPersistenceError(_INVALID_REVIEW_INPUT_MESSAGE) from None
+
+    if validated != dict(current_record):
+        raise ApprovalPersistenceError(_INVALID_REVIEW_INPUT_MESSAGE)
+
+    if validated["status"] != "pending":
+        raise ApprovalPersistenceError(_INVALID_REVIEW_INPUT_MESSAGE)
+
+    return validated
+
+
+def _validate_review_transition_plan(
+    transition_plan: Any,
+    validated_current_record: Mapping[str, Any],
+) -> tuple[str, str]:
+    if not isinstance(transition_plan, Mapping):
+        raise ApprovalPersistenceError(_INVALID_REVIEW_PLAN_MESSAGE)
+
+    if set(transition_plan) != _REVIEW_TRANSITION_PLAN_FIELDS:
+        raise ApprovalPersistenceError(_INVALID_REVIEW_PLAN_MESSAGE)
+
+    approval_id = transition_plan["approval_id"]
+    canonical_approval_id = _validate_approval_id(approval_id)
+    if canonical_approval_id != approval_id:
+        raise ApprovalPersistenceError(_INVALID_REVIEW_PLAN_MESSAGE)
+    if canonical_approval_id != validated_current_record["id"]:
+        raise ApprovalPersistenceError(_INVALID_REVIEW_PLAN_MESSAGE)
+
+    from_status = transition_plan["from_status"]
+    if from_status != "pending":
+        raise ApprovalPersistenceError(_INVALID_REVIEW_PLAN_MESSAGE)
+    if from_status != validated_current_record["status"]:
+        raise ApprovalPersistenceError(_INVALID_REVIEW_PLAN_MESSAGE)
+
+    to_status = transition_plan["to_status"]
+    if to_status not in _REVIEW_TARGET_STATUSES:
+        raise ApprovalPersistenceError(_INVALID_REVIEW_PLAN_MESSAGE)
+
+    set_fields = transition_plan["set_fields"]
+    if not isinstance(set_fields, Mapping) or not set_fields:
+        raise ApprovalPersistenceError(_INVALID_REVIEW_PLAN_MESSAGE)
+
+    if set_fields.get("status") != to_status:
+        raise ApprovalPersistenceError(_INVALID_REVIEW_PLAN_MESSAGE)
+
+    return to_status, canonical_approval_id
+
+
+def _verify_genuine_review_plan(
+    to_status: str,
+    transition_plan: Mapping[str, Any],
+    validated_current_record: Mapping[str, Any],
+) -> dict[str, Any]:
+    set_fields = transition_plan["set_fields"]
+
+    if to_status == "approved":
+        if list(set_fields) != list(_APPROVE_SET_FIELDS_ORDER):
+            raise ApprovalPersistenceError(_INVALID_REVIEW_PLAN_MESSAGE)
+        reconstructed_request = {
+            "transition": "approve",
+            "reviewed_by": set_fields.get("approved_by"),
+            "reviewed_at": set_fields.get("approved_at"),
+        }
+    else:
+        if list(set_fields) != list(_REJECT_SET_FIELDS_ORDER):
+            raise ApprovalPersistenceError(_INVALID_REVIEW_PLAN_MESSAGE)
+        reconstructed_request = {
+            "transition": "reject",
+            "reviewed_by": set_fields.get("rejected_by"),
+            "reviewed_at": set_fields.get("rejected_at"),
+            "rejection_reason": set_fields.get("rejection_reason"),
+        }
+
+    try:
+        recomputed_plan = validate_approval_transition(validated_current_record, reconstructed_request)
+    except ApprovalTransitionError:
+        raise ApprovalPersistenceError(_INVALID_REVIEW_PLAN_MESSAGE) from None
+
+    if recomputed_plan != dict(transition_plan):
+        raise ApprovalPersistenceError(_INVALID_REVIEW_PLAN_MESSAGE)
+
+    return recomputed_plan
+
+
+def _compute_expected_updated_record(
+    validated_current_record: Mapping[str, Any],
+    set_fields: Mapping[str, Any],
+) -> dict[str, Any]:
+    candidate = dict(copy.deepcopy(dict(validated_current_record)))
+    candidate.update(copy.deepcopy(dict(set_fields)))
+    try:
+        return validate_approval_record(candidate)
+    except ApprovalTransitionError:
+        raise ApprovalPersistenceError(_INVALID_REVIEW_PLAN_MESSAGE) from None
+
+
+def apply_approval_review_transition(
+    executor: ApprovalExecutor,
+    current_record: Mapping[str, Any],
+    transition_plan: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Apply one genuine pending -> approved or pending -> rejected
+    transition plan as a single conditional update, and return the
+    verified plan alongside the updated, canonical sixteen-field record.
+
+    `current_record` must already be the exact, canonical output of
+    `validate_approval_record`, with `status == "pending"` -- an
+    approved, rejected, or consumed record is rejected before the
+    executor is ever invoked, as is any record validation would change.
+    `transition_plan` must contain exactly `approval_id`, `from_status`,
+    `to_status`, and `set_fields`; only `pending -> approved` and
+    `pending -> rejected` are supported (a consume plan, a pending
+    target, a repeated-state plan, or any missing/unknown/noncanonical
+    field is rejected before the executor is ever invoked).
+
+    The supplied plan is never trusted at face value: this function
+    reconstructs the equivalent transition request from `set_fields` and
+    recomputes the plan by calling `validate_approval_transition` exactly
+    once, requiring the result to equal the supplied plan exactly. This
+    re-derives (and cannot bypass) self-approval prevention, Unicode
+    casefold comparison, expiry enforcement, timestamp validation, and
+    identity canonicalization -- self-rejection and rejection-after-
+    expiry remain allowed, exactly as `validate_approval_transition`
+    itself allows them.
+
+    Invokes `executor` exactly once with a conditional update operation
+    descriptor for the `approvals` table: `values` contains only the
+    verified `set_fields`, and `filters` requires the canonical `id`,
+    `status == "pending"`, and every lifecycle field still null -- so a
+    concurrently modified or already-transitioned row can never match.
+    Zero returned rows raises `ApprovalConflictError` (never retried).
+    Exactly one row is required; it is normalized, validated through
+    `validate_approval_record`, and required to equal the independently
+    computed expected updated record exactly (proving the identifier,
+    frozen request fields, `action_payload`, `expires_at`, and
+    `created_at` are unchanged, and that only the plan's own `set_fields`
+    were applied).
+
+    Returns exactly:
+
+        {
+            "transition_plan": {...},
+            "updated_record": {...},
+        }
+
+    This is a:
+
+        Verified approval review update -- no consumption or investigation update
+
+    Raises `ApprovalPersistenceError` for invalid `current_record` or
+    `transition_plan` input (before the executor is ever invoked),
+    `ApprovalConflictError` for a genuine plan matched against zero rows,
+    `ApprovalResponseError` for any other malformed or mismatched executor
+    response, and `ApprovalTransportError` if `executor` itself raises.
+    Never raises `ApprovalTransitionError` directly. Never mutates
+    `current_record`, its nested `action_payload`, `transition_plan`, or
+    `transition_plan["set_fields"]`, and never returns a persistence
+    receipt, row count, operation descriptor, authentication result, or
+    investigation-update result.
+    """
+    validated_current_record = _validate_current_record_for_review(current_record)
+
+    to_status, canonical_approval_id = _validate_review_transition_plan(
+        transition_plan, validated_current_record
+    )
+
+    recomputed_plan = _verify_genuine_review_plan(to_status, transition_plan, validated_current_record)
+
+    genuine_set_fields = recomputed_plan["set_fields"]
+
+    expected_updated_record = _compute_expected_updated_record(validated_current_record, genuine_set_fields)
+
+    filters: dict[str, Any] = {"id": canonical_approval_id, "status": "pending"}
+    for field_name in _PENDING_LIFECYCLE_FILTER_FIELDS:
+        filters[field_name] = None
+
+    operation = {
+        "operation": "update",
+        "table": "approvals",
+        "values": copy.deepcopy(dict(genuine_set_fields)),
+        "filters": filters,
+        "returning": list(_RECORD_FIELDS),
+    }
+
+    response = _invoke_executor(executor, operation)
+
+    if not isinstance(response, list):
+        raise ApprovalResponseError(_REVIEW_RESPONSE_MESSAGE)
+    if len(response) == 0:
+        raise ApprovalConflictError(_REVIEW_CONFLICT_MESSAGE)
+    if len(response) > 1:
+        raise ApprovalResponseError(_REVIEW_RESPONSE_MESSAGE)
+
+    updated_record = _validate_row_shape(response[0], _REVIEW_RESPONSE_MESSAGE)
+
+    if updated_record != expected_updated_record:
+        raise ApprovalResponseError(_REVIEW_RESPONSE_MESSAGE)
+
+    return {
+        "transition_plan": copy.deepcopy(dict(recomputed_plan)),
+        "updated_record": copy.deepcopy(updated_record),
+    }

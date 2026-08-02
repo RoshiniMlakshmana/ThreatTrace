@@ -30,16 +30,22 @@ import pytest
 
 import core.approval_persistence as approval_persistence
 from core.approval_persistence import (
+    ApprovalConflictError,
     ApprovalExecutor,
     ApprovalNotFoundError,
     ApprovalPersistenceError,
     ApprovalResponseError,
     ApprovalTransportError,
+    apply_approval_review_transition,
     insert_pending_approval,
     load_approval_record,
 )
 from core.approval_request import ApprovalRequestError
-from core.approval_transition import ApprovalTransitionError, validate_approval_record
+from core.approval_transition import (
+    ApprovalTransitionError,
+    validate_approval_record,
+    validate_approval_transition,
+)
 
 APPROVAL_ID = "51111111-1111-4111-8111-111111111111"
 INVESTIGATION_ID = "41111111-1111-4111-8111-111111111111"
@@ -209,8 +215,9 @@ def test_008_approval_transport_error_subclasses_persistence_error():
     assert issubclass(ApprovalTransportError, ApprovalPersistenceError)
 
 
-def test_009_approval_conflict_error_does_not_exist_yet():
-    assert not hasattr(approval_persistence, "ApprovalConflictError")
+def test_009_approval_conflict_error_exists_and_subclasses_persistence_error():
+    assert hasattr(approval_persistence, "ApprovalConflictError")
+    assert issubclass(approval_persistence.ApprovalConflictError, ApprovalPersistenceError)
 
 
 def test_010_plain_function_executor_works_without_any_client_type():
@@ -1497,7 +1504,7 @@ def test_243_to_257_no_forbidden_identifiers_referenced(forbidden_identifier):
     assert forbidden_identifier not in identifiers
 
 
-def test_250_only_insert_and_select_operations_exist():
+def test_250_only_insert_select_and_update_operations_exist():
     tree = _module_ast()
     operation_values = set()
     for node in ast.walk(tree):
@@ -1509,16 +1516,19 @@ def test_250_only_insert_and_select_operations_exist():
                     and isinstance(value_node, ast.Constant)
                 ):
                     operation_values.add(value_node.value)
-    assert operation_values == {"insert", "select"}
+    assert operation_values == {"insert", "select", "update"}
 
 
-def test_258_no_approval_conflict_error_yet():
-    assert not hasattr(approval_persistence, "ApprovalConflictError")
+def test_258_approval_conflict_error_reserved_for_review_transitions():
+    # ApprovalConflictError now exists (Step 8), but only for a
+    # structurally-genuine approve/reject update matched against zero
+    # rows -- covered functionally in the review-transition test section.
+    assert issubclass(approval_persistence.ApprovalConflictError, ApprovalPersistenceError)
 
 
 def test_259_public_functions_only_call_the_executor_for_io():
     tree = _module_ast()
-    for function_name in ("insert_pending_approval", "load_approval_record"):
+    for function_name in ("insert_pending_approval", "load_approval_record", "apply_approval_review_transition"):
         fn = _function_def(tree, function_name)
         called = {
             node.func.id
@@ -1548,6 +1558,715 @@ def test_261_validate_approval_record_remains_record_contract_owner():
             for alias in node.names:
                 import_names.add(alias.name)
     assert "validate_approval_record" in import_names
+
+
+# ---------------------------------------------------------------------------
+# apply_approval_review_transition -- fixtures
+# ---------------------------------------------------------------------------
+
+
+def _canonical_pending_record(**overrides):
+    return _pending_row(**overrides)
+
+
+def _genuine_approve_plan(current_record, reviewed_by="Security Reviewer", reviewed_at=None):
+    request = {"transition": "approve", "reviewed_by": reviewed_by}
+    if reviewed_at is not None:
+        request["reviewed_at"] = reviewed_at
+    return validate_approval_transition(current_record, request)
+
+
+def _genuine_reject_plan(
+    current_record,
+    reviewed_by="Security Reviewer",
+    reviewed_at=None,
+    rejection_reason="Needs more evidence before approval.",
+):
+    request = {
+        "transition": "reject",
+        "reviewed_by": reviewed_by,
+        "rejection_reason": rejection_reason,
+    }
+    if reviewed_at is not None:
+        request["reviewed_at"] = reviewed_at
+    return validate_approval_transition(current_record, request)
+
+
+def _apply_set_fields(record, set_fields):
+    updated = dict(record)
+    updated.update(set_fields)
+    return updated
+
+
+def _review_executor_for(record, plan, *, row_override=None):
+    response = row_override if row_override is not None else [_apply_set_fields(record, plan["set_fields"])]
+    return _RecordingExecutor(response=response)
+
+
+# ---------------------------------------------------------------------------
+# apply_approval_review_transition -- public boundary
+# ---------------------------------------------------------------------------
+
+
+def test_review_conflict_error_subclasses_persistence_error():
+    assert issubclass(ApprovalConflictError, ApprovalPersistenceError)
+
+
+def test_review_signature_has_exactly_three_required_parameters():
+    signature = inspect.signature(apply_approval_review_transition)
+    parameters = signature.parameters
+    assert list(parameters) == ["executor", "current_record", "transition_plan"]
+    for name in parameters:
+        assert parameters[name].default is inspect.Parameter.empty
+
+
+def test_review_no_transition_request_or_now_parameter():
+    signature = inspect.signature(apply_approval_review_transition)
+    assert "transition_request" not in signature.parameters
+    assert "now" not in signature.parameters
+
+
+def test_review_no_consume_specific_persistence_function_exists():
+    assert not hasattr(approval_persistence, "apply_approval_consume_transition")
+    assert not hasattr(approval_persistence, "consume_pending_approval")
+    assert not hasattr(approval_persistence, "apply_approval_consume")
+
+
+def test_review_required_docstring_phrase_exists():
+    assert (
+        "Verified approval review update -- no consumption or investigation update"
+        in apply_approval_review_transition.__doc__
+    )
+
+
+# ---------------------------------------------------------------------------
+# apply_approval_review_transition -- approve success
+# ---------------------------------------------------------------------------
+
+
+def test_review_genuine_approve_plan_succeeds():
+    record = _canonical_pending_record()
+    plan = _genuine_approve_plan(record)
+    executor = _review_executor_for(record, plan)
+    result = apply_approval_review_transition(executor, record, plan)
+    assert result["updated_record"]["status"] == "approved"
+
+
+def test_review_approve_executor_called_exactly_once():
+    record = _canonical_pending_record()
+    plan = _genuine_approve_plan(record)
+    executor = _review_executor_for(record, plan)
+    apply_approval_review_transition(executor, record, plan)
+    assert len(executor.calls) == 1
+
+
+def test_review_approve_descriptor_is_exact():
+    record = _canonical_pending_record()
+    plan = _genuine_approve_plan(record)
+    executor = _review_executor_for(record, plan)
+    apply_approval_review_transition(executor, record, plan)
+    operation = executor.calls[0]
+    assert operation["operation"] == "update"
+    assert operation["table"] == "approvals"
+    assert operation["values"] == plan["set_fields"]
+    assert set(operation) == {"operation", "table", "values", "filters", "returning"}
+
+
+def test_review_return_contains_exactly_transition_plan_and_updated_record():
+    record = _canonical_pending_record()
+    plan = _genuine_approve_plan(record)
+    executor = _review_executor_for(record, plan)
+    result = apply_approval_review_transition(executor, record, plan)
+    assert list(result) == ["transition_plan", "updated_record"]
+
+
+def test_review_approved_metadata_matches_plan():
+    record = _canonical_pending_record()
+    plan = _genuine_approve_plan(record)
+    executor = _review_executor_for(record, plan)
+    result = apply_approval_review_transition(executor, record, plan)
+    updated = result["updated_record"]
+    assert updated["approved_by"] == plan["set_fields"]["approved_by"]
+    assert updated["approved_at"] == plan["set_fields"]["approved_at"]
+
+
+def test_review_frozen_fields_unchanged_after_approve():
+    record = _canonical_pending_record()
+    plan = _genuine_approve_plan(record)
+    executor = _review_executor_for(record, plan)
+    result = apply_approval_review_transition(executor, record, plan)
+    updated = result["updated_record"]
+    for field_name in (
+        "id", "investigation_id", "action_type", "action_payload",
+        "requested_by", "requested_at", "expires_at", "created_at",
+    ):
+        assert updated[field_name] == record[field_name]
+
+
+def test_review_rejection_and_consumption_fields_none_after_approve():
+    record = _canonical_pending_record()
+    plan = _genuine_approve_plan(record)
+    executor = _review_executor_for(record, plan)
+    result = apply_approval_review_transition(executor, record, plan)
+    updated = result["updated_record"]
+    for field_name in ("rejected_by", "rejected_at", "rejection_reason", "consumed_by", "consumed_at"):
+        assert updated[field_name] is None
+
+
+# ---------------------------------------------------------------------------
+# apply_approval_review_transition -- reject success
+# ---------------------------------------------------------------------------
+
+
+def test_review_genuine_reject_plan_succeeds():
+    record = _canonical_pending_record()
+    plan = _genuine_reject_plan(record)
+    executor = _review_executor_for(record, plan)
+    result = apply_approval_review_transition(executor, record, plan)
+    assert result["updated_record"]["status"] == "rejected"
+
+
+def test_review_self_rejection_succeeds():
+    record = _canonical_pending_record(requested_by="Roshini Analyst")
+    plan = _genuine_reject_plan(record, reviewed_by="Roshini Analyst")
+    executor = _review_executor_for(record, plan)
+    result = apply_approval_review_transition(executor, record, plan)
+    assert result["updated_record"]["rejected_by"] == "Roshini Analyst"
+
+
+def test_review_rejection_metadata_matches_plan():
+    record = _canonical_pending_record()
+    plan = _genuine_reject_plan(record)
+    executor = _review_executor_for(record, plan)
+    result = apply_approval_review_transition(executor, record, plan)
+    updated = result["updated_record"]
+    assert updated["rejected_by"] == plan["set_fields"]["rejected_by"]
+    assert updated["rejected_at"] == plan["set_fields"]["rejected_at"]
+    assert updated["rejection_reason"] == plan["set_fields"]["rejection_reason"]
+
+
+def test_review_frozen_fields_unchanged_after_reject():
+    record = _canonical_pending_record()
+    plan = _genuine_reject_plan(record)
+    executor = _review_executor_for(record, plan)
+    result = apply_approval_review_transition(executor, record, plan)
+    updated = result["updated_record"]
+    for field_name in (
+        "id", "investigation_id", "action_type", "action_payload",
+        "requested_by", "requested_at", "expires_at", "created_at",
+    ):
+        assert updated[field_name] == record[field_name]
+
+
+def test_review_approval_and_consumption_fields_none_after_reject():
+    record = _canonical_pending_record()
+    plan = _genuine_reject_plan(record)
+    executor = _review_executor_for(record, plan)
+    result = apply_approval_review_transition(executor, record, plan)
+    updated = result["updated_record"]
+    for field_name in ("approved_by", "approved_at", "consumed_by", "consumed_at"):
+        assert updated[field_name] is None
+
+
+# ---------------------------------------------------------------------------
+# apply_approval_review_transition -- input failure
+# ---------------------------------------------------------------------------
+
+
+def test_review_malformed_record_fails_before_executor():
+    executor = _RecordingExecutor(response=[_pending_row()])
+    with pytest.raises(ApprovalPersistenceError):
+        apply_approval_review_transition(executor, ["not", "a", "mapping"], {})
+    assert executor.calls == []
+
+
+def test_review_noncanonical_record_fails():
+    record = _canonical_pending_record(id=APPROVAL_ID.upper())
+    executor = _RecordingExecutor(response=[_pending_row()])
+    with pytest.raises(ApprovalPersistenceError):
+        apply_approval_review_transition(executor, record, {})
+    assert executor.calls == []
+
+
+def test_review_non_pending_record_fails():
+    record = _canonical_pending_record(
+        status="approved",
+        approved_by="Security Reviewer",
+        approved_at="2026-08-01T16:00:00Z",
+    )
+    executor = _RecordingExecutor(response=[_pending_row()])
+    with pytest.raises(ApprovalPersistenceError):
+        apply_approval_review_transition(executor, record, {})
+    assert executor.calls == []
+
+
+def test_review_malformed_plan_fails():
+    record = _canonical_pending_record()
+    executor = _RecordingExecutor(response=[_pending_row()])
+    with pytest.raises(ApprovalPersistenceError):
+        apply_approval_review_transition(executor, record, {"not": "a valid plan"})
+    assert executor.calls == []
+
+
+def test_review_plan_id_mismatch_fails():
+    record = _canonical_pending_record()
+    plan = _genuine_approve_plan(record)
+    forged_plan = copy.deepcopy(plan)
+    forged_plan["approval_id"] = "59999999-9999-4999-8999-999999999999"
+    executor = _RecordingExecutor(response=[_pending_row()])
+    with pytest.raises(ApprovalPersistenceError):
+        apply_approval_review_transition(executor, record, forged_plan)
+    assert executor.calls == []
+
+
+def test_review_from_status_mismatch_fails():
+    record = _canonical_pending_record()
+    plan = _genuine_approve_plan(record)
+    forged_plan = copy.deepcopy(plan)
+    forged_plan["from_status"] = "approved"
+    executor = _RecordingExecutor(response=[_pending_row()])
+    with pytest.raises(ApprovalPersistenceError):
+        apply_approval_review_transition(executor, record, forged_plan)
+    assert executor.calls == []
+
+
+def test_review_consume_plan_fails():
+    record = _canonical_pending_record()
+    forged_plan = {
+        "approval_id": record["id"],
+        "from_status": "pending",
+        "to_status": "consumed",
+        "set_fields": {
+            "status": "consumed",
+            "consumed_by": "Someone",
+            "consumed_at": "2026-08-01T17:00:00Z",
+        },
+    }
+    executor = _RecordingExecutor(response=[_pending_row()])
+    with pytest.raises(ApprovalPersistenceError):
+        apply_approval_review_transition(executor, record, forged_plan)
+    assert executor.calls == []
+
+
+def test_review_forged_approve_plan_fails():
+    # A forged approved_at that predates requested_at cannot be
+    # reproduced by recomputing through validate_approval_transition --
+    # unlike swapping in a different (equally valid) reviewer name, this
+    # is a genuine, detectable chronology violation.
+    record = _canonical_pending_record()
+    genuine_plan = _genuine_approve_plan(record)
+    forged_plan = copy.deepcopy(genuine_plan)
+    forged_plan["set_fields"]["approved_at"] = "2026-08-01T10:00:00Z"
+    executor = _RecordingExecutor(response=[_pending_row()])
+    with pytest.raises(ApprovalPersistenceError):
+        apply_approval_review_transition(executor, record, forged_plan)
+    assert executor.calls == []
+
+
+def test_review_forged_reject_plan_fails():
+    # A forged blank rejection_reason cannot be reproduced by recomputing
+    # through validate_approval_transition -- it fails that validator's
+    # own nonblank requirement, a genuine, detectable forgery.
+    record = _canonical_pending_record()
+    genuine_plan = _genuine_reject_plan(record)
+    forged_plan = copy.deepcopy(genuine_plan)
+    forged_plan["set_fields"]["rejection_reason"] = "   "
+    executor = _RecordingExecutor(response=[_pending_row()])
+    with pytest.raises(ApprovalPersistenceError):
+        apply_approval_review_transition(executor, record, forged_plan)
+    assert executor.calls == []
+
+
+def test_review_self_approval_plan_fails():
+    record = _canonical_pending_record(requested_by="Roshini Analyst")
+    forged_plan = {
+        "approval_id": record["id"],
+        "from_status": "pending",
+        "to_status": "approved",
+        "set_fields": {
+            "status": "approved",
+            "approved_by": "Roshini Analyst",
+            "approved_at": "2026-08-01T16:00:00Z",
+        },
+    }
+    executor = _RecordingExecutor(response=[_pending_row()])
+    with pytest.raises(ApprovalPersistenceError):
+        apply_approval_review_transition(executor, record, forged_plan)
+    assert executor.calls == []
+
+
+def test_review_expired_approve_plan_fails():
+    record = _canonical_pending_record(expires_at="2026-08-01T15:50:00Z")
+    forged_plan = {
+        "approval_id": record["id"],
+        "from_status": "pending",
+        "to_status": "approved",
+        "set_fields": {
+            "status": "approved",
+            "approved_by": "Security Reviewer",
+            "approved_at": "2026-08-02T00:00:00Z",
+        },
+    }
+    executor = _RecordingExecutor(response=[_pending_row()])
+    with pytest.raises(ApprovalPersistenceError):
+        apply_approval_review_transition(executor, record, forged_plan)
+    assert executor.calls == []
+
+
+def test_review_rejection_after_expiry_succeeds():
+    record = _canonical_pending_record(expires_at="2026-08-01T15:50:00Z")
+    plan = _genuine_reject_plan(record, reviewed_at="2026-08-02T00:00:00Z")
+    executor = _review_executor_for(record, plan)
+    result = apply_approval_review_transition(executor, record, plan)
+    assert result["updated_record"]["status"] == "rejected"
+
+
+# ---------------------------------------------------------------------------
+# apply_approval_review_transition -- descriptor
+# ---------------------------------------------------------------------------
+
+
+def test_review_descriptor_operation_is_update():
+    record = _canonical_pending_record()
+    plan = _genuine_approve_plan(record)
+    executor = _review_executor_for(record, plan)
+    apply_approval_review_transition(executor, record, plan)
+    assert executor.calls[0]["operation"] == "update"
+
+
+def test_review_descriptor_table_is_approvals():
+    record = _canonical_pending_record()
+    plan = _genuine_approve_plan(record)
+    executor = _review_executor_for(record, plan)
+    apply_approval_review_transition(executor, record, plan)
+    assert executor.calls[0]["table"] == "approvals"
+
+
+def test_review_descriptor_values_equal_set_fields_exactly():
+    record = _canonical_pending_record()
+    plan = _genuine_reject_plan(record)
+    executor = _review_executor_for(record, plan)
+    apply_approval_review_transition(executor, record, plan)
+    assert executor.calls[0]["values"] == plan["set_fields"]
+
+
+def test_review_descriptor_filters_contain_id_pending_and_seven_null_guards():
+    record = _canonical_pending_record()
+    plan = _genuine_approve_plan(record)
+    executor = _review_executor_for(record, plan)
+    apply_approval_review_transition(executor, record, plan)
+    filters = executor.calls[0]["filters"]
+    assert filters == {
+        "id": record["id"],
+        "status": "pending",
+        "approved_by": None,
+        "approved_at": None,
+        "rejected_by": None,
+        "rejected_at": None,
+        "rejection_reason": None,
+        "consumed_by": None,
+        "consumed_at": None,
+    }
+    assert list(filters) == [
+        "id", "status", "approved_by", "approved_at", "rejected_by",
+        "rejected_at", "rejection_reason", "consumed_by", "consumed_at",
+    ]
+
+
+def test_review_descriptor_returning_contains_sixteen_columns_in_order():
+    record = _canonical_pending_record()
+    plan = _genuine_approve_plan(record)
+    executor = _review_executor_for(record, plan)
+    apply_approval_review_transition(executor, record, plan)
+    assert executor.calls[0]["returning"] == list(_RECORD_FIELDS)
+
+
+def test_review_descriptor_has_no_unrelated_filter_or_metadata():
+    record = _canonical_pending_record()
+    plan = _genuine_approve_plan(record)
+    executor = _review_executor_for(record, plan)
+    apply_approval_review_transition(executor, record, plan)
+    operation = executor.calls[0]
+    assert "limit" not in operation
+    assert "row_count" not in operation
+    assert "expected_count" not in operation
+    assert "investigation_id" not in operation["filters"]
+    assert "action_type" not in operation["filters"]
+    assert "expires_at" not in operation["filters"]
+
+
+# ---------------------------------------------------------------------------
+# apply_approval_review_transition -- response
+# ---------------------------------------------------------------------------
+
+
+def test_review_zero_rows_raises_conflict():
+    record = _canonical_pending_record()
+    plan = _genuine_approve_plan(record)
+    executor = _RecordingExecutor(response=[])
+    with pytest.raises(ApprovalConflictError):
+        apply_approval_review_transition(executor, record, plan)
+
+
+def test_review_no_retry_on_conflict():
+    record = _canonical_pending_record()
+    plan = _genuine_approve_plan(record)
+    executor = _RecordingExecutor(response=[])
+    with pytest.raises(ApprovalConflictError):
+        apply_approval_review_transition(executor, record, plan)
+    assert len(executor.calls) == 1
+
+
+def test_review_multiple_rows_fail():
+    record = _canonical_pending_record()
+    plan = _genuine_approve_plan(record)
+    row = _apply_set_fields(record, plan["set_fields"])
+    executor = _RecordingExecutor(response=[row, copy.deepcopy(row)])
+    with pytest.raises(ApprovalResponseError):
+        apply_approval_review_transition(executor, record, plan)
+
+
+@pytest.mark.parametrize("response", [None, {"id": APPROVAL_ID}, (1, 2), "not-a-list"])
+def test_review_malformed_response_fails(response):
+    record = _canonical_pending_record()
+    plan = _genuine_approve_plan(record)
+    executor = _RecordingExecutor(response=response)
+    with pytest.raises(ApprovalResponseError):
+        apply_approval_review_transition(executor, record, plan)
+
+
+def test_review_nullable_keys_restore_correctly():
+    record = _canonical_pending_record()
+    plan = _genuine_reject_plan(record)
+    row = _apply_set_fields(record, plan["set_fields"])
+    del row["consumed_by"]
+    del row["consumed_at"]
+    executor = _RecordingExecutor(response=[row])
+    result = apply_approval_review_transition(executor, record, plan)
+    assert result["updated_record"]["consumed_by"] is None
+    assert result["updated_record"]["consumed_at"] is None
+
+
+@pytest.mark.parametrize(
+    "field_name,new_value",
+    [
+        ("investigation_id", "42222222-2222-4222-8222-222222222222"),
+        ("requested_by", "Someone Else"),
+        ("requested_at", "2026-08-01T16:00:00Z"),
+        ("action_payload", {"status": "escalated", "confidence": "low"}),
+        ("expires_at", "2026-08-05T00:00:00Z"),
+        ("created_at", "2026-08-01T15:47:00Z"),
+        ("id", "59999999-9999-4999-8999-999999999999"),
+    ],
+)
+def test_review_changed_frozen_field_fails(field_name, new_value):
+    record = _canonical_pending_record()
+    plan = _genuine_approve_plan(record)
+    row = _apply_set_fields(record, plan["set_fields"])
+    row[field_name] = new_value
+    executor = _RecordingExecutor(response=[row])
+    with pytest.raises(ApprovalResponseError):
+        apply_approval_review_transition(executor, record, plan)
+
+
+def test_review_wrong_final_status_fails():
+    record = _canonical_pending_record()
+    plan = _genuine_approve_plan(record)
+    row = _apply_set_fields(record, plan["set_fields"])
+    row["status"] = "rejected"
+    row["approved_by"] = None
+    row["approved_at"] = None
+    row["rejected_by"] = "Security Reviewer"
+    row["rejected_at"] = plan["set_fields"]["approved_at"]
+    row["rejection_reason"] = "Some other reason entirely."
+    executor = _RecordingExecutor(response=[row])
+    with pytest.raises(ApprovalResponseError):
+        apply_approval_review_transition(executor, record, plan)
+
+
+def test_review_wrong_lifecycle_metadata_fails():
+    record = _canonical_pending_record()
+    plan = _genuine_approve_plan(record)
+    row = _apply_set_fields(record, plan["set_fields"])
+    row["approved_by"] = "Someone Completely Different"
+    executor = _RecordingExecutor(response=[row])
+    with pytest.raises(ApprovalResponseError):
+        apply_approval_review_transition(executor, record, plan)
+
+
+# ---------------------------------------------------------------------------
+# apply_approval_review_transition -- redaction
+# ---------------------------------------------------------------------------
+
+
+def test_review_transport_error_exposes_no_raw_exception():
+    record = _canonical_pending_record()
+    plan = _genuine_approve_plan(record)
+    secret_message = "connection failed: postgres://user:hunter2@db.internal/prod"
+    executor = _RecordingExecutor(raises=RuntimeError(secret_message))
+    with pytest.raises(ApprovalTransportError) as excinfo:
+        apply_approval_review_transition(executor, record, plan)
+    message = str(excinfo.value)
+    assert secret_message not in message
+    assert "RuntimeError" not in message
+    assert excinfo.value.__cause__ is None
+
+
+def test_review_conflict_error_exposes_no_record_or_plan():
+    record = _canonical_pending_record()
+    plan = _genuine_approve_plan(record)
+    executor = _RecordingExecutor(response=[])
+    with pytest.raises(ApprovalConflictError) as excinfo:
+        apply_approval_review_transition(executor, record, plan)
+    message = str(excinfo.value)
+    assert record["requested_by"] not in message
+    assert plan["set_fields"]["approved_by"] not in message
+
+
+def test_review_response_error_exposes_no_row_or_secrets():
+    record = _canonical_pending_record()
+    plan = _genuine_approve_plan(record)
+    secret_marker = "top-secret-review-marker"
+    row = _apply_set_fields(record, plan["set_fields"])
+    row["approved_by"] = secret_marker
+    executor = _RecordingExecutor(response=[row])
+    with pytest.raises(ApprovalResponseError) as excinfo:
+        apply_approval_review_transition(executor, record, plan)
+    assert secret_marker not in str(excinfo.value)
+
+
+# ---------------------------------------------------------------------------
+# apply_approval_review_transition -- non-mutation and independence
+# ---------------------------------------------------------------------------
+
+
+def test_review_inputs_and_response_unchanged():
+    record = _canonical_pending_record()
+    plan = _genuine_approve_plan(record)
+    before_record = copy.deepcopy(record)
+    before_plan = copy.deepcopy(plan)
+    row = _apply_set_fields(record, plan["set_fields"])
+    response = [row]
+    before_response = copy.deepcopy(response)
+    executor = _RecordingExecutor(response=response)
+    apply_approval_review_transition(executor, record, plan)
+    assert record == before_record
+    assert plan == before_plan
+    assert response == before_response
+
+
+def test_review_returned_objects_are_independent():
+    record = _canonical_pending_record()
+    plan = _genuine_approve_plan(record)
+    row = _apply_set_fields(record, plan["set_fields"])
+    executor = _RecordingExecutor(response=[row])
+    result = apply_approval_review_transition(executor, record, plan)
+    assert result["transition_plan"] is not plan
+    assert result["transition_plan"]["set_fields"] is not plan["set_fields"]
+    assert result["updated_record"] is not row
+    assert result["updated_record"]["action_payload"] is not row["action_payload"]
+
+
+def test_review_hostile_executor_mutation_cannot_alter_inputs():
+    record = _canonical_pending_record()
+    plan = _genuine_approve_plan(record)
+    row = _apply_set_fields(record, plan["set_fields"])
+
+    def _hostile(operation):
+        operation["values"]["approved_by"] = "HACKED"
+        operation["filters"]["id"] = "hacked"
+        return [row]
+
+    apply_approval_review_transition(_hostile, record, plan)
+    assert plan["set_fields"]["approved_by"] != "HACKED"
+    assert record["id"] != "hacked"
+
+
+def test_review_separate_calls_share_no_mutable_state():
+    record = _canonical_pending_record()
+    plan = _genuine_approve_plan(record)
+    row = _apply_set_fields(record, plan["set_fields"])
+
+    executor_one = _RecordingExecutor(response=[copy.deepcopy(row)])
+    executor_two = _RecordingExecutor(response=[copy.deepcopy(row)])
+
+    result_one = apply_approval_review_transition(executor_one, record, plan)
+    result_two = apply_approval_review_transition(executor_two, record, plan)
+
+    assert result_one == result_two
+    assert result_one["updated_record"] is not result_two["updated_record"]
+
+
+# ---------------------------------------------------------------------------
+# apply_approval_review_transition -- runtime and source boundaries
+# ---------------------------------------------------------------------------
+
+
+def test_review_no_concrete_supabase_import():
+    tree = _module_ast()
+    imports = _top_level_imports(tree)
+    assert not any(name == "supabase" or name.startswith("supabase.") for name in imports)
+
+
+def test_review_works_under_runtime_guards(monkeypatch):
+    def _forbidden(*_args, **_kwargs):
+        raise AssertionError("a forbidden entry point was called")
+
+    monkeypatch.setattr("builtins.open", _forbidden)
+    monkeypatch.setattr(Path, "open", _forbidden)
+    monkeypatch.setattr(subprocess, "run", _forbidden)
+    monkeypatch.setattr(subprocess, "Popen", _forbidden)
+    monkeypatch.setattr(socket, "socket", _forbidden)
+    monkeypatch.setattr(socket, "create_connection", _forbidden)
+    monkeypatch.setattr(urllib.request, "urlopen", _forbidden)
+
+    record = _canonical_pending_record()
+    plan = _genuine_approve_plan(record)
+    row = _apply_set_fields(record, plan["set_fields"])
+    executor = _RecordingExecutor(response=[row])
+    result = apply_approval_review_transition(executor, record, plan)
+    assert result["updated_record"]["status"] == "approved"
+
+
+def test_review_no_consume_descriptor_ever_built():
+    tree = _module_ast()
+    string_constants = {
+        node.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Constant) and isinstance(node.value, str)
+    }
+    assert "consume" not in string_constants
+
+
+def test_review_no_investigation_table_descriptor():
+    tree = _module_ast()
+    table_values = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Dict):
+            for key_node, value_node in zip(node.keys, node.values):
+                if (
+                    isinstance(key_node, ast.Constant)
+                    and key_node.value == "table"
+                    and isinstance(value_node, ast.Constant)
+                ):
+                    table_values.add(value_node.value)
+    assert table_values == {"approvals"}
+
+
+def test_review_no_transaction_or_rpc_keyword():
+    tree = _module_ast()
+    identifiers = _referenced_identifiers(tree)
+    for forbidden in ("transaction", "rpc", "begin", "commit", "rollback"):
+        assert forbidden not in identifiers
+
+
+def test_review_no_update_case_hashing_auth_or_containment():
+    source = _module_source_text()
+    assert "/update-case" not in source
+    tree = _module_ast()
+    identifiers = _referenced_identifiers(tree)
+    for forbidden in ("hash", "auth", "authenticate", "containment"):
+        assert forbidden not in identifiers
 
 
 # ---------------------------------------------------------------------------
