@@ -1848,6 +1848,71 @@ def test_review_consume_plan_fails():
     assert executor.calls == []
 
 
+def test_review_genuine_expanded_consume_plan_rejected_before_executor():
+    # Step 11 expanded the real consume-plan contract to six top-level
+    # keys (approval_id, from_status, to_status, set_fields,
+    # expected_investigation_id, expected_action_type). This function
+    # must still reject a consume plan outright -- consumption remains
+    # entirely outside its scope -- and must do so before the executor
+    # is ever invoked, regardless of the plan's now-larger shape.
+    approved_record = _canonical_pending_record(
+        status="approved",
+        approved_by="Security Reviewer",
+        approved_at="2026-08-01T16:00:00Z",
+    )
+    genuine_consume_plan = validate_approval_transition(
+        approved_record,
+        {
+            "transition": "consume",
+            "consumed_by": "Update Case Operator",
+            "expected_investigation_id": INVESTIGATION_ID,
+            "expected_action_type": "update_investigation_state",
+            "consumed_at": "2026-08-01T17:00:00Z",
+        },
+    )
+    assert set(genuine_consume_plan) == {
+        "approval_id", "from_status", "to_status", "set_fields",
+        "expected_investigation_id", "expected_action_type",
+    }
+
+    executor = _RecordingExecutor(response=[_pending_row()])
+    with pytest.raises(ApprovalPersistenceError):
+        apply_approval_review_transition(executor, approved_record, genuine_consume_plan)
+    assert executor.calls == []
+
+
+def test_review_no_rpc_or_consume_operation_descriptor_exists():
+    tree = _module_ast()
+    operation_values = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Dict):
+            for key_node, value_node in zip(node.keys, node.values):
+                if (
+                    isinstance(key_node, ast.Constant)
+                    and key_node.value == "operation"
+                    and isinstance(value_node, ast.Constant)
+                ):
+                    operation_values.add(value_node.value)
+    assert "rpc" not in operation_values
+    assert "consume" not in operation_values
+    assert operation_values == {"insert", "select", "update"}
+
+
+def test_review_no_investigation_table_descriptor_exists_after_expansion():
+    tree = _module_ast()
+    table_values = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Dict):
+            for key_node, value_node in zip(node.keys, node.values):
+                if (
+                    isinstance(key_node, ast.Constant)
+                    and key_node.value == "table"
+                    and isinstance(value_node, ast.Constant)
+                ):
+                    table_values.add(value_node.value)
+    assert table_values == {"approvals"}
+
+
 def test_review_forged_approve_plan_fails():
     # A forged approved_at that predates requested_at cannot be
     # reproduced by recomputing through validate_approval_transition --

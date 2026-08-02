@@ -1019,7 +1019,10 @@ def test_131_approved_to_consumed_succeeds():
 
 def test_132_consume_output_exact_shape():
     result = validate_approval_transition(_approved_record(), _consume_request())
-    assert set(result.keys()) == {"approval_id", "from_status", "to_status", "set_fields"}
+    assert set(result.keys()) == {
+        "approval_id", "from_status", "to_status", "set_fields",
+        "expected_investigation_id", "expected_action_type",
+    }
     assert set(result["set_fields"].keys()) == {"status", "consumed_by", "consumed_at"}
 
 
@@ -1168,6 +1171,152 @@ def test_154_no_action_payload_copied_into_output():
     result = validate_approval_transition(_approved_record(), _consume_request())
     assert "action_payload" not in result
     assert "action_payload" not in result["set_fields"]
+
+
+# ---------------------------------------------------------------------------
+# Consume plan binding-field contract (Step 11)
+# ---------------------------------------------------------------------------
+
+
+def test_154b_consume_plan_top_level_order_exact():
+    result = validate_approval_transition(_approved_record(), _consume_request())
+    assert list(result.keys()) == [
+        "approval_id", "from_status", "to_status", "set_fields",
+        "expected_investigation_id", "expected_action_type",
+    ]
+
+
+def test_154c_approve_plan_still_exactly_four_keys():
+    result = validate_approval_transition(_pending_record(), _approve_request())
+    assert list(result.keys()) == ["approval_id", "from_status", "to_status", "set_fields"]
+
+
+def test_154d_reject_plan_still_exactly_four_keys():
+    result = validate_approval_transition(_pending_record(), _reject_request())
+    assert list(result.keys()) == ["approval_id", "from_status", "to_status", "set_fields"]
+
+
+def test_154e_binding_fields_absent_from_approve_plan():
+    result = validate_approval_transition(_pending_record(), _approve_request())
+    assert "expected_investigation_id" not in result
+    assert "expected_action_type" not in result
+
+
+def test_154f_binding_fields_absent_from_reject_plan():
+    result = validate_approval_transition(_pending_record(), _reject_request())
+    assert "expected_investigation_id" not in result
+    assert "expected_action_type" not in result
+
+
+def test_154g_binding_fields_not_inside_consume_set_fields():
+    result = validate_approval_transition(_approved_record(), _consume_request())
+    assert "expected_investigation_id" not in result["set_fields"]
+    assert "expected_action_type" not in result["set_fields"]
+
+
+def test_154h_consume_set_fields_still_exactly_three_keys():
+    result = validate_approval_transition(_approved_record(), _consume_request())
+    assert set(result["set_fields"].keys()) == {"status", "consumed_by", "consumed_at"}
+
+
+def test_154i_no_persistence_or_execution_field_in_consume_plan():
+    result = validate_approval_transition(_approved_record(), _consume_request())
+    for forbidden in ("persisted", "row_count", "affected_rows", "database_result", "operation", "table"):
+        assert forbidden not in result
+
+
+def test_154j_expected_investigation_id_equals_validated_request_value():
+    result = validate_approval_transition(
+        _approved_record(), _consume_request(expected_investigation_id=INVESTIGATION_ID.upper())
+    )
+    assert result["expected_investigation_id"] == INVESTIGATION_ID
+
+
+def test_154k_expected_investigation_id_equals_record_investigation_id():
+    result = validate_approval_transition(_approved_record(), _consume_request())
+    assert result["expected_investigation_id"] == INVESTIGATION_ID
+
+
+def test_154l_expected_action_type_equals_validated_request_value():
+    result = validate_approval_transition(
+        _approved_record(), _consume_request(expected_action_type="UPDATE_INVESTIGATION_STATE")
+    )
+    assert result["expected_action_type"] == "update_investigation_state"
+
+
+def test_154m_expected_action_type_equals_record_action_type():
+    result = validate_approval_transition(_approved_record(), _consume_request())
+    assert result["expected_action_type"] == "update_investigation_state"
+
+
+def test_154n_canonical_uuid_retained_from_padded_input():
+    result = validate_approval_transition(
+        _approved_record(), _consume_request(expected_investigation_id=f"  {INVESTIGATION_ID}  ")
+    )
+    assert result["expected_investigation_id"] == INVESTIGATION_ID
+
+
+def test_154o_canonical_action_type_retained_from_padded_input():
+    result = validate_approval_transition(
+        _approved_record(), _consume_request(expected_action_type="  update_investigation_state  ")
+    )
+    assert result["expected_action_type"] == "update_investigation_state"
+
+
+def test_154p_mismatched_investigation_id_still_fails():
+    other_id = "66666666-6666-4666-8666-666666666666"
+    with pytest.raises(ApprovalTransitionError):
+        validate_approval_transition(_approved_record(), _consume_request(expected_investigation_id=other_id))
+
+
+def test_154q_mismatched_action_type_still_fails(monkeypatch):
+    import core.approval_transition as module
+
+    monkeypatch.setattr(module, "ACTION_TYPES", frozenset({"update_investigation_state", "fake_other_action"}))
+    with pytest.raises(ApprovalTransitionError):
+        validate_approval_transition(_approved_record(), _consume_request(expected_action_type="fake_other_action"))
+
+
+def test_154r_invalid_investigation_uuid_still_fails():
+    with pytest.raises(ApprovalTransitionError):
+        validate_approval_transition(_approved_record(), _consume_request(expected_investigation_id="not-a-uuid"))
+
+
+def test_154s_invalid_action_type_still_fails():
+    with pytest.raises(ApprovalTransitionError):
+        validate_approval_transition(_approved_record(), _consume_request(expected_action_type="delete_everything"))
+
+
+def test_154t_missing_expected_investigation_id_still_fails():
+    request = _consume_request()
+    del request["expected_investigation_id"]
+    with pytest.raises(ApprovalTransitionError):
+        validate_approval_transition(_approved_record(), request)
+
+
+def test_154u_missing_expected_action_type_still_fails():
+    request = _consume_request()
+    del request["expected_action_type"]
+    with pytest.raises(ApprovalTransitionError):
+        validate_approval_transition(_approved_record(), request)
+
+
+def test_154v_consume_plan_binding_values_independent_of_input_request_object():
+    request = _consume_request()
+    result = validate_approval_transition(_approved_record(), request)
+    result["expected_investigation_id"] = "mutated"
+    result["expected_action_type"] = "mutated"
+    assert request["expected_investigation_id"] == INVESTIGATION_ID
+    assert request["expected_action_type"] == "update_investigation_state"
+
+
+def test_154w_separate_consume_calls_return_independent_plan_objects():
+    request = _consume_request(consumed_at=CONSUMED_AT)
+    first = validate_approval_transition(_approved_record(), request)
+    second = validate_approval_transition(_approved_record(), request)
+    assert first == second
+    assert first is not second
+    assert first["set_fields"] is not second["set_fields"]
 
 
 # ---------------------------------------------------------------------------

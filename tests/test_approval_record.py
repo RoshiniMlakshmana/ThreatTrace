@@ -1190,3 +1190,55 @@ def test_158_both_lifecycle_and_record_contract_phrases_coexist():
     source = _module_source_text()
     assert "Validated transition plan -- not persisted" in source
     assert "Validated approval record -- not proof of persistence" in source
+
+
+# ---------------------------------------------------------------------------
+# Step 11 regression: consume-plan binding fields never leak into the record
+# ---------------------------------------------------------------------------
+
+
+def test_159_validate_approval_record_output_remains_exactly_sixteen_fields():
+    result = validate_approval_record(_consumed_record())
+    assert set(result) == set(_ALL_FIELDS)
+    assert len(result) == 16
+
+
+def test_160_approval_record_never_gains_expected_investigation_id():
+    result = validate_approval_record(_consumed_record())
+    assert "expected_investigation_id" not in result
+
+
+def test_161_approval_record_never_gains_expected_action_type():
+    result = validate_approval_record(_consumed_record())
+    assert "expected_action_type" not in result
+
+
+def test_162_approve_behavior_unchanged_by_consume_plan_expansion():
+    plan = validate_approval_transition(_pending_record(), _approve_request())
+    assert list(plan.keys()) == ["approval_id", "from_status", "to_status", "set_fields"]
+
+
+def test_163_reject_behavior_unchanged_by_consume_plan_expansion():
+    request = {
+        "transition": "reject",
+        "reviewed_by": "Security Reviewer",
+        "rejection_reason": REJECTION_REASON,
+    }
+    plan = validate_approval_transition(_pending_record(), request)
+    assert list(plan.keys()) == ["approval_id", "from_status", "to_status", "set_fields"]
+
+
+def test_164_consume_transition_reflects_expanded_plan_only():
+    record = _approved_record()
+    plan = validate_approval_transition(record, _consume_request())
+    assert list(plan.keys()) == [
+        "approval_id", "from_status", "to_status", "set_fields",
+        "expected_investigation_id", "expected_action_type",
+    ]
+    assert plan["expected_investigation_id"] == INVESTIGATION_ID
+    assert plan["expected_action_type"] == "update_investigation_state"
+    # The underlying validated *record* contract is untouched by this
+    # expansion -- validate_approval_record itself never sees or produces
+    # either binding field.
+    assert "expected_investigation_id" not in record
+    assert "expected_action_type" not in record

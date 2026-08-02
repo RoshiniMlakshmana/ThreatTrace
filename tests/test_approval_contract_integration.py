@@ -390,12 +390,17 @@ def test_012_consume_output_equals_direct_validator(full_pipeline):
 
 def test_013_consume_exact_plan_shape(full_pipeline):
     plan = full_pipeline.consume_plan
-    assert set(plan.keys()) == {"approval_id", "from_status", "to_status", "set_fields"}
+    assert set(plan.keys()) == {
+        "approval_id", "from_status", "to_status", "set_fields",
+        "expected_investigation_id", "expected_action_type",
+    }
     # sort_keys=True means the decoded JSON key order is alphabetical.
     assert set(plan["set_fields"].keys()) == {"status", "consumed_by", "consumed_at"}
     assert list(plan["set_fields"].keys()) == sorted(plan["set_fields"].keys())
     assert plan["from_status"] == "approved"
     assert plan["to_status"] == "consumed"
+    assert plan["expected_investigation_id"] == INVESTIGATION_ID
+    assert plan["expected_action_type"] == "update_investigation_state"
 
 
 def test_014_consumed_snapshot_applies_only_set_fields(full_pipeline):

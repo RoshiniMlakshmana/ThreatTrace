@@ -273,7 +273,56 @@ def test_022_consume_output_preserves_exact_transition_plan_shape():
         json.dumps(_envelope(current_record=_approved_record(), transition_request=_consume_request()))
     )
     parsed = json.loads(stdout)
+    assert set(parsed.keys()) == {
+        "approval_id", "from_status", "to_status", "set_fields",
+        "expected_investigation_id", "expected_action_type",
+    }
     assert set(parsed["set_fields"].keys()) == {"status", "consumed_by", "consumed_at"}
+
+
+def test_022b_consume_output_emits_both_binding_fields():
+    _exit_code, stdout, _stderr = _run(
+        json.dumps(_envelope(
+            current_record=_approved_record(),
+            transition_request=_consume_request(consumed_at=CONSUMED_AT),
+        ))
+    )
+    parsed = json.loads(stdout)
+    assert parsed["expected_investigation_id"] == INVESTIGATION_ID
+    assert parsed["expected_action_type"] == "update_investigation_state"
+
+
+def test_022c_direct_consume_validator_output_equals_cli_decoded_output():
+    current_record = _approved_record()
+    transition_request = _consume_request(consumed_at=CONSUMED_AT)
+
+    direct = approval_transition.validate_approval_transition(current_record, transition_request)
+
+    _exit_code, stdout, _stderr = _run(
+        json.dumps(_envelope(current_record=current_record, transition_request=transition_request))
+    )
+    parsed = json.loads(stdout)
+
+    assert parsed["approval_id"] == direct["approval_id"]
+    assert parsed["from_status"] == direct["from_status"]
+    assert parsed["to_status"] == direct["to_status"]
+    assert parsed["set_fields"] == direct["set_fields"]
+    assert parsed["expected_investigation_id"] == direct["expected_investigation_id"]
+    assert parsed["expected_action_type"] == direct["expected_action_type"]
+    # sort_keys=True reorders the top-level JSON output alphabetically;
+    # this must never be confused with the validator's own construction
+    # order (approval_id, from_status, to_status, set_fields,
+    # expected_investigation_id, expected_action_type).
+    assert list(parsed.keys()) == sorted(parsed.keys())
+    assert list(direct.keys()) != sorted(direct.keys())
+
+
+def test_022d_no_new_cli_envelope_field_accepted():
+    envelope = _envelope(current_record=_approved_record(), transition_request=_consume_request())
+    envelope["expected_investigation_id"] = INVESTIGATION_ID
+    exit_code, stdout, _stderr = _run(json.dumps(envelope))
+    assert exit_code == 2
+    assert stdout == ""
 
 
 def test_023_generated_transition_timestamp_appears_when_omitted():

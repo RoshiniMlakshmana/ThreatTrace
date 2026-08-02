@@ -601,6 +601,8 @@ def _validate_consume(record: Mapping[str, Any], transition_request: Mapping[str
             "consumed_by": consumed_by,
             "consumed_at": consumed_at,
         },
+        "expected_investigation_id": expected_investigation_id,
+        "expected_action_type": expected_action_type,
     }
 
 
@@ -634,6 +636,24 @@ def validate_approval_transition(
             "to_status": "...",
             "set_fields": {...},
         }
+
+    A consume plan additionally carries the two independently-validated
+    binding fields as top-level siblings of `set_fields` -- never inside
+    it, since they describe what was validated, not a column written by
+    the eventual approval-consumption update:
+
+        {
+            "approval_id": "...",
+            "from_status": "approved",
+            "to_status": "consumed",
+            "set_fields": {"status": "consumed", "consumed_by": "...", "consumed_at": "..."},
+            "expected_investigation_id": "...",
+            "expected_action_type": "...",
+        }
+
+    This lets a future persistence function reconstruct and independently
+    revalidate the genuine consume request from the plan alone, without
+    discarding `expected_investigation_id`/`expected_action_type`.
 
     This plan is a **validated transition plan -- not persisted**. Neither
     `current_record` nor `transition_request` (nor any nested mapping
