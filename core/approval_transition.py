@@ -389,12 +389,60 @@ def _validate_current_record(current_record: Any) -> dict[str, Any]:
         "id": approval_id,
         "investigation_id": validated_request["investigation_id"],
         "action_type": validated_request["action_type"],
+        "action_payload": validated_request["action_payload"],
         "requested_by": validated_request["requested_by"],
         "requested_at": requested_at,
         "status": status,
-        "expires_at": expires_at,
+        "approved_by": approved_by,
         "approved_at": approved_at,
+        "rejected_by": rejected_by,
+        "rejected_at": rejected_at,
+        "rejection_reason": rejection_reason,
+        "expires_at": expires_at,
+        "consumed_by": consumed_by,
+        "consumed_at": consumed_at,
+        "created_at": created_at,
     }
+
+
+def validate_approval_record(current_record: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate one complete approval-record snapshot in isolation.
+
+    This is a thin public wrapper around the same current-record
+    validation `validate_approval_transition` itself relies on -- no
+    validation logic is duplicated. `current_record` must contain exactly
+    the sixteen fields documented in this module (nullable lifecycle
+    fields explicitly present as `None` when unused); its five frozen
+    request-side fields are revalidated by calling
+    `core.approval_request.validate_approval_request` (never duplicated).
+
+    Returns a new dict containing exactly the same sixteen fields, in
+    this fixed order: `id`, `investigation_id`, `action_type`,
+    `action_payload`, `requested_by`, `requested_at`, `status`,
+    `approved_by`, `approved_at`, `rejected_by`, `rejected_at`,
+    `rejection_reason`, `expires_at`, `consumed_by`, `consumed_at`,
+    `created_at`.
+
+    This is a:
+
+        Validated approval record -- not proof of persistence
+
+    It does not check `expires_at` against the current time -- expiry is
+    a transition-time concern, evaluated only when an approval or
+    consumption is actually attempted, never a current-record-validation
+    concern. It does not query Supabase, does not check whether the
+    record actually exists in any database, and does not re-derive or
+    enforce any two-person rule. `current_record` is never mutated, and
+    no mutable object from it is retained by reference in the result.
+
+    Raises ApprovalTransitionError for any structurally invalid input,
+    including an unrecognized type, an unknown or missing field, a
+    malformed UUID or timestamp, a non-canonical (padded) stored
+    identity/reason value, an internally inconsistent lifecycle-field
+    combination for the record's status, or a chronological
+    inconsistency among its timestamps.
+    """
+    return _validate_current_record(current_record)
 
 
 def _validate_approve(record: Mapping[str, Any], transition_request: Mapping[str, Any], now: datetime | None) -> dict[str, Any]:
@@ -600,7 +648,7 @@ def validate_approval_transition(
     chronological inconsistency, or an expired approval/consumption
     attempt.
     """
-    record = _validate_current_record(current_record)
+    record = validate_approval_record(current_record)
 
     if not isinstance(transition_request, Mapping):
         raise ApprovalTransitionError("transition_request must be a mapping")

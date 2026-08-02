@@ -2305,11 +2305,41 @@ def test_291_helper_still_used_for_all_four_current_record_fields():
     assert fields_passed_to_helper == {"approved_by", "rejected_by", "consumed_by", "rejection_reason"}
 
 
-def test_292_no_public_approval_record_validator_added():
+def test_292_validate_approval_record_is_public_and_delegated_to_exactly_once(monkeypatch):
+    import ast
+
     import core.approval_transition as module
 
-    assert not hasattr(module, "validate_approval_record")
-    assert not hasattr(module, "ValidateApprovalRecord")
+    assert hasattr(module, "validate_approval_record")
+    assert callable(module.validate_approval_record)
+
+    tree = ast.parse(_module_source_text())
+    transition_fn = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "validate_approval_transition"
+    )
+    called_names = {
+        subnode.func.id
+        for subnode in ast.walk(transition_fn)
+        if isinstance(subnode, ast.Call) and isinstance(subnode.func, ast.Name)
+    }
+    assert "validate_approval_record" in called_names
+    assert "_validate_current_record" not in called_names
+
+    call_count = 0
+    real = module.validate_approval_record
+
+    def _counting_wrapper(current_record):
+        nonlocal call_count
+        call_count += 1
+        return real(current_record)
+
+    monkeypatch.setattr(module, "validate_approval_record", _counting_wrapper)
+
+    validate_approval_transition(_pending_record(), _approve_request())
+
+    assert call_count == 1
 
 
 def test_293_validate_current_record_remains_private():
