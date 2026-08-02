@@ -44,6 +44,8 @@ from core.approval_transition import (
     validate_approval_record,
     validate_approval_transition,
 )
+from core.decision_context import INVESTIGATION_STATUSES
+from core.evidence_normalizer import CONFIDENCE_LEVELS
 
 
 class ApprovalExecutor(Protocol):
@@ -114,6 +116,7 @@ _RECORD_FIELDS = (
     "consumed_at",
     "created_at",
 )
+_RECORD_FIELDS_SET = frozenset(_RECORD_FIELDS)
 
 _NULLABLE_RECORD_FIELDS = (
     "approved_by",
@@ -153,6 +156,36 @@ _PENDING_LIFECYCLE_FILTER_FIELDS = (
     "consumed_by",
     "consumed_at",
 )
+
+_INVALID_CONSUMPTION_INPUT_MESSAGE = "Invalid approval consumption input."
+_CONSUMPTION_CONFLICT_MESSAGE = "Approval consumption conflicted."
+_CONSUMPTION_RESPONSE_MESSAGE = "Approval consumption response was invalid."
+
+_CONSUME_TRANSITION_PLAN_FIELDS = (
+    "approval_id",
+    "from_status",
+    "to_status",
+    "set_fields",
+    "expected_investigation_id",
+    "expected_action_type",
+)
+_CONSUME_SET_FIELDS_ORDER = ("status", "consumed_by", "consumed_at")
+
+_CONSUMPTION_RPC_FUNCTION_NAME = "consume_approval_and_update_investigation_state"
+_CONSUMPTION_RPC_PARAMETER_ORDER = (
+    "approval_id",
+    "expected_investigation_id",
+    "expected_action_type",
+    "consumed_by",
+    "consumed_at",
+)
+
+_INVESTIGATION_RESULT_FIELDS = (
+    "investigation_status",
+    "investigation_confidence",
+    "investigation_updated_at",
+)
+_CONSUMPTION_ROW_FIELDS_SET = _RECORD_FIELDS_SET | frozenset(_INVESTIGATION_RESULT_FIELDS)
 
 
 def _validate_validated_request(validated_request: Any) -> dict[str, Any]:
@@ -476,13 +509,14 @@ def _verify_genuine_review_plan(
 def _compute_expected_updated_record(
     validated_current_record: Mapping[str, Any],
     set_fields: Mapping[str, Any],
+    generic_message: str = _INVALID_REVIEW_PLAN_MESSAGE,
 ) -> dict[str, Any]:
     candidate = dict(copy.deepcopy(dict(validated_current_record)))
     candidate.update(copy.deepcopy(dict(set_fields)))
     try:
         return validate_approval_record(candidate)
     except ApprovalTransitionError:
-        raise ApprovalPersistenceError(_INVALID_REVIEW_PLAN_MESSAGE) from None
+        raise ApprovalPersistenceError(generic_message) from None
 
 
 def apply_approval_review_transition(
@@ -590,4 +624,285 @@ def apply_approval_review_transition(
     return {
         "transition_plan": copy.deepcopy(dict(recomputed_plan)),
         "updated_record": copy.deepcopy(updated_record),
+    }
+
+
+def _validate_current_record_for_consumption(current_record: Any) -> dict[str, Any]:
+    if not isinstance(current_record, Mapping):
+        raise ApprovalPersistenceError(_INVALID_CONSUMPTION_INPUT_MESSAGE)
+
+    try:
+        validated = validate_approval_record(current_record)
+    except ApprovalTransitionError:
+        raise ApprovalPersistenceError(_INVALID_CONSUMPTION_INPUT_MESSAGE) from None
+
+    if validated != dict(current_record):
+        raise ApprovalPersistenceError(_INVALID_CONSUMPTION_INPUT_MESSAGE)
+
+    if validated["status"] != "approved":
+        raise ApprovalPersistenceError(_INVALID_CONSUMPTION_INPUT_MESSAGE)
+
+    return validated
+
+
+def _validate_consume_transition_plan(
+    transition_plan: Any,
+    validated_current_record: Mapping[str, Any],
+) -> tuple[str, str]:
+    if not isinstance(transition_plan, Mapping):
+        raise ApprovalPersistenceError(_INVALID_CONSUMPTION_INPUT_MESSAGE)
+
+    if tuple(transition_plan) != _CONSUME_TRANSITION_PLAN_FIELDS:
+        raise ApprovalPersistenceError(_INVALID_CONSUMPTION_INPUT_MESSAGE)
+
+    approval_id = transition_plan["approval_id"]
+    canonical_approval_id = _validate_approval_id(approval_id)
+    if canonical_approval_id != approval_id:
+        raise ApprovalPersistenceError(_INVALID_CONSUMPTION_INPUT_MESSAGE)
+    if canonical_approval_id != validated_current_record["id"]:
+        raise ApprovalPersistenceError(_INVALID_CONSUMPTION_INPUT_MESSAGE)
+
+    if transition_plan["from_status"] != "approved":
+        raise ApprovalPersistenceError(_INVALID_CONSUMPTION_INPUT_MESSAGE)
+    if transition_plan["from_status"] != validated_current_record["status"]:
+        raise ApprovalPersistenceError(_INVALID_CONSUMPTION_INPUT_MESSAGE)
+
+    if transition_plan["to_status"] != "consumed":
+        raise ApprovalPersistenceError(_INVALID_CONSUMPTION_INPUT_MESSAGE)
+
+    expected_investigation_id = transition_plan["expected_investigation_id"]
+    canonical_expected_investigation_id = _validate_approval_id(expected_investigation_id)
+    if canonical_expected_investigation_id != expected_investigation_id:
+        raise ApprovalPersistenceError(_INVALID_CONSUMPTION_INPUT_MESSAGE)
+    if canonical_expected_investigation_id != validated_current_record["investigation_id"]:
+        raise ApprovalPersistenceError(_INVALID_CONSUMPTION_INPUT_MESSAGE)
+
+    expected_action_type = transition_plan["expected_action_type"]
+    if not isinstance(expected_action_type, str):
+        raise ApprovalPersistenceError(_INVALID_CONSUMPTION_INPUT_MESSAGE)
+    if expected_action_type != expected_action_type.strip().lower():
+        raise ApprovalPersistenceError(_INVALID_CONSUMPTION_INPUT_MESSAGE)
+    if expected_action_type != validated_current_record["action_type"]:
+        raise ApprovalPersistenceError(_INVALID_CONSUMPTION_INPUT_MESSAGE)
+    if expected_action_type != "update_investigation_state":
+        raise ApprovalPersistenceError(_INVALID_CONSUMPTION_INPUT_MESSAGE)
+
+    set_fields = transition_plan["set_fields"]
+    if not isinstance(set_fields, Mapping):
+        raise ApprovalPersistenceError(_INVALID_CONSUMPTION_INPUT_MESSAGE)
+    if tuple(set_fields) != _CONSUME_SET_FIELDS_ORDER:
+        raise ApprovalPersistenceError(_INVALID_CONSUMPTION_INPUT_MESSAGE)
+    if set_fields.get("status") != "consumed":
+        raise ApprovalPersistenceError(_INVALID_CONSUMPTION_INPUT_MESSAGE)
+
+    return canonical_approval_id, canonical_expected_investigation_id
+
+
+def _verify_genuine_consume_plan(
+    transition_plan: Mapping[str, Any],
+    validated_current_record: Mapping[str, Any],
+) -> dict[str, Any]:
+    set_fields = transition_plan["set_fields"]
+    reconstructed_request = {
+        "transition": "consume",
+        "consumed_by": set_fields.get("consumed_by"),
+        "consumed_at": set_fields.get("consumed_at"),
+        "expected_investigation_id": transition_plan["expected_investigation_id"],
+        "expected_action_type": transition_plan["expected_action_type"],
+    }
+
+    try:
+        recomputed_plan = validate_approval_transition(validated_current_record, reconstructed_request)
+    except ApprovalTransitionError:
+        raise ApprovalPersistenceError(_INVALID_CONSUMPTION_INPUT_MESSAGE) from None
+
+    if recomputed_plan != dict(transition_plan):
+        raise ApprovalPersistenceError(_INVALID_CONSUMPTION_INPUT_MESSAGE)
+
+    return recomputed_plan
+
+
+def _validate_investigation_status(value: Any) -> str:
+    if not isinstance(value, str):
+        raise ApprovalResponseError(_CONSUMPTION_RESPONSE_MESSAGE)
+    stripped = value.strip()
+    if not stripped or value != stripped:
+        raise ApprovalResponseError(_CONSUMPTION_RESPONSE_MESSAGE)
+    if value not in INVESTIGATION_STATUSES:
+        raise ApprovalResponseError(_CONSUMPTION_RESPONSE_MESSAGE)
+    return value
+
+
+def _validate_investigation_confidence(value: Any) -> str:
+    if not isinstance(value, str):
+        raise ApprovalResponseError(_CONSUMPTION_RESPONSE_MESSAGE)
+    stripped = value.strip()
+    if not stripped or value != stripped:
+        raise ApprovalResponseError(_CONSUMPTION_RESPONSE_MESSAGE)
+    if value not in CONFIDENCE_LEVELS:
+        raise ApprovalResponseError(_CONSUMPTION_RESPONSE_MESSAGE)
+    return value
+
+
+def apply_approval_consumption(
+    executor: ApprovalExecutor,
+    current_record: Mapping[str, Any],
+    transition_plan: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Apply one genuine approved -> consumed transition atomically, via a
+    single PostgreSQL RPC call that consumes the approval and updates its
+    referenced investigation together, and return the verified plan,
+    consumed approval record, and investigation result.
+
+    `current_record` must already be the exact, canonical output of
+    `validate_approval_record`, with `status == "approved"` -- a pending,
+    rejected, or consumed record is rejected before the executor is ever
+    invoked, as is any record validation would change. `transition_plan`
+    must contain exactly `approval_id`, `from_status`, `to_status`,
+    `set_fields`, `expected_investigation_id`, and `expected_action_type`,
+    in that exact order -- an approve/reject plan, an old four-field
+    consume plan, or any missing/unknown/reordered field is rejected
+    before the executor is ever invoked.
+
+    The supplied plan is never trusted at face value: this function
+    reconstructs the equivalent consume transition request from
+    `set_fields` and the plan's own binding fields, and recomputes the
+    plan by calling `validate_approval_transition` exactly once, requiring
+    the result to equal the supplied plan exactly. This re-derives (and
+    cannot bypass) the approved-and-unconsumed requirement, consumed
+    identity/timestamp validation, `consumed_at >= approved_at`, strict
+    `consumed_at < expires_at`, and both expected bindings.
+
+    Invokes `executor` exactly once with one RPC operation descriptor
+    naming `consume_approval_and_update_investigation_state` and exactly
+    its five parameters. The PostgreSQL function performs the entire
+    approval-consumption-and-investigation-update atomically; this
+    function never issues that as two separate client-side calls. Zero
+    returned rows raises `ApprovalConflictError` (never retried, and never
+    followed by an automatic `load_approval_record` call) -- it represents
+    any lifecycle, expiry, replay, or binding conflict, and the specific
+    cause is never distinguished or exposed. Exactly one row is required;
+    it must contain the sixteen approval-record fields plus exactly
+    `investigation_status`, `investigation_confidence`, and
+    `investigation_updated_at` -- no other field. The approval portion is
+    normalized (missing nullable lifecycle fields restored as `None`,
+    exactly as elsewhere in this module) and validated through
+    `validate_approval_record` exactly once, then required to equal an
+    independently computed expected consumed record exactly. The
+    investigation portion is validated as a member of
+    `core.decision_context.INVESTIGATION_STATUSES` /
+    `core.evidence_normalizer.CONFIDENCE_LEVELS` (already-trimmed strings)
+    and a canonical UTC timestamp, and is required to match whichever of
+    `status`/`confidence` the already-validated `current_record`'s own
+    `action_payload` specifies -- this function never accepts a
+    caller-supplied replacement status, confidence, or `action_payload`.
+
+    Returns exactly:
+
+        {
+            "transition_plan": {...},
+            "updated_record": {...},
+            "investigation_result": {
+                "investigation_id": "...",
+                "status": "...",
+                "confidence": "...",
+                "updated_at": "...",
+            },
+        }
+
+    This is a:
+
+        Verified atomic approval consumption -- approval and investigation changed together
+
+    Raises `ApprovalPersistenceError` for invalid `current_record` or
+    `transition_plan` input (before the executor is ever invoked),
+    `ApprovalConflictError` for a genuine plan matched against zero rows,
+    `ApprovalResponseError` for any other malformed or mismatched executor
+    response, and `ApprovalTransportError` if `executor` itself raises.
+    Never raises `ApprovalTransitionError` directly. Never mutates
+    `current_record`, its nested `action_payload`, `transition_plan`, or
+    `transition_plan["set_fields"]`, and never returns a persistence
+    receipt, row count, operation descriptor, authentication result,
+    action hash, or investigation title/description.
+    """
+    validated_current_record = _validate_current_record_for_consumption(current_record)
+
+    canonical_approval_id, canonical_expected_investigation_id = _validate_consume_transition_plan(
+        transition_plan, validated_current_record
+    )
+
+    recomputed_plan = _verify_genuine_consume_plan(transition_plan, validated_current_record)
+
+    genuine_set_fields = recomputed_plan["set_fields"]
+
+    expected_consumed_record = _compute_expected_updated_record(
+        validated_current_record, genuine_set_fields, _INVALID_CONSUMPTION_INPUT_MESSAGE
+    )
+
+    operation = {
+        "operation": "rpc",
+        "function": _CONSUMPTION_RPC_FUNCTION_NAME,
+        "parameters": {
+            "approval_id": canonical_approval_id,
+            "expected_investigation_id": canonical_expected_investigation_id,
+            "expected_action_type": "update_investigation_state",
+            "consumed_by": genuine_set_fields["consumed_by"],
+            "consumed_at": genuine_set_fields["consumed_at"],
+        },
+    }
+
+    response = _invoke_executor(executor, operation)
+
+    if not isinstance(response, list):
+        raise ApprovalResponseError(_CONSUMPTION_RESPONSE_MESSAGE)
+    if len(response) == 0:
+        raise ApprovalConflictError(_CONSUMPTION_CONFLICT_MESSAGE)
+    if len(response) > 1:
+        raise ApprovalResponseError(_CONSUMPTION_RESPONSE_MESSAGE)
+
+    row = response[0]
+    if not isinstance(row, Mapping):
+        raise ApprovalResponseError(_CONSUMPTION_RESPONSE_MESSAGE)
+
+    unknown_fields = set(row) - _CONSUMPTION_ROW_FIELDS_SET
+    if unknown_fields:
+        raise ApprovalResponseError(_CONSUMPTION_RESPONSE_MESSAGE)
+
+    missing_investigation_fields = [field for field in _INVESTIGATION_RESULT_FIELDS if field not in row]
+    if missing_investigation_fields:
+        raise ApprovalResponseError(_CONSUMPTION_RESPONSE_MESSAGE)
+
+    approval_portion = {key: value for key, value in row.items() if key in _RECORD_FIELDS_SET}
+    approval_record = _validate_row_shape(approval_portion, _CONSUMPTION_RESPONSE_MESSAGE)
+
+    if approval_record != expected_consumed_record:
+        raise ApprovalResponseError(_CONSUMPTION_RESPONSE_MESSAGE)
+
+    investigation_status = _validate_investigation_status(row["investigation_status"])
+    investigation_confidence = _validate_investigation_confidence(row["investigation_confidence"])
+    try:
+        investigation_updated_at = _normalize_timestamp(row["investigation_updated_at"])
+    except ApprovalPersistenceError:
+        raise ApprovalResponseError(_CONSUMPTION_RESPONSE_MESSAGE) from None
+
+    stored_payload = validated_current_record["action_payload"]
+    if "status" in stored_payload and investigation_status != stored_payload["status"]:
+        raise ApprovalResponseError(_CONSUMPTION_RESPONSE_MESSAGE)
+    if "confidence" in stored_payload and investigation_confidence != stored_payload["confidence"]:
+        raise ApprovalResponseError(_CONSUMPTION_RESPONSE_MESSAGE)
+
+    if canonical_expected_investigation_id != approval_record["investigation_id"]:
+        raise ApprovalResponseError(_CONSUMPTION_RESPONSE_MESSAGE)
+
+    investigation_result = {
+        "investigation_id": canonical_expected_investigation_id,
+        "status": investigation_status,
+        "confidence": investigation_confidence,
+        "updated_at": investigation_updated_at,
+    }
+
+    return {
+        "transition_plan": copy.deepcopy(dict(recomputed_plan)),
+        "updated_record": copy.deepcopy(approval_record),
+        "investigation_result": investigation_result,
     }

@@ -36,6 +36,7 @@ from core.approval_persistence import (
     ApprovalPersistenceError,
     ApprovalResponseError,
     ApprovalTransportError,
+    apply_approval_consumption,
     apply_approval_review_transition,
     insert_pending_approval,
     load_approval_record,
@@ -1504,7 +1505,7 @@ def test_243_to_257_no_forbidden_identifiers_referenced(forbidden_identifier):
     assert forbidden_identifier not in identifiers
 
 
-def test_250_only_insert_select_and_update_operations_exist():
+def test_250_only_insert_select_update_and_rpc_operations_exist():
     tree = _module_ast()
     operation_values = set()
     for node in ast.walk(tree):
@@ -1516,7 +1517,7 @@ def test_250_only_insert_select_and_update_operations_exist():
                     and isinstance(value_node, ast.Constant)
                 ):
                     operation_values.add(value_node.value)
-    assert operation_values == {"insert", "select", "update"}
+    assert operation_values == {"insert", "select", "update", "rpc"}
 
 
 def test_258_approval_conflict_error_reserved_for_review_transitions():
@@ -1882,9 +1883,16 @@ def test_review_genuine_expanded_consume_plan_rejected_before_executor():
 
 
 def test_review_no_rpc_or_consume_operation_descriptor_exists():
+    # apply_approval_review_transition itself must never build an "rpc" or
+    # "consume" operation descriptor -- that remains apply_approval_
+    # consumption's exclusive concern (Step 16). This check is scoped to
+    # apply_approval_review_transition's own function body, not the whole
+    # module, since the module as a whole now legitimately contains an
+    # "rpc" operation descriptor for the separate consumption function.
     tree = _module_ast()
+    fn = _function_def(tree, "apply_approval_review_transition")
     operation_values = set()
-    for node in ast.walk(tree):
+    for node in ast.walk(fn):
         if isinstance(node, ast.Dict):
             for key_node, value_node in zip(node.keys, node.values):
                 if (
@@ -1895,7 +1903,7 @@ def test_review_no_rpc_or_consume_operation_descriptor_exists():
                     operation_values.add(value_node.value)
     assert "rpc" not in operation_values
     assert "consume" not in operation_values
-    assert operation_values == {"insert", "select", "update"}
+    assert operation_values == {"update"}
 
 
 def test_review_no_investigation_table_descriptor_exists_after_expansion():
@@ -2294,10 +2302,15 @@ def test_review_works_under_runtime_guards(monkeypatch):
 
 
 def test_review_no_consume_descriptor_ever_built():
+    # Scoped to apply_approval_review_transition's own function body --
+    # the module as a whole now legitimately contains the literal string
+    # "consume" inside apply_approval_consumption's genuine-plan
+    # reconstruction (Step 16), which is a wholly separate function.
     tree = _module_ast()
+    fn = _function_def(tree, "apply_approval_review_transition")
     string_constants = {
         node.value
-        for node in ast.walk(tree)
+        for node in ast.walk(fn)
         if isinstance(node, ast.Constant) and isinstance(node.value, str)
     }
     assert "consume" not in string_constants
@@ -2331,6 +2344,2026 @@ def test_review_no_update_case_hashing_auth_or_containment():
     tree = _module_ast()
     identifiers = _referenced_identifiers(tree)
     for forbidden in ("hash", "auth", "authenticate", "containment"):
+        assert forbidden not in identifiers
+
+
+# ---------------------------------------------------------------------------
+# apply_approval_consumption -- fixtures
+# ---------------------------------------------------------------------------
+
+APPROVED_AT = "2026-08-01T16:00:00Z"
+CONSUMED_AT = "2026-08-01T17:00:00Z"
+
+
+def _canonical_approved_record(**overrides):
+    record = _pending_row(
+        status="approved",
+        approved_by="Security Reviewer",
+        approved_at=APPROVED_AT,
+    )
+    record.update(overrides)
+    return record
+
+
+def _genuine_consume_plan(
+    current_record,
+    consumed_by="Update Case Operator",
+    consumed_at=CONSUMED_AT,
+    expected_investigation_id=None,
+    expected_action_type="update_investigation_state",
+):
+    request = {
+        "transition": "consume",
+        "consumed_by": consumed_by,
+        "expected_investigation_id": (
+            expected_investigation_id if expected_investigation_id is not None else current_record["investigation_id"]
+        ),
+        "expected_action_type": expected_action_type,
+    }
+    if consumed_at is not None:
+        request["consumed_at"] = consumed_at
+    return validate_approval_transition(current_record, request)
+
+
+def _consumption_row_for(
+    record,
+    plan,
+    *,
+    investigation_status=None,
+    investigation_confidence=None,
+    investigation_updated_at=CONSUMED_AT,
+):
+    approval_row = _apply_set_fields(record, plan["set_fields"])
+    payload = record["action_payload"]
+    row = dict(approval_row)
+    row["investigation_status"] = (
+        investigation_status if investigation_status is not None else payload.get("status", "escalated")
+    )
+    row["investigation_confidence"] = (
+        investigation_confidence if investigation_confidence is not None else payload.get("confidence", "high")
+    )
+    row["investigation_updated_at"] = investigation_updated_at
+    return row
+
+
+def _consumption_executor_for(record, plan, *, row_override=None):
+    response = row_override if row_override is not None else [_consumption_row_for(record, plan)]
+    return _RecordingExecutor(response=response)
+
+
+# ---------------------------------------------------------------------------
+# apply_approval_consumption -- public contract
+# ---------------------------------------------------------------------------
+
+
+def test_consume_function_exists_and_is_callable():
+    assert callable(apply_approval_consumption)
+
+
+def test_consume_signature_has_exactly_three_required_parameters():
+    signature = inspect.signature(apply_approval_consumption)
+    parameters = signature.parameters
+    assert list(parameters) == ["executor", "current_record", "transition_plan"]
+    for name in parameters:
+        assert parameters[name].default is inspect.Parameter.empty
+
+
+def test_consume_no_transition_request_now_or_replacement_value_parameter():
+    signature = inspect.signature(apply_approval_consumption)
+    for forbidden in ("transition_request", "now", "status", "confidence", "action_payload", "investigation_record"):
+        assert forbidden not in signature.parameters
+
+
+def test_consume_required_docstring_phrase_exists():
+    assert (
+        "Verified atomic approval consumption -- approval and investigation changed together"
+        in apply_approval_consumption.__doc__
+    )
+
+
+def test_consume_no_new_exception_class_introduced():
+    tree = _module_ast()
+    defined_classes = [node.name for node in ast.walk(tree) if isinstance(node, ast.ClassDef)]
+    assert set(defined_classes) == {
+        "ApprovalExecutor",
+        "ApprovalPersistenceError",
+        "ApprovalNotFoundError",
+        "ApprovalResponseError",
+        "ApprovalTransportError",
+        "ApprovalConflictError",
+    }
+
+
+# ---------------------------------------------------------------------------
+# apply_approval_consumption -- current approved record
+# ---------------------------------------------------------------------------
+
+
+def test_consume_canonical_approved_record_succeeds():
+    record = _canonical_approved_record()
+    plan = _genuine_consume_plan(record)
+    executor = _consumption_executor_for(record, plan)
+    result = apply_approval_consumption(executor, record, plan)
+    assert result["updated_record"]["status"] == "consumed"
+
+
+def test_consume_non_mapping_record_fails():
+    executor = _RecordingExecutor(response=[{}])
+    with pytest.raises(ApprovalPersistenceError):
+        apply_approval_consumption(executor, ["not", "a", "mapping"], {})
+    assert executor.calls == []
+
+
+def test_consume_missing_record_field_fails():
+    record = _canonical_approved_record()
+    del record["created_at"]
+    executor = _RecordingExecutor(response=[{}])
+    with pytest.raises(ApprovalPersistenceError):
+        apply_approval_consumption(executor, record, {})
+    assert executor.calls == []
+
+
+def test_consume_unknown_record_field_fails():
+    record = _canonical_approved_record(extra_field="unexpected")
+    executor = _RecordingExecutor(response=[{}])
+    with pytest.raises(ApprovalPersistenceError):
+        apply_approval_consumption(executor, record, {})
+    assert executor.calls == []
+
+
+def test_consume_noncanonical_approval_id_fails():
+    record = _canonical_approved_record(id=APPROVAL_ID.upper())
+    executor = _RecordingExecutor(response=[{}])
+    with pytest.raises(ApprovalPersistenceError):
+        apply_approval_consumption(executor, record, {})
+    assert executor.calls == []
+
+
+def test_consume_noncanonical_investigation_id_fails():
+    record = _canonical_approved_record(investigation_id=INVESTIGATION_ID.upper())
+    executor = _RecordingExecutor(response=[{}])
+    with pytest.raises(ApprovalPersistenceError):
+        apply_approval_consumption(executor, record, {})
+    assert executor.calls == []
+
+
+def test_consume_noncanonical_record_timestamp_fails():
+    record = _canonical_approved_record(approved_at="2026-08-01T16:00:00+00:00")
+    executor = _RecordingExecutor(response=[{}])
+    with pytest.raises(ApprovalPersistenceError):
+        apply_approval_consumption(executor, record, {})
+    assert executor.calls == []
+
+
+def test_consume_pending_record_fails():
+    record = _canonical_pending_record()
+    executor = _RecordingExecutor(response=[{}])
+    with pytest.raises(ApprovalPersistenceError):
+        apply_approval_consumption(executor, record, {})
+    assert executor.calls == []
+
+
+def test_consume_rejected_record_fails():
+    record = _canonical_pending_record(
+        status="rejected",
+        rejected_by="Security Reviewer",
+        rejected_at=APPROVED_AT,
+        rejection_reason="Needs more evidence before approval.",
+    )
+    executor = _RecordingExecutor(response=[{}])
+    with pytest.raises(ApprovalPersistenceError):
+        apply_approval_consumption(executor, record, {})
+    assert executor.calls == []
+
+
+def test_consume_already_consumed_record_fails():
+    record = _canonical_approved_record(
+        status="consumed",
+        consumed_by="Update Case Operator",
+        consumed_at=CONSUMED_AT,
+    )
+    executor = _RecordingExecutor(response=[{}])
+    with pytest.raises(ApprovalPersistenceError):
+        apply_approval_consumption(executor, record, {})
+    assert executor.calls == []
+
+
+def test_consume_record_validator_called_exactly_once(monkeypatch):
+    call_count = 0
+    real = approval_persistence.validate_approval_record
+
+    def _counting_wrapper(current_record):
+        nonlocal call_count
+        call_count += 1
+        return real(current_record)
+
+    monkeypatch.setattr(approval_persistence, "validate_approval_record", _counting_wrapper)
+
+    record = _canonical_approved_record()
+    plan = _genuine_consume_plan(record)
+    executor = _consumption_executor_for(record, plan)
+    apply_approval_consumption(executor, record, plan)
+
+    # validate_approval_record is called once for the current-record
+    # boundary, once for the expected-consumed-record candidate, and once
+    # for the returned response row -- three calls total, never zero.
+    assert call_count == 3
+
+
+def test_consume_approval_transition_error_never_escapes():
+    record = _canonical_pending_record()
+    executor = _RecordingExecutor(response=[{}])
+    try:
+        apply_approval_consumption(executor, record, {})
+        pytest.fail("expected ApprovalPersistenceError")
+    except ApprovalTransitionError:
+        pytest.fail("ApprovalTransitionError must never escape apply_approval_consumption")
+    except ApprovalPersistenceError:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# apply_approval_consumption -- consume-plan envelope
+# ---------------------------------------------------------------------------
+
+
+def test_consume_genuine_six_field_plan_succeeds():
+    record = _canonical_approved_record()
+    plan = _genuine_consume_plan(record)
+    assert list(plan.keys()) == [
+        "approval_id", "from_status", "to_status", "set_fields",
+        "expected_investigation_id", "expected_action_type",
+    ]
+    executor = _consumption_executor_for(record, plan)
+    result = apply_approval_consumption(executor, record, plan)
+    assert result["updated_record"]["status"] == "consumed"
+
+
+def test_consume_non_mapping_plan_fails():
+    record = _canonical_approved_record()
+    executor = _RecordingExecutor(response=[{}])
+    with pytest.raises(ApprovalPersistenceError):
+        apply_approval_consumption(executor, record, ["not", "a", "mapping"])
+    assert executor.calls == []
+
+
+def test_consume_old_four_field_consume_plan_fails():
+    record = _canonical_approved_record()
+    plan = _genuine_consume_plan(record)
+    old_shaped_plan = {
+        "approval_id": plan["approval_id"],
+        "from_status": plan["from_status"],
+        "to_status": plan["to_status"],
+        "set_fields": plan["set_fields"],
+    }
+    executor = _RecordingExecutor(response=[{}])
+    with pytest.raises(ApprovalPersistenceError):
+        apply_approval_consumption(executor, record, old_shaped_plan)
+    assert executor.calls == []
+
+
+@pytest.mark.parametrize(
+    "missing_field",
+    ["approval_id", "from_status", "to_status", "set_fields", "expected_investigation_id", "expected_action_type"],
+)
+def test_consume_missing_envelope_field_fails(missing_field):
+    record = _canonical_approved_record()
+    plan = dict(_genuine_consume_plan(record))
+    del plan[missing_field]
+    executor = _RecordingExecutor(response=[{}])
+    with pytest.raises(ApprovalPersistenceError):
+        apply_approval_consumption(executor, record, plan)
+    assert executor.calls == []
+
+
+def test_consume_unknown_plan_field_fails():
+    record = _canonical_approved_record()
+    plan = dict(_genuine_consume_plan(record))
+    plan["extra_metadata"] = "unexpected"
+    executor = _RecordingExecutor(response=[{}])
+    with pytest.raises(ApprovalPersistenceError):
+        apply_approval_consumption(executor, record, plan)
+    assert executor.calls == []
+
+
+def test_consume_reordered_plan_fails():
+    record = _canonical_approved_record()
+    plan = _genuine_consume_plan(record)
+    reordered_plan = {
+        "from_status": plan["from_status"],
+        "approval_id": plan["approval_id"],
+        "to_status": plan["to_status"],
+        "set_fields": plan["set_fields"],
+        "expected_investigation_id": plan["expected_investigation_id"],
+        "expected_action_type": plan["expected_action_type"],
+    }
+    executor = _RecordingExecutor(response=[{}])
+    with pytest.raises(ApprovalPersistenceError):
+        apply_approval_consumption(executor, record, reordered_plan)
+    assert executor.calls == []
+
+
+def test_consume_approve_plan_fails():
+    record = _canonical_approved_record()
+    pending_record = _canonical_pending_record()
+    approve_plan = _genuine_approve_plan(pending_record)
+    executor = _RecordingExecutor(response=[{}])
+    with pytest.raises(ApprovalPersistenceError):
+        apply_approval_consumption(executor, record, approve_plan)
+    assert executor.calls == []
+
+
+def test_consume_reject_plan_fails():
+    record = _canonical_approved_record()
+    pending_record = _canonical_pending_record()
+    reject_plan = _genuine_reject_plan(pending_record)
+    executor = _RecordingExecutor(response=[{}])
+    with pytest.raises(ApprovalPersistenceError):
+        apply_approval_consumption(executor, record, reject_plan)
+    assert executor.calls == []
+
+
+def test_consume_noncanonical_approval_id_in_plan_fails():
+    record = _canonical_approved_record()
+    plan = dict(_genuine_consume_plan(record))
+    plan["approval_id"] = f" {plan['approval_id']} "
+    executor = _RecordingExecutor(response=[{}])
+    with pytest.raises(ApprovalPersistenceError):
+        apply_approval_consumption(executor, record, plan)
+    assert executor.calls == []
+
+
+def test_consume_approval_id_mismatch_fails():
+    record = _canonical_approved_record()
+    plan = dict(_genuine_consume_plan(record))
+    plan["approval_id"] = "59999999-9999-4999-8999-999999999999"
+    executor = _RecordingExecutor(response=[{}])
+    with pytest.raises(ApprovalPersistenceError):
+        apply_approval_consumption(executor, record, plan)
+    assert executor.calls == []
+
+
+def test_consume_from_status_other_than_approved_fails():
+    record = _canonical_approved_record()
+    plan = dict(_genuine_consume_plan(record))
+    plan["from_status"] = "pending"
+    executor = _RecordingExecutor(response=[{}])
+    with pytest.raises(ApprovalPersistenceError):
+        apply_approval_consumption(executor, record, plan)
+    assert executor.calls == []
+
+
+def test_consume_to_status_other_than_consumed_fails():
+    record = _canonical_approved_record()
+    plan = dict(_genuine_consume_plan(record))
+    plan["to_status"] = "approved"
+    executor = _RecordingExecutor(response=[{}])
+    with pytest.raises(ApprovalPersistenceError):
+        apply_approval_consumption(executor, record, plan)
+    assert executor.calls == []
+
+
+def test_consume_noncanonical_expected_investigation_id_fails():
+    record = _canonical_approved_record()
+    plan = dict(_genuine_consume_plan(record))
+    plan["expected_investigation_id"] = f" {plan['expected_investigation_id']} "
+    executor = _RecordingExecutor(response=[{}])
+    with pytest.raises(ApprovalPersistenceError):
+        apply_approval_consumption(executor, record, plan)
+    assert executor.calls == []
+
+
+def test_consume_investigation_binding_mismatch_fails():
+    record = _canonical_approved_record()
+    plan = dict(_genuine_consume_plan(record))
+    plan["expected_investigation_id"] = "59999999-9999-4999-8999-999999999999"
+    executor = _RecordingExecutor(response=[{}])
+    with pytest.raises(ApprovalPersistenceError):
+        apply_approval_consumption(executor, record, plan)
+    assert executor.calls == []
+
+
+def test_consume_noncanonical_expected_action_type_fails():
+    record = _canonical_approved_record()
+    plan = dict(_genuine_consume_plan(record))
+    plan["expected_action_type"] = "UPDATE_INVESTIGATION_STATE"
+    executor = _RecordingExecutor(response=[{}])
+    with pytest.raises(ApprovalPersistenceError):
+        apply_approval_consumption(executor, record, plan)
+    assert executor.calls == []
+
+
+def test_consume_action_type_mismatch_fails(monkeypatch):
+    import core.approval_request as approval_request_module
+    import core.approval_transition as approval_transition_module
+
+    broadened = frozenset({"update_investigation_state", "fake_other_action"})
+    monkeypatch.setattr(approval_request_module, "ACTION_TYPES", broadened)
+    monkeypatch.setattr(approval_transition_module, "ACTION_TYPES", broadened)
+
+    record = _canonical_approved_record(action_type="fake_other_action")
+    # Build a genuine plan matching this record's own action_type first
+    # (a real mismatch cannot be validator-constructed directly), then
+    # forge only the top-level expected_action_type field afterward.
+    genuine_plan = _genuine_consume_plan(record, expected_action_type="fake_other_action")
+    forged_plan = dict(genuine_plan)
+    forged_plan["expected_action_type"] = "update_investigation_state"
+    executor = _RecordingExecutor(response=[{}])
+    with pytest.raises(ApprovalPersistenceError):
+        apply_approval_consumption(executor, record, forged_plan)
+    assert executor.calls == []
+
+
+def test_consume_unsupported_action_type_fails():
+    record = _canonical_approved_record()
+    plan = dict(_genuine_consume_plan(record))
+    plan["expected_action_type"] = "delete_everything"
+    executor = _RecordingExecutor(response=[{}])
+    with pytest.raises(ApprovalPersistenceError):
+        apply_approval_consumption(executor, record, plan)
+    assert executor.calls == []
+
+
+# ---------------------------------------------------------------------------
+# apply_approval_consumption -- set_fields
+# ---------------------------------------------------------------------------
+
+
+def test_consume_set_fields_exact_three_key_shape_required():
+    record = _canonical_approved_record()
+    plan = _genuine_consume_plan(record)
+    assert set(plan["set_fields"].keys()) == {"status", "consumed_by", "consumed_at"}
+
+
+def test_consume_set_fields_exact_order_required():
+    record = _canonical_approved_record()
+    plan = dict(_genuine_consume_plan(record))
+    reordered_set_fields = {
+        "consumed_by": plan["set_fields"]["consumed_by"],
+        "status": plan["set_fields"]["status"],
+        "consumed_at": plan["set_fields"]["consumed_at"],
+    }
+    plan["set_fields"] = reordered_set_fields
+    executor = _RecordingExecutor(response=[{}])
+    with pytest.raises(ApprovalPersistenceError):
+        apply_approval_consumption(executor, record, plan)
+    assert executor.calls == []
+
+
+def test_consume_set_fields_status_must_equal_consumed():
+    record = _canonical_approved_record()
+    plan = dict(_genuine_consume_plan(record))
+    plan["set_fields"] = {**plan["set_fields"], "status": "approved"}
+    executor = _RecordingExecutor(response=[{}])
+    with pytest.raises(ApprovalPersistenceError):
+        apply_approval_consumption(executor, record, plan)
+    assert executor.calls == []
+
+
+def test_consume_set_fields_missing_consumed_by_fails():
+    record = _canonical_approved_record()
+    plan = dict(_genuine_consume_plan(record))
+    plan["set_fields"] = {"status": "consumed", "consumed_at": plan["set_fields"]["consumed_at"]}
+    executor = _RecordingExecutor(response=[{}])
+    with pytest.raises(ApprovalPersistenceError):
+        apply_approval_consumption(executor, record, plan)
+    assert executor.calls == []
+
+
+def test_consume_set_fields_missing_consumed_at_fails():
+    record = _canonical_approved_record()
+    plan = dict(_genuine_consume_plan(record))
+    plan["set_fields"] = {"status": "consumed", "consumed_by": plan["set_fields"]["consumed_by"]}
+    executor = _RecordingExecutor(response=[{}])
+    with pytest.raises(ApprovalPersistenceError):
+        apply_approval_consumption(executor, record, plan)
+    assert executor.calls == []
+
+
+def test_consume_set_fields_unknown_field_fails():
+    record = _canonical_approved_record()
+    plan = dict(_genuine_consume_plan(record))
+    plan["set_fields"] = {**plan["set_fields"], "unexpected": "value"}
+    executor = _RecordingExecutor(response=[{}])
+    with pytest.raises(ApprovalPersistenceError):
+        apply_approval_consumption(executor, record, plan)
+    assert executor.calls == []
+
+
+def test_consume_set_fields_binding_field_fails():
+    record = _canonical_approved_record()
+    plan = dict(_genuine_consume_plan(record))
+    plan["set_fields"] = {**plan["set_fields"], "expected_investigation_id": record["investigation_id"]}
+    executor = _RecordingExecutor(response=[{}])
+    with pytest.raises(ApprovalPersistenceError):
+        apply_approval_consumption(executor, record, plan)
+    assert executor.calls == []
+
+
+def test_consume_set_fields_investigation_field_fails():
+    record = _canonical_approved_record()
+    plan = dict(_genuine_consume_plan(record))
+    plan["set_fields"] = {**plan["set_fields"], "investigation_status": "escalated"}
+    executor = _RecordingExecutor(response=[{}])
+    with pytest.raises(ApprovalPersistenceError):
+        apply_approval_consumption(executor, record, plan)
+    assert executor.calls == []
+
+
+def test_consume_set_fields_approval_field_fails():
+    record = _canonical_approved_record()
+    plan = dict(_genuine_consume_plan(record))
+    plan["set_fields"] = {**plan["set_fields"], "approved_by": "Security Reviewer"}
+    executor = _RecordingExecutor(response=[{}])
+    with pytest.raises(ApprovalPersistenceError):
+        apply_approval_consumption(executor, record, plan)
+    assert executor.calls == []
+
+
+def test_consume_set_fields_rejection_field_fails():
+    record = _canonical_approved_record()
+    plan = dict(_genuine_consume_plan(record))
+    plan["set_fields"] = {**plan["set_fields"], "rejection_reason": "Some reason"}
+    executor = _RecordingExecutor(response=[{}])
+    with pytest.raises(ApprovalPersistenceError):
+        apply_approval_consumption(executor, record, plan)
+    assert executor.calls == []
+
+
+def test_consume_set_fields_persistence_metadata_fails():
+    record = _canonical_approved_record()
+    plan = dict(_genuine_consume_plan(record))
+    plan["set_fields"] = {**plan["set_fields"], "row_count": 1}
+    executor = _RecordingExecutor(response=[{}])
+    with pytest.raises(ApprovalPersistenceError):
+        apply_approval_consumption(executor, record, plan)
+    assert executor.calls == []
+
+
+# ---------------------------------------------------------------------------
+# apply_approval_consumption -- genuine-plan verification
+# ---------------------------------------------------------------------------
+
+
+def test_consume_validate_approval_transition_called_exactly_once(monkeypatch):
+    call_count = 0
+    real = approval_persistence.validate_approval_transition
+
+    def _counting_wrapper(current_record, transition_request):
+        nonlocal call_count
+        call_count += 1
+        return real(current_record, transition_request)
+
+    monkeypatch.setattr(approval_persistence, "validate_approval_transition", _counting_wrapper)
+
+    record = _canonical_approved_record()
+    plan = _genuine_consume_plan(record)
+    executor = _consumption_executor_for(record, plan)
+    apply_approval_consumption(executor, record, plan)
+
+    assert call_count == 1
+
+
+def test_consume_reconstructed_request_has_exactly_five_fields(monkeypatch):
+    captured = {}
+    real = approval_persistence.validate_approval_transition
+
+    def _capturing_wrapper(current_record, transition_request):
+        captured["transition_request"] = transition_request
+        return real(current_record, transition_request)
+
+    monkeypatch.setattr(approval_persistence, "validate_approval_transition", _capturing_wrapper)
+
+    record = _canonical_approved_record()
+    plan = _genuine_consume_plan(record)
+    executor = _consumption_executor_for(record, plan)
+    apply_approval_consumption(executor, record, plan)
+
+    assert set(captured["transition_request"].keys()) == {
+        "transition", "consumed_by", "consumed_at", "expected_investigation_id", "expected_action_type",
+    }
+
+
+def test_consume_reconstructed_request_values_match_the_plan(monkeypatch):
+    captured = {}
+    real = approval_persistence.validate_approval_transition
+
+    def _capturing_wrapper(current_record, transition_request):
+        captured["transition_request"] = transition_request
+        return real(current_record, transition_request)
+
+    monkeypatch.setattr(approval_persistence, "validate_approval_transition", _capturing_wrapper)
+
+    record = _canonical_approved_record()
+    plan = _genuine_consume_plan(record)
+    executor = _consumption_executor_for(record, plan)
+    apply_approval_consumption(executor, record, plan)
+
+    request = captured["transition_request"]
+    assert request["transition"] == "consume"
+    assert request["consumed_by"] == plan["set_fields"]["consumed_by"]
+    assert request["consumed_at"] == plan["set_fields"]["consumed_at"]
+    assert request["expected_investigation_id"] == plan["expected_investigation_id"]
+    assert request["expected_action_type"] == plan["expected_action_type"]
+
+
+def test_consume_forged_consumed_by_fails():
+    record = _canonical_approved_record()
+    genuine_plan = _genuine_consume_plan(record)
+    forged_plan = copy.deepcopy(genuine_plan)
+    forged_plan["set_fields"]["consumed_by"] = "   "
+    executor = _RecordingExecutor(response=[{}])
+    with pytest.raises(ApprovalPersistenceError):
+        apply_approval_consumption(executor, record, forged_plan)
+    assert executor.calls == []
+
+
+def test_consume_forged_consumed_at_fails():
+    record = _canonical_approved_record()
+    genuine_plan = _genuine_consume_plan(record)
+    forged_plan = copy.deepcopy(genuine_plan)
+    forged_plan["set_fields"]["consumed_at"] = "2026-08-01T10:00:00Z"
+    executor = _RecordingExecutor(response=[{}])
+    with pytest.raises(ApprovalPersistenceError):
+        apply_approval_consumption(executor, record, forged_plan)
+    assert executor.calls == []
+
+
+def test_consume_expired_consume_plan_fails():
+    record = _canonical_approved_record(expires_at="2026-08-01T16:30:00Z")
+    genuine_plan_at_valid_time = _genuine_consume_plan(record, consumed_at="2026-08-01T16:15:00Z")
+    forged_plan = copy.deepcopy(genuine_plan_at_valid_time)
+    forged_plan["set_fields"]["consumed_at"] = "2026-08-02T00:00:00Z"
+    executor = _RecordingExecutor(response=[{}])
+    with pytest.raises(ApprovalPersistenceError):
+        apply_approval_consumption(executor, record, forged_plan)
+    assert executor.calls == []
+
+
+def test_consume_consumed_at_before_approved_at_fails():
+    record = _canonical_approved_record()
+    genuine_plan = _genuine_consume_plan(record)
+    forged_plan = copy.deepcopy(genuine_plan)
+    forged_plan["set_fields"]["consumed_at"] = "2026-08-01T10:00:00Z"
+    executor = _RecordingExecutor(response=[{}])
+    with pytest.raises(ApprovalPersistenceError):
+        apply_approval_consumption(executor, record, forged_plan)
+    assert executor.calls == []
+
+
+def test_consume_consumed_at_exactly_at_expiry_fails():
+    record = _canonical_approved_record(expires_at=CONSUMED_AT)
+    with pytest.raises(ApprovalTransitionError):
+        _genuine_consume_plan(record)
+
+
+def test_consume_same_principal_consumption_remains_allowed():
+    record = _canonical_approved_record(requested_by="Roshini Analyst", approved_by="Security Reviewer")
+    plan = _genuine_consume_plan(record, consumed_by="Roshini Analyst")
+    executor = _consumption_executor_for(record, plan)
+    result = apply_approval_consumption(executor, record, plan)
+    assert result["updated_record"]["consumed_by"] == "Roshini Analyst"
+
+
+def test_consume_validator_generated_plan_is_accepted_unchanged():
+    record = _canonical_approved_record()
+    plan = _genuine_consume_plan(record)
+    executor = _consumption_executor_for(record, plan)
+    result = apply_approval_consumption(executor, record, plan)
+    assert result["transition_plan"] == plan
+
+
+# ---------------------------------------------------------------------------
+# apply_approval_consumption -- expected consumed record
+# ---------------------------------------------------------------------------
+
+
+def test_consume_expected_record_status_is_consumed():
+    record = _canonical_approved_record()
+    plan = _genuine_consume_plan(record)
+    executor = _consumption_executor_for(record, plan)
+    result = apply_approval_consumption(executor, record, plan)
+    assert result["updated_record"]["status"] == "consumed"
+
+
+def test_consume_expected_record_consumed_by_matches():
+    record = _canonical_approved_record()
+    plan = _genuine_consume_plan(record)
+    executor = _consumption_executor_for(record, plan)
+    result = apply_approval_consumption(executor, record, plan)
+    assert result["updated_record"]["consumed_by"] == plan["set_fields"]["consumed_by"]
+
+
+def test_consume_expected_record_consumed_at_matches():
+    record = _canonical_approved_record()
+    plan = _genuine_consume_plan(record)
+    executor = _consumption_executor_for(record, plan)
+    result = apply_approval_consumption(executor, record, plan)
+    assert result["updated_record"]["consumed_at"] == plan["set_fields"]["consumed_at"]
+
+
+def test_consume_expected_record_approval_metadata_unchanged():
+    record = _canonical_approved_record()
+    plan = _genuine_consume_plan(record)
+    executor = _consumption_executor_for(record, plan)
+    result = apply_approval_consumption(executor, record, plan)
+    assert result["updated_record"]["approved_by"] == record["approved_by"]
+    assert result["updated_record"]["approved_at"] == record["approved_at"]
+
+
+def test_consume_expected_record_rejection_fields_remain_null():
+    record = _canonical_approved_record()
+    plan = _genuine_consume_plan(record)
+    executor = _consumption_executor_for(record, plan)
+    result = apply_approval_consumption(executor, record, plan)
+    assert result["updated_record"]["rejected_by"] is None
+    assert result["updated_record"]["rejected_at"] is None
+    assert result["updated_record"]["rejection_reason"] is None
+
+
+def test_consume_expected_record_frozen_request_fields_unchanged():
+    record = _canonical_approved_record()
+    plan = _genuine_consume_plan(record)
+    executor = _consumption_executor_for(record, plan)
+    result = apply_approval_consumption(executor, record, plan)
+    updated = result["updated_record"]
+    for field_name in ("id", "investigation_id", "action_type", "requested_by", "requested_at"):
+        assert updated[field_name] == record[field_name]
+
+
+def test_consume_expected_record_expires_at_unchanged():
+    record = _canonical_approved_record()
+    plan = _genuine_consume_plan(record)
+    executor = _consumption_executor_for(record, plan)
+    result = apply_approval_consumption(executor, record, plan)
+    assert result["updated_record"]["expires_at"] == record["expires_at"]
+
+
+def test_consume_expected_record_created_at_unchanged():
+    record = _canonical_approved_record()
+    plan = _genuine_consume_plan(record)
+    executor = _consumption_executor_for(record, plan)
+    result = apply_approval_consumption(executor, record, plan)
+    assert result["updated_record"]["created_at"] == record["created_at"]
+
+
+def test_consume_expected_record_action_payload_unchanged():
+    record = _canonical_approved_record()
+    plan = _genuine_consume_plan(record)
+    executor = _consumption_executor_for(record, plan)
+    result = apply_approval_consumption(executor, record, plan)
+    assert result["updated_record"]["action_payload"] == record["action_payload"]
+
+
+def test_consume_expected_candidate_validated_exactly_once(monkeypatch):
+    call_count = 0
+    real = approval_persistence.validate_approval_record
+
+    def _counting_wrapper(current_record):
+        nonlocal call_count
+        call_count += 1
+        return real(current_record)
+
+    monkeypatch.setattr(approval_persistence, "validate_approval_record", _counting_wrapper)
+
+    record = _canonical_approved_record()
+    plan = _genuine_consume_plan(record)
+    executor = _consumption_executor_for(record, plan)
+    apply_approval_consumption(executor, record, plan)
+
+    assert call_count == 3
+
+
+# ---------------------------------------------------------------------------
+# apply_approval_consumption -- RPC descriptor
+# ---------------------------------------------------------------------------
+
+
+def test_consume_executor_called_exactly_once():
+    record = _canonical_approved_record()
+    plan = _genuine_consume_plan(record)
+    executor = _consumption_executor_for(record, plan)
+    apply_approval_consumption(executor, record, plan)
+    assert len(executor.calls) == 1
+
+
+def test_consume_operation_equals_rpc():
+    record = _canonical_approved_record()
+    plan = _genuine_consume_plan(record)
+    executor = _consumption_executor_for(record, plan)
+    apply_approval_consumption(executor, record, plan)
+    assert executor.calls[0]["operation"] == "rpc"
+
+
+def test_consume_function_name_is_exact():
+    record = _canonical_approved_record()
+    plan = _genuine_consume_plan(record)
+    executor = _consumption_executor_for(record, plan)
+    apply_approval_consumption(executor, record, plan)
+    assert executor.calls[0]["function"] == "consume_approval_and_update_investigation_state"
+
+
+def test_consume_descriptor_contains_exactly_operation_function_parameters():
+    record = _canonical_approved_record()
+    plan = _genuine_consume_plan(record)
+    executor = _consumption_executor_for(record, plan)
+    apply_approval_consumption(executor, record, plan)
+    assert set(executor.calls[0]) == {"operation", "function", "parameters"}
+
+
+def test_consume_parameters_contain_exactly_five_fields_in_order():
+    record = _canonical_approved_record()
+    plan = _genuine_consume_plan(record)
+    executor = _consumption_executor_for(record, plan)
+    apply_approval_consumption(executor, record, plan)
+    parameters = executor.calls[0]["parameters"]
+    assert list(parameters.keys()) == [
+        "approval_id", "expected_investigation_id", "expected_action_type", "consumed_by", "consumed_at",
+    ]
+
+
+def test_consume_parameter_values_are_exact():
+    record = _canonical_approved_record()
+    plan = _genuine_consume_plan(record)
+    executor = _consumption_executor_for(record, plan)
+    apply_approval_consumption(executor, record, plan)
+    parameters = executor.calls[0]["parameters"]
+    assert parameters["approval_id"] == plan["approval_id"]
+    assert parameters["expected_investigation_id"] == plan["expected_investigation_id"]
+    assert parameters["expected_action_type"] == plan["expected_action_type"]
+    assert parameters["consumed_by"] == plan["set_fields"]["consumed_by"]
+    assert parameters["consumed_at"] == plan["set_fields"]["consumed_at"]
+
+
+@pytest.mark.parametrize(
+    "forbidden_key",
+    ["table", "values", "filters", "returning", "limit", "current_record", "transition_plan", "row_count"],
+)
+def test_consume_descriptor_excludes_forbidden_top_level_keys(forbidden_key):
+    record = _canonical_approved_record()
+    plan = _genuine_consume_plan(record)
+    executor = _consumption_executor_for(record, plan)
+    apply_approval_consumption(executor, record, plan)
+    assert forbidden_key not in executor.calls[0]
+
+
+@pytest.mark.parametrize(
+    "forbidden_parameter",
+    ["status", "confidence", "action_payload", "requested_by", "approved_by", "auth_token", "action_hash"],
+)
+def test_consume_parameters_exclude_forbidden_fields(forbidden_parameter):
+    record = _canonical_approved_record()
+    plan = _genuine_consume_plan(record)
+    executor = _consumption_executor_for(record, plan)
+    apply_approval_consumption(executor, record, plan)
+    assert forbidden_parameter not in executor.calls[0]["parameters"]
+
+
+# ---------------------------------------------------------------------------
+# apply_approval_consumption -- conflict
+# ---------------------------------------------------------------------------
+
+
+def test_consume_zero_rows_raises_conflict():
+    record = _canonical_approved_record()
+    plan = _genuine_consume_plan(record)
+    executor = _RecordingExecutor(response=[])
+    with pytest.raises(ApprovalConflictError):
+        apply_approval_consumption(executor, record, plan)
+
+
+def test_consume_conflict_message_is_deterministic():
+    record = _canonical_approved_record()
+    plan = _genuine_consume_plan(record)
+    executor = _RecordingExecutor(response=[])
+    with pytest.raises(ApprovalConflictError) as excinfo:
+        apply_approval_consumption(executor, record, plan)
+    assert str(excinfo.value) == "Approval consumption conflicted."
+
+
+def test_consume_conflict_exposes_no_approval_id():
+    record = _canonical_approved_record()
+    plan = _genuine_consume_plan(record)
+    executor = _RecordingExecutor(response=[])
+    with pytest.raises(ApprovalConflictError) as excinfo:
+        apply_approval_consumption(executor, record, plan)
+    assert plan["approval_id"] not in str(excinfo.value)
+
+
+def test_consume_conflict_exposes_no_identity():
+    record = _canonical_approved_record()
+    plan = _genuine_consume_plan(record)
+    executor = _RecordingExecutor(response=[])
+    with pytest.raises(ApprovalConflictError) as excinfo:
+        apply_approval_consumption(executor, record, plan)
+    assert plan["set_fields"]["consumed_by"] not in str(excinfo.value)
+
+
+def test_consume_conflict_exposes_no_binding():
+    record = _canonical_approved_record()
+    plan = _genuine_consume_plan(record)
+    executor = _RecordingExecutor(response=[])
+    with pytest.raises(ApprovalConflictError) as excinfo:
+        apply_approval_consumption(executor, record, plan)
+    assert plan["expected_investigation_id"] not in str(excinfo.value)
+
+
+def test_consume_conflict_executor_called_exactly_once():
+    record = _canonical_approved_record()
+    plan = _genuine_consume_plan(record)
+    executor = _RecordingExecutor(response=[])
+    with pytest.raises(ApprovalConflictError):
+        apply_approval_consumption(executor, record, plan)
+    assert len(executor.calls) == 1
+
+
+def test_consume_conflict_no_load_after_conflict_occurs():
+    tree = _module_ast()
+    fn = _function_def(tree, "apply_approval_consumption")
+    called = {
+        node.func.id
+        for node in ast.walk(fn)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    }
+    assert "load_approval_record" not in called
+
+
+def test_consume_conflict_is_not_approval_not_found_error():
+    record = _canonical_approved_record()
+    plan = _genuine_consume_plan(record)
+    executor = _RecordingExecutor(response=[])
+    try:
+        apply_approval_consumption(executor, record, plan)
+        pytest.fail("expected ApprovalConflictError")
+    except ApprovalNotFoundError:
+        pytest.fail("ApprovalNotFoundError must never be raised by apply_approval_consumption")
+    except ApprovalConflictError:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# apply_approval_consumption -- response shape
+# ---------------------------------------------------------------------------
+
+
+def test_consume_exactly_one_nineteen_field_row_succeeds():
+    record = _canonical_approved_record()
+    plan = _genuine_consume_plan(record)
+    row = _consumption_row_for(record, plan)
+    assert len(row) == 19
+    executor = _RecordingExecutor(response=[row])
+    result = apply_approval_consumption(executor, record, plan)
+    assert result["updated_record"]["status"] == "consumed"
+
+
+@pytest.mark.parametrize("response", [None, {"id": APPROVAL_ID}, (1, 2), "not-a-list"])
+def test_consume_malformed_response_shape_fails(response):
+    record = _canonical_approved_record()
+    plan = _genuine_consume_plan(record)
+    executor = _RecordingExecutor(response=response)
+    with pytest.raises(ApprovalResponseError):
+        apply_approval_consumption(executor, record, plan)
+
+
+def test_consume_generator_response_fails():
+    record = _canonical_approved_record()
+    plan = _genuine_consume_plan(record)
+    row = _consumption_row_for(record, plan)
+
+    def _generator():
+        yield row
+
+    executor = _RecordingExecutor(response=_generator())
+    with pytest.raises(ApprovalResponseError):
+        apply_approval_consumption(executor, record, plan)
+
+
+def test_consume_multiple_rows_fail():
+    record = _canonical_approved_record()
+    plan = _genuine_consume_plan(record)
+    row = _consumption_row_for(record, plan)
+    executor = _RecordingExecutor(response=[row, copy.deepcopy(row)])
+    with pytest.raises(ApprovalResponseError):
+        apply_approval_consumption(executor, record, plan)
+
+
+def test_consume_non_mapping_row_fails():
+    record = _canonical_approved_record()
+    plan = _genuine_consume_plan(record)
+    executor = _RecordingExecutor(response=["not-a-mapping"])
+    with pytest.raises(ApprovalResponseError):
+        apply_approval_consumption(executor, record, plan)
+
+
+@pytest.mark.parametrize(
+    "missing_field", ["id", "investigation_id", "action_type", "requested_by", "requested_at", "status", "created_at"]
+)
+def test_consume_missing_required_approval_field_fails(missing_field):
+    record = _canonical_approved_record()
+    plan = _genuine_consume_plan(record)
+    row = _consumption_row_for(record, plan)
+    del row[missing_field]
+    executor = _RecordingExecutor(response=[row])
+    with pytest.raises(ApprovalResponseError):
+        apply_approval_consumption(executor, record, plan)
+
+
+def test_consume_missing_investigation_status_fails():
+    record = _canonical_approved_record()
+    plan = _genuine_consume_plan(record)
+    row = _consumption_row_for(record, plan)
+    del row["investigation_status"]
+    executor = _RecordingExecutor(response=[row])
+    with pytest.raises(ApprovalResponseError):
+        apply_approval_consumption(executor, record, plan)
+
+
+def test_consume_missing_investigation_confidence_fails():
+    record = _canonical_approved_record()
+    plan = _genuine_consume_plan(record)
+    row = _consumption_row_for(record, plan)
+    del row["investigation_confidence"]
+    executor = _RecordingExecutor(response=[row])
+    with pytest.raises(ApprovalResponseError):
+        apply_approval_consumption(executor, record, plan)
+
+
+def test_consume_missing_investigation_updated_at_fails():
+    record = _canonical_approved_record()
+    plan = _genuine_consume_plan(record)
+    row = _consumption_row_for(record, plan)
+    del row["investigation_updated_at"]
+    executor = _RecordingExecutor(response=[row])
+    with pytest.raises(ApprovalResponseError):
+        apply_approval_consumption(executor, record, plan)
+
+
+def test_consume_unknown_row_field_fails():
+    record = _canonical_approved_record()
+    plan = _genuine_consume_plan(record)
+    row = _consumption_row_for(record, plan)
+    row["unexpected_field"] = "value"
+    executor = _RecordingExecutor(response=[row])
+    with pytest.raises(ApprovalResponseError):
+        apply_approval_consumption(executor, record, plan)
+
+
+def test_consume_nullable_approval_fields_restored_as_none():
+    record = _canonical_approved_record()
+    plan = _genuine_consume_plan(record)
+    row = _consumption_row_for(record, plan)
+    del row["rejected_by"]
+    del row["rejection_reason"]
+    executor = _RecordingExecutor(response=[row])
+    result = apply_approval_consumption(executor, record, plan)
+    assert result["updated_record"]["rejected_by"] is None
+    assert result["updated_record"]["rejection_reason"] is None
+
+
+def test_consume_response_errors_do_not_return_partial_output():
+    record = _canonical_approved_record()
+    plan = _genuine_consume_plan(record)
+    row = _consumption_row_for(record, plan)
+    row["unexpected_field"] = "value"
+    executor = _RecordingExecutor(response=[row])
+    try:
+        result = apply_approval_consumption(executor, record, plan)
+        pytest.fail(f"expected ApprovalResponseError, got a result: {result!r}")
+    except ApprovalResponseError:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# apply_approval_consumption -- returned approval verification
+# ---------------------------------------------------------------------------
+
+
+def test_consume_returned_approval_validated_exactly_once(monkeypatch):
+    call_count = 0
+    real = approval_persistence.validate_approval_record
+
+    record = _canonical_approved_record()
+    plan = _genuine_consume_plan(record)
+    row = _consumption_row_for(record, plan)
+
+    def _counting_wrapper(current_record):
+        nonlocal call_count
+        call_count += 1
+        return real(current_record)
+
+    monkeypatch.setattr(approval_persistence, "validate_approval_record", _counting_wrapper)
+    executor = _RecordingExecutor(response=[row])
+    apply_approval_consumption(executor, record, plan)
+
+    assert call_count == 3
+
+
+def test_consume_returned_record_equals_expected_record():
+    record = _canonical_approved_record()
+    plan = _genuine_consume_plan(record)
+    row = _consumption_row_for(record, plan)
+    executor = _RecordingExecutor(response=[row])
+    result = apply_approval_consumption(executor, record, plan)
+    expected_approval_portion = {key: row[key] for key in _RECORD_FIELDS}
+    assert result["updated_record"] == expected_approval_portion
+
+
+@pytest.mark.parametrize(
+    "field_name,new_value",
+    [
+        ("id", "59999999-9999-4999-8999-999999999999"),
+        ("investigation_id", "42222222-2222-4222-8222-222222222222"),
+        ("requested_by", "Someone Else"),
+        ("requested_at", "2026-08-01T16:00:00Z"),
+        ("action_payload", {"status": "escalated", "confidence": "low"}),
+        ("approved_by", "Someone Completely Different"),
+        ("approved_at", "2026-08-01T15:50:00Z"),
+        ("expires_at", "2026-08-05T00:00:00Z"),
+        ("consumed_by", "Someone Else Entirely"),
+        ("consumed_at", "2026-08-01T18:00:00Z"),
+        ("created_at", "2026-08-01T15:47:00Z"),
+    ],
+)
+def test_consume_changed_frozen_or_lifecycle_field_fails(field_name, new_value):
+    record = _canonical_approved_record()
+    plan = _genuine_consume_plan(record)
+    row = _consumption_row_for(record, plan)
+    row[field_name] = new_value
+    executor = _RecordingExecutor(response=[row])
+    with pytest.raises(ApprovalResponseError):
+        apply_approval_consumption(executor, record, plan)
+
+
+def test_consume_changed_action_type_fails(monkeypatch):
+    import core.approval_request as approval_request_module
+
+    monkeypatch.setattr(
+        approval_request_module, "ACTION_TYPES", frozenset({"update_investigation_state", "fake_other_action"})
+    )
+    record = _canonical_approved_record()
+    plan = _genuine_consume_plan(record)
+    row = _consumption_row_for(record, plan)
+    row["action_type"] = "fake_other_action"
+    executor = _RecordingExecutor(response=[row])
+    with pytest.raises(ApprovalResponseError):
+        apply_approval_consumption(executor, record, plan)
+
+
+def test_consume_wrong_status_fails():
+    record = _canonical_approved_record()
+    plan = _genuine_consume_plan(record)
+    row = _consumption_row_for(record, plan)
+    row["status"] = "approved"
+    row["consumed_by"] = None
+    row["consumed_at"] = None
+    executor = _RecordingExecutor(response=[row])
+    with pytest.raises(ApprovalResponseError):
+        apply_approval_consumption(executor, record, plan)
+
+
+def test_consume_unexpected_rejection_metadata_fails():
+    record = _canonical_approved_record()
+    plan = _genuine_consume_plan(record)
+    row = _consumption_row_for(record, plan)
+    row["status"] = "rejected"
+    row["rejected_by"] = "Security Reviewer"
+    row["rejected_at"] = APPROVED_AT
+    row["rejection_reason"] = "Some other reason entirely."
+    row["approved_by"] = None
+    row["approved_at"] = None
+    row["consumed_by"] = None
+    row["consumed_at"] = None
+    executor = _RecordingExecutor(response=[row])
+    with pytest.raises(ApprovalResponseError):
+        apply_approval_consumption(executor, record, plan)
+
+
+def test_consume_returned_approval_transition_error_never_escapes():
+    record = _canonical_approved_record()
+    plan = _genuine_consume_plan(record)
+    row = _consumption_row_for(record, plan)
+    row["rejected_by"] = "Security Reviewer"
+    executor = _RecordingExecutor(response=[row])
+    try:
+        apply_approval_consumption(executor, record, plan)
+        pytest.fail("expected ApprovalResponseError")
+    except ApprovalTransitionError:
+        pytest.fail("ApprovalTransitionError must never escape apply_approval_consumption")
+    except ApprovalResponseError:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# apply_approval_consumption -- investigation result
+# ---------------------------------------------------------------------------
+
+
+def test_consume_valid_status_succeeds():
+    record = _canonical_approved_record()
+    plan = _genuine_consume_plan(record)
+    row = _consumption_row_for(record, plan, investigation_status="escalated")
+    executor = _RecordingExecutor(response=[row])
+    result = apply_approval_consumption(executor, record, plan)
+    assert result["investigation_result"]["status"] == "escalated"
+
+
+def test_consume_valid_confidence_succeeds():
+    record = _canonical_approved_record()
+    plan = _genuine_consume_plan(record)
+    row = _consumption_row_for(record, plan, investigation_confidence="high")
+    executor = _RecordingExecutor(response=[row])
+    result = apply_approval_consumption(executor, record, plan)
+    assert result["investigation_result"]["confidence"] == "high"
+
+
+def test_consume_aware_updated_at_succeeds():
+    record = _canonical_approved_record()
+    plan = _genuine_consume_plan(record)
+    row = _consumption_row_for(record, plan, investigation_updated_at="2026-08-01T17:00:00Z")
+    executor = _RecordingExecutor(response=[row])
+    result = apply_approval_consumption(executor, record, plan)
+    assert result["investigation_result"]["updated_at"] == "2026-08-01T17:00:00Z"
+
+
+def test_consume_offset_updated_at_canonicalizes_to_utc_z():
+    record = _canonical_approved_record()
+    plan = _genuine_consume_plan(record)
+    row = _consumption_row_for(record, plan, investigation_updated_at="2026-08-01T12:00:00-05:00")
+    executor = _RecordingExecutor(response=[row])
+    result = apply_approval_consumption(executor, record, plan)
+    assert result["investigation_result"]["updated_at"] == "2026-08-01T17:00:00Z"
+
+
+def test_consume_aware_datetime_updated_at_succeeds():
+    record = _canonical_approved_record()
+    plan = _genuine_consume_plan(record)
+    dt = datetime(2026, 8, 1, 17, 0, 0, tzinfo=timezone.utc)
+    row = _consumption_row_for(record, plan, investigation_updated_at=dt)
+    executor = _RecordingExecutor(response=[row])
+    result = apply_approval_consumption(executor, record, plan)
+    assert result["investigation_result"]["updated_at"] == "2026-08-01T17:00:00Z"
+
+
+def test_consume_naive_updated_at_fails():
+    record = _canonical_approved_record()
+    plan = _genuine_consume_plan(record)
+    row = _consumption_row_for(record, plan, investigation_updated_at="2026-08-01T17:00:00")
+    executor = _RecordingExecutor(response=[row])
+    with pytest.raises(ApprovalResponseError):
+        apply_approval_consumption(executor, record, plan)
+
+
+def test_consume_malformed_updated_at_fails():
+    record = _canonical_approved_record()
+    plan = _genuine_consume_plan(record)
+    row = _consumption_row_for(record, plan, investigation_updated_at="not-a-timestamp")
+    executor = _RecordingExecutor(response=[row])
+    with pytest.raises(ApprovalResponseError):
+        apply_approval_consumption(executor, record, plan)
+
+
+def test_consume_blank_status_fails():
+    record = _canonical_approved_record()
+    plan = _genuine_consume_plan(record)
+    row = _consumption_row_for(record, plan, investigation_status="   ")
+    executor = _RecordingExecutor(response=[row])
+    with pytest.raises(ApprovalResponseError):
+        apply_approval_consumption(executor, record, plan)
+
+
+def test_consume_padded_status_fails():
+    record = _canonical_approved_record()
+    plan = _genuine_consume_plan(record)
+    row = _consumption_row_for(record, plan, investigation_status=" escalated")
+    executor = _RecordingExecutor(response=[row])
+    with pytest.raises(ApprovalResponseError):
+        apply_approval_consumption(executor, record, plan)
+
+
+def test_consume_unknown_status_fails():
+    record = _canonical_approved_record()
+    plan = _genuine_consume_plan(record)
+    row = _consumption_row_for(record, plan, investigation_status="not-a-real-status")
+    executor = _RecordingExecutor(response=[row])
+    with pytest.raises(ApprovalResponseError):
+        apply_approval_consumption(executor, record, plan)
+
+
+def test_consume_non_string_status_fails():
+    record = _canonical_approved_record()
+    plan = _genuine_consume_plan(record)
+    row = _consumption_row_for(record, plan, investigation_status=12345)
+    executor = _RecordingExecutor(response=[row])
+    with pytest.raises(ApprovalResponseError):
+        apply_approval_consumption(executor, record, plan)
+
+
+def test_consume_blank_confidence_fails():
+    record = _canonical_approved_record()
+    plan = _genuine_consume_plan(record)
+    row = _consumption_row_for(record, plan, investigation_confidence="   ")
+    executor = _RecordingExecutor(response=[row])
+    with pytest.raises(ApprovalResponseError):
+        apply_approval_consumption(executor, record, plan)
+
+
+def test_consume_padded_confidence_fails():
+    record = _canonical_approved_record()
+    plan = _genuine_consume_plan(record)
+    row = _consumption_row_for(record, plan, investigation_confidence=" high")
+    executor = _RecordingExecutor(response=[row])
+    with pytest.raises(ApprovalResponseError):
+        apply_approval_consumption(executor, record, plan)
+
+
+def test_consume_unknown_confidence_fails():
+    record = _canonical_approved_record()
+    plan = _genuine_consume_plan(record)
+    row = _consumption_row_for(record, plan, investigation_confidence="extreme")
+    executor = _RecordingExecutor(response=[row])
+    with pytest.raises(ApprovalResponseError):
+        apply_approval_consumption(executor, record, plan)
+
+
+def test_consume_non_string_confidence_fails():
+    record = _canonical_approved_record()
+    plan = _genuine_consume_plan(record)
+    row = _consumption_row_for(record, plan, investigation_confidence=99)
+    executor = _RecordingExecutor(response=[row])
+    with pytest.raises(ApprovalResponseError):
+        apply_approval_consumption(executor, record, plan)
+
+
+def test_consume_returned_investigation_id_equals_expected_binding():
+    record = _canonical_approved_record()
+    plan = _genuine_consume_plan(record)
+    executor = _consumption_executor_for(record, plan)
+    result = apply_approval_consumption(executor, record, plan)
+    assert result["investigation_result"]["investigation_id"] == plan["expected_investigation_id"]
+
+
+def test_consume_public_result_key_order_is_exact():
+    record = _canonical_approved_record()
+    plan = _genuine_consume_plan(record)
+    executor = _consumption_executor_for(record, plan)
+    result = apply_approval_consumption(executor, record, plan)
+    assert list(result.keys()) == ["transition_plan", "updated_record", "investigation_result"]
+    assert list(result["investigation_result"].keys()) == ["investigation_id", "status", "confidence", "updated_at"]
+
+
+def test_consume_public_result_uses_status_confidence_updated_at_names():
+    record = _canonical_approved_record()
+    plan = _genuine_consume_plan(record)
+    executor = _consumption_executor_for(record, plan)
+    result = apply_approval_consumption(executor, record, plan)
+    investigation_result = result["investigation_result"]
+    assert "status" in investigation_result
+    assert "confidence" in investigation_result
+    assert "updated_at" in investigation_result
+
+
+def test_consume_raw_investigation_prefixed_keys_not_returned_publicly():
+    record = _canonical_approved_record()
+    plan = _genuine_consume_plan(record)
+    executor = _consumption_executor_for(record, plan)
+    result = apply_approval_consumption(executor, record, plan)
+    investigation_result = result["investigation_result"]
+    assert "investigation_status" not in investigation_result
+    assert "investigation_confidence" not in investigation_result
+    assert "investigation_updated_at" not in investigation_result
+
+
+# ---------------------------------------------------------------------------
+# apply_approval_consumption -- stored-action binding
+# ---------------------------------------------------------------------------
+
+
+def test_consume_status_only_payload_requires_matching_returned_status():
+    record = _canonical_approved_record(action_payload={"status": "escalated"})
+    plan = _genuine_consume_plan(record)
+    row = _consumption_row_for(record, plan, investigation_status="escalated", investigation_confidence="unknown")
+    executor = _RecordingExecutor(response=[row])
+    result = apply_approval_consumption(executor, record, plan)
+    assert result["investigation_result"]["status"] == "escalated"
+
+
+def test_consume_status_only_payload_permits_any_valid_returned_confidence():
+    record = _canonical_approved_record(action_payload={"status": "escalated"})
+    plan = _genuine_consume_plan(record)
+    row = _consumption_row_for(record, plan, investigation_status="escalated", investigation_confidence="medium")
+    executor = _RecordingExecutor(response=[row])
+    result = apply_approval_consumption(executor, record, plan)
+    assert result["investigation_result"]["confidence"] == "medium"
+
+
+def test_consume_confidence_only_payload_requires_matching_returned_confidence():
+    record = _canonical_approved_record(action_payload={"confidence": "high"})
+    plan = _genuine_consume_plan(record)
+    row = _consumption_row_for(record, plan, investigation_status="investigating", investigation_confidence="high")
+    executor = _RecordingExecutor(response=[row])
+    result = apply_approval_consumption(executor, record, plan)
+    assert result["investigation_result"]["confidence"] == "high"
+
+
+def test_consume_confidence_only_payload_permits_any_valid_returned_status():
+    record = _canonical_approved_record(action_payload={"confidence": "high"})
+    plan = _genuine_consume_plan(record)
+    row = _consumption_row_for(record, plan, investigation_status="closed", investigation_confidence="high")
+    executor = _RecordingExecutor(response=[row])
+    result = apply_approval_consumption(executor, record, plan)
+    assert result["investigation_result"]["status"] == "closed"
+
+
+def test_consume_status_and_confidence_payload_requires_both_exact_matches():
+    record = _canonical_approved_record(action_payload={"status": "escalated", "confidence": "high"})
+    plan = _genuine_consume_plan(record)
+    row = _consumption_row_for(record, plan, investigation_status="escalated", investigation_confidence="high")
+    executor = _RecordingExecutor(response=[row])
+    result = apply_approval_consumption(executor, record, plan)
+    assert result["investigation_result"]["status"] == "escalated"
+    assert result["investigation_result"]["confidence"] == "high"
+
+
+def test_consume_mismatched_stored_status_fails():
+    record = _canonical_approved_record(action_payload={"status": "escalated", "confidence": "high"})
+    plan = _genuine_consume_plan(record)
+    row = _consumption_row_for(record, plan, investigation_status="closed", investigation_confidence="high")
+    executor = _RecordingExecutor(response=[row])
+    with pytest.raises(ApprovalResponseError):
+        apply_approval_consumption(executor, record, plan)
+
+
+def test_consume_mismatched_stored_confidence_fails():
+    record = _canonical_approved_record(action_payload={"status": "escalated", "confidence": "high"})
+    plan = _genuine_consume_plan(record)
+    row = _consumption_row_for(record, plan, investigation_status="escalated", investigation_confidence="low")
+    executor = _RecordingExecutor(response=[row])
+    with pytest.raises(ApprovalResponseError):
+        apply_approval_consumption(executor, record, plan)
+
+
+def test_consume_no_caller_replacement_value_is_accepted():
+    signature = inspect.signature(apply_approval_consumption)
+    assert "status" not in signature.parameters
+    assert "confidence" not in signature.parameters
+
+
+def test_consume_python_does_not_claim_prior_value_verification():
+    # When a payload field is absent, apply_approval_consumption only
+    # requires the returned value to remain a valid vocabulary member --
+    # it never compares against (or claims to know) the investigation's
+    # prior stored value, since no prior investigation record is ever
+    # read or supplied.
+    record = _canonical_approved_record(action_payload={"status": "escalated"})
+    plan = _genuine_consume_plan(record)
+    row = _consumption_row_for(record, plan, investigation_status="escalated", investigation_confidence="unknown")
+    executor = _RecordingExecutor(response=[row])
+    result = apply_approval_consumption(executor, record, plan)
+    assert result["investigation_result"]["confidence"] == "unknown"
+
+
+# ---------------------------------------------------------------------------
+# apply_approval_consumption -- transport/error safety
+# ---------------------------------------------------------------------------
+
+
+def test_consume_executor_exception_becomes_transport_error():
+    record = _canonical_approved_record()
+    plan = _genuine_consume_plan(record)
+    executor = _RecordingExecutor(raises=RuntimeError("boom"))
+    with pytest.raises(ApprovalTransportError):
+        apply_approval_consumption(executor, record, plan)
+
+
+def test_consume_transport_error_redacts_everything():
+    record = _canonical_approved_record()
+    plan = _genuine_consume_plan(record)
+    secret_exception_message = "postgres://user:hunter2@db.internal:5432/prod?sslmode=require"
+    executor = _RecordingExecutor(
+        raises=RuntimeError(
+            secret_exception_message
+            + " service_role_key=sk-fake-secret-key action_payload={'status':'x'} identity=jane"
+            + " expected_investigation_id=" + plan["expected_investigation_id"]
+        )
+    )
+    with pytest.raises(ApprovalTransportError) as excinfo:
+        apply_approval_consumption(executor, record, plan)
+
+    message = str(excinfo.value)
+    assert "RuntimeError" not in message
+    assert secret_exception_message not in message
+    assert "Traceback" not in message
+    assert "postgres://" not in message
+    assert "sk-fake-secret-key" not in message
+    assert "action_payload" not in message
+    assert "identity=jane" not in message
+    assert plan["expected_investigation_id"] not in message
+    assert excinfo.value.__cause__ is None
+
+
+def test_consume_response_errors_expose_no_row():
+    record = _canonical_approved_record()
+    plan = _genuine_consume_plan(record)
+    secret_marker = "top-secret-consume-marker"
+    row = _consumption_row_for(record, plan)
+    row["consumed_by"] = secret_marker
+    executor = _RecordingExecutor(response=[row])
+    with pytest.raises(ApprovalResponseError) as excinfo:
+        apply_approval_consumption(executor, record, plan)
+    assert secret_marker not in str(excinfo.value)
+
+
+def test_consume_persistence_error_before_executor_not_misclassified():
+    record = _canonical_pending_record()
+    executor = _RecordingExecutor(response=[{}])
+    try:
+        apply_approval_consumption(executor, record, {})
+    except ApprovalTransportError:
+        pytest.fail("invalid adapter input must not be classified as a transport error")
+    except ApprovalPersistenceError:
+        pass
+    assert executor.calls == []
+
+
+def test_consume_executor_invoked_once_only_on_transport_failure():
+    record = _canonical_approved_record()
+    plan = _genuine_consume_plan(record)
+    executor = _RecordingExecutor(raises=RuntimeError("boom"))
+    with pytest.raises(ApprovalTransportError):
+        apply_approval_consumption(executor, record, plan)
+    assert len(executor.calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# apply_approval_consumption -- non-mutation and independence
+# ---------------------------------------------------------------------------
+
+
+def test_consume_inputs_and_response_unchanged():
+    record = _canonical_approved_record()
+    plan = _genuine_consume_plan(record)
+    before_record = copy.deepcopy(record)
+    before_plan = copy.deepcopy(plan)
+    row = _consumption_row_for(record, plan)
+    response = [row]
+    before_response = copy.deepcopy(response)
+    executor = _RecordingExecutor(response=response)
+    apply_approval_consumption(executor, record, plan)
+    assert record == before_record
+    assert plan == before_plan
+    assert response == before_response
+
+
+def test_consume_hostile_executor_mutation_cannot_alter_inputs():
+    record = _canonical_approved_record()
+    plan = _genuine_consume_plan(record)
+    row = _consumption_row_for(record, plan)
+
+    def _hostile(operation):
+        operation["parameters"]["consumed_by"] = "HACKED"
+        operation["parameters"]["approval_id"] = "hacked"
+        return [row]
+
+    apply_approval_consumption(_hostile, record, plan)
+    assert plan["set_fields"]["consumed_by"] != "HACKED"
+    assert record["id"] != "hacked"
+
+
+def test_consume_returned_objects_are_independent():
+    record = _canonical_approved_record()
+    plan = _genuine_consume_plan(record)
+    row = _consumption_row_for(record, plan)
+    executor = _RecordingExecutor(response=[row])
+    result = apply_approval_consumption(executor, record, plan)
+    assert result["transition_plan"] is not plan
+    assert result["transition_plan"]["set_fields"] is not plan["set_fields"]
+    assert result["updated_record"] is not row
+    assert result["updated_record"]["action_payload"] is not row["action_payload"]
+    assert result["investigation_result"] is not row
+
+
+def test_consume_separate_calls_return_independent_objects():
+    record = _canonical_approved_record()
+    plan = _genuine_consume_plan(record)
+    row = _consumption_row_for(record, plan)
+
+    executor_one = _RecordingExecutor(response=[copy.deepcopy(row)])
+    executor_two = _RecordingExecutor(response=[copy.deepcopy(row)])
+
+    result_one = apply_approval_consumption(executor_one, record, plan)
+    result_two = apply_approval_consumption(executor_two, record, plan)
+
+    assert result_one == result_two
+    assert result_one["updated_record"] is not result_two["updated_record"]
+    assert result_one["investigation_result"] is not result_two["investigation_result"]
+
+
+def test_consume_failure_paths_do_not_mutate_inputs():
+    record = _canonical_approved_record()
+    plan = _genuine_consume_plan(record)
+    before_record = copy.deepcopy(record)
+    before_plan = copy.deepcopy(plan)
+    executor = _RecordingExecutor(response=[])
+    with pytest.raises(ApprovalConflictError):
+        apply_approval_consumption(executor, record, plan)
+    assert record == before_record
+    assert plan == before_plan
+
+
+# ---------------------------------------------------------------------------
+# apply_approval_consumption -- output exclusions
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "excluded_key",
+    [
+        "persisted", "success", "row_count", "affected_rows", "database_result",
+        "executor_result", "rpc_result", "operation", "title", "description",
+        "authentication_result", "action_hash", "execution_result",
+    ],
+)
+def test_consume_output_never_contains_forbidden_keys(excluded_key):
+    record = _canonical_approved_record()
+    plan = _genuine_consume_plan(record)
+    executor = _consumption_executor_for(record, plan)
+    result = apply_approval_consumption(executor, record, plan)
+    assert excluded_key not in result
+    assert excluded_key not in result["updated_record"]
+    assert excluded_key not in result["investigation_result"]
+
+
+# ---------------------------------------------------------------------------
+# apply_approval_consumption -- existing regressions
+# ---------------------------------------------------------------------------
+
+
+def test_consume_insert_behavior_remains_unchanged():
+    executor = _RecordingExecutor(response=[_pending_row(expires_at=None)])
+    result = insert_pending_approval(executor, _validated_request(), expires_at=None)
+    assert result["status"] == "pending"
+
+
+def test_consume_lookup_behavior_remains_unchanged():
+    executor = _RecordingExecutor(response=[_pending_row()])
+    result = load_approval_record(executor, APPROVAL_ID)
+    assert result["status"] == "pending"
+
+
+def test_consume_approve_persistence_remains_unchanged():
+    pending_record = _canonical_pending_record()
+    plan = _genuine_approve_plan(pending_record)
+    executor = _review_executor_for(pending_record, plan)
+    result = apply_approval_review_transition(executor, pending_record, plan)
+    assert result["updated_record"]["status"] == "approved"
+
+
+def test_consume_reject_persistence_remains_unchanged():
+    pending_record = _canonical_pending_record()
+    plan = _genuine_reject_plan(pending_record)
+    executor = _review_executor_for(pending_record, plan)
+    result = apply_approval_review_transition(executor, pending_record, plan)
+    assert result["updated_record"]["status"] == "rejected"
+
+
+def test_consume_existing_insert_descriptor_unchanged():
+    executor = _RecordingExecutor(response=[_pending_row()])
+    insert_pending_approval(executor, _validated_request(), expires_at=EXPIRES_AT)
+    operation = executor.calls[0]
+    assert operation["operation"] == "insert"
+    assert set(operation) == {"operation", "table", "values", "returning"}
+
+
+def test_consume_existing_select_descriptor_unchanged():
+    executor = _RecordingExecutor(response=[_pending_row()])
+    load_approval_record(executor, APPROVAL_ID)
+    operation = executor.calls[0]
+    assert operation["operation"] == "select"
+    assert set(operation) == {"operation", "table", "columns", "filters", "limit"}
+
+
+def test_consume_existing_update_descriptor_unchanged():
+    pending_record = _canonical_pending_record()
+    plan = _genuine_approve_plan(pending_record)
+    executor = _review_executor_for(pending_record, plan)
+    apply_approval_review_transition(executor, pending_record, plan)
+    operation = executor.calls[0]
+    assert operation["operation"] == "update"
+    assert set(operation) == {"operation", "table", "values", "filters", "returning"}
+
+
+def test_consume_existing_exception_behavior_unchanged():
+    executor = _RecordingExecutor(response=[])
+    with pytest.raises(ApprovalNotFoundError):
+        load_approval_record(executor, APPROVAL_ID)
+
+
+# ---------------------------------------------------------------------------
+# apply_approval_consumption -- runtime boundary
+# ---------------------------------------------------------------------------
+
+
+def test_consume_import_performs_no_side_effects(monkeypatch):
+    import importlib
+    import sys
+
+    def _forbidden(*_args, **_kwargs):
+        raise AssertionError("a forbidden entry point was called during import")
+
+    monkeypatch.setattr("builtins.open", _forbidden)
+    monkeypatch.setattr(Path, "open", _forbidden)
+    monkeypatch.setattr(subprocess, "run", _forbidden)
+    monkeypatch.setattr(subprocess, "Popen", _forbidden)
+    monkeypatch.setattr(socket, "socket", _forbidden)
+    monkeypatch.setattr(socket, "create_connection", _forbidden)
+    monkeypatch.setattr(urllib.request, "urlopen", _forbidden)
+    monkeypatch.setattr(os.environ, "get", _forbidden)
+
+    module_name = "core.approval_persistence"
+    existing = sys.modules.pop(module_name, None)
+    try:
+        reloaded = importlib.import_module(module_name)
+        assert reloaded is not None
+    finally:
+        if existing is not None:
+            sys.modules[module_name] = existing
+
+
+def test_consume_works_under_runtime_guards(monkeypatch):
+    def _forbidden(*_args, **_kwargs):
+        raise AssertionError("a forbidden entry point was called")
+
+    try:
+        import requests
+    except ImportError:
+        requests = None
+
+    try:
+        import supabase
+    except ImportError:
+        supabase = None
+
+    monkeypatch.setattr("builtins.open", _forbidden)
+    monkeypatch.setattr(Path, "open", _forbidden)
+    monkeypatch.setattr(subprocess, "run", _forbidden)
+    monkeypatch.setattr(subprocess, "Popen", _forbidden)
+    monkeypatch.setattr(socket, "socket", _forbidden)
+    monkeypatch.setattr(socket, "create_connection", _forbidden)
+    monkeypatch.setattr(urllib.request, "urlopen", _forbidden)
+
+    if requests is not None:
+        monkeypatch.setattr(requests, "get", _forbidden)
+        monkeypatch.setattr(requests, "post", _forbidden)
+
+    if supabase is not None and hasattr(supabase, "create_client"):
+        monkeypatch.setattr(supabase, "create_client", _forbidden)
+
+    record = _canonical_approved_record()
+    plan = _genuine_consume_plan(record)
+    executor = _consumption_executor_for(record, plan)
+    result = apply_approval_consumption(executor, record, plan)
+    assert result["updated_record"]["status"] == "consumed"
+
+
+def test_consume_environment_and_cwd_unchanged():
+    original_cwd = os.getcwd()
+    original_environ = dict(os.environ)
+
+    record = _canonical_approved_record()
+    plan = _genuine_consume_plan(record)
+    executor = _consumption_executor_for(record, plan)
+    apply_approval_consumption(executor, record, plan)
+
+    assert os.getcwd() == original_cwd
+    assert dict(os.environ) == original_environ
+
+
+def test_consume_hayabusa_not_imported():
+    import sys
+
+    record = _canonical_approved_record()
+    plan = _genuine_consume_plan(record)
+    executor = _consumption_executor_for(record, plan)
+    apply_approval_consumption(executor, record, plan)
+    assert "mcp.hayabusa_server" not in sys.modules
+
+
+def test_consume_no_cli_or_slash_command_invoked():
+    tree = _module_ast()
+    fn = _function_def(tree, "apply_approval_consumption")
+    called = {
+        node.func.id
+        for node in ast.walk(fn)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    }
+    assert not called & {"SlashCommand", "run_slash_command", "invoke_slash_command"}
+
+
+def test_consume_no_second_executor_call_occurs():
+    record = _canonical_approved_record()
+    plan = _genuine_consume_plan(record)
+    executor = _consumption_executor_for(record, plan)
+    apply_approval_consumption(executor, record, plan)
+    assert len(executor.calls) == 1
+
+
+def test_consume_no_client_side_investigation_update_descriptor():
+    tree = _module_ast()
+    fn = _function_def(tree, "apply_approval_consumption")
+    table_values = set()
+    for node in ast.walk(fn):
+        if isinstance(node, ast.Dict):
+            for key_node, value_node in zip(node.keys, node.values):
+                if (
+                    isinstance(key_node, ast.Constant)
+                    and key_node.value == "table"
+                    and isinstance(value_node, ast.Constant)
+                ):
+                    table_values.add(value_node.value)
+    assert table_values == set()
+
+
+def test_consume_no_authentication_containment_or_red_team_behavior():
+    tree = _module_ast()
+    fn = _function_def(tree, "apply_approval_consumption")
+    identifiers = _referenced_identifiers(fn)
+    for forbidden in ("auth", "authenticate", "containment", "execute_simulation", "run_atomic"):
+        assert forbidden not in identifiers
+
+
+# ---------------------------------------------------------------------------
+# apply_approval_consumption -- source boundary
+# ---------------------------------------------------------------------------
+
+
+def test_consume_production_module_imports_only_approved_modules():
+    tree = _module_ast()
+    top_level_imports = set()
+    for node in tree.body:
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                top_level_imports.add(alias.name.split(".")[0])
+        elif isinstance(node, ast.ImportFrom):
+            if node.module:
+                top_level_imports.add(node.module.split(".")[0])
+    allowed = {"__future__", "copy", "uuid", "collections", "datetime", "typing", "core"}
+    assert top_level_imports <= allowed
+
+
+def test_consume_investigation_statuses_imported_from_owner():
+    tree = _module_ast()
+    import_names = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module == "core.decision_context":
+            for alias in node.names:
+                import_names.add(alias.name)
+    assert "INVESTIGATION_STATUSES" in import_names
+
+
+def test_consume_confidence_levels_imported_from_owner():
+    tree = _module_ast()
+    import_names = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module == "core.evidence_normalizer":
+            for alias in node.names:
+                import_names.add(alias.name)
+    assert "CONFIDENCE_LEVELS" in import_names
+
+
+def test_consume_validate_approval_transition_is_reused_not_reimplemented():
+    tree = _module_ast()
+    import_names = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module == "core.approval_transition":
+            for alias in node.names:
+                import_names.add(alias.name)
+    assert "validate_approval_transition" in import_names
+    function_defs = [node.name for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)]
+    assert "validate_approval_transition" not in function_defs
+
+
+def test_consume_validate_approval_record_is_reused_not_reimplemented():
+    tree = _module_ast()
+    import_names = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module == "core.approval_transition":
+            for alias in node.names:
+                import_names.add(alias.name)
+    assert "validate_approval_record" in import_names
+    function_defs = [node.name for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)]
+    assert "validate_approval_record" not in function_defs
+
+
+@pytest.mark.parametrize("forbidden_module", ["supabase", "requests", "socket", "subprocess", "os", "mcp"])
+def test_consume_no_forbidden_module_imported(forbidden_module):
+    tree = _module_ast()
+    imports = _top_level_imports(tree)
+    assert not any(name == forbidden_module or name.startswith(forbidden_module + ".") for name in imports)
+
+
+def test_consume_no_sql_string_in_source():
+    tree = _module_ast()
+    fn = _function_def(tree, "apply_approval_consumption")
+    string_constants = {
+        node.value for node in ast.walk(fn) if isinstance(node, ast.Constant) and isinstance(node.value, str)
+    }
+    for forbidden_sql_keyword in ("SELECT ", "INSERT INTO", "UPDATE ", "DELETE FROM"):
+        assert forbidden_sql_keyword not in string_constants
+
+
+def test_consume_no_database_connection_or_client_creation():
+    tree = _module_ast()
+    identifiers = _referenced_identifiers(tree)
+    for forbidden in ("connect", "create_client", "create_engine", "psycopg2"):
+        assert forbidden not in identifiers
+
+
+def test_consume_only_one_rpc_operation_descriptor_exists():
+    tree = _module_ast()
+    operation_values = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Dict):
+            for key_node, value_node in zip(node.keys, node.values):
+                if (
+                    isinstance(key_node, ast.Constant)
+                    and key_node.value == "operation"
+                    and isinstance(value_node, ast.Constant)
+                    and value_node.value == "rpc"
+                ):
+                    operation_values.append(value_node.value)
+    assert len(operation_values) == 1
+
+
+def test_consume_rpc_function_name_is_exact_string_constant():
+    tree = _module_ast()
+    string_constants = {
+        node.value for node in ast.walk(tree) if isinstance(node, ast.Constant) and isinstance(node.value, str)
+    }
+    assert "consume_approval_and_update_investigation_state" in string_constants
+
+
+def test_consume_no_separate_approvals_update_added_for_consumption():
+    tree = _module_ast()
+    fn = _function_def(tree, "apply_approval_consumption")
+    called = {
+        node.func.id
+        for node in ast.walk(fn)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    }
+    assert "_invoke_executor" in called
+    invoke_calls = [
+        node for node in ast.walk(fn)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "_invoke_executor"
+    ]
+    assert len(invoke_calls) == 1
+
+
+def test_consume_no_two_call_sequence_exists():
+    tree = _module_ast()
+    fn = _function_def(tree, "apply_approval_consumption")
+    invoke_calls = [
+        node for node in ast.walk(fn)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "_invoke_executor"
+    ]
+    assert len(invoke_calls) == 1
+
+
+def test_consume_no_transaction_emulation_exists():
+    tree = _module_ast()
+    identifiers = _referenced_identifiers(tree)
+    for forbidden in ("commit", "rollback", "begin", "transaction"):
+        assert forbidden not in identifiers
+
+
+def test_consume_no_update_case_integration_exists():
+    source = _module_source_text()
+    assert "/update-case" not in source
+
+
+def test_consume_no_action_hashing_exists():
+    tree = _module_ast()
+    identifiers = _referenced_identifiers(tree)
+    assert "hash" not in identifiers
+    assert "action_hash" not in identifiers
+
+
+def test_consume_no_authentication_exists_module_wide():
+    tree = _module_ast()
+    identifiers = _referenced_identifiers(tree)
+    for forbidden in ("auth", "authenticate"):
+        assert forbidden not in identifiers
+
+
+def test_consume_no_containment_exists_module_wide():
+    tree = _module_ast()
+    identifiers = _referenced_identifiers(tree)
+    assert "containment" not in identifiers
+
+
+def test_consume_no_red_team_execution_exists_module_wide():
+    tree = _module_ast()
+    identifiers = _referenced_identifiers(tree)
+    for forbidden in ("execute_simulation", "run_atomic"):
         assert forbidden not in identifiers
 
 
