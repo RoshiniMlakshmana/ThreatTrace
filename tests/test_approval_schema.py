@@ -297,6 +297,20 @@ def _constraint_map():
     return {_constraint_name(item): item for item in constraints}
 
 
+def _create_trigger_statements(schema_text):
+    """Return (trigger_name, table_name, function_name) for every actual
+    CREATE TRIGGER ... ON <table> ... EXECUTE {FUNCTION|PROCEDURE}
+    <function>( statement in the schema -- never a DROP TRIGGER statement,
+    a comment, a GRANT/REVOKE statement, or a bare mention of a function
+    name elsewhere."""
+    pattern = re.compile(
+        r"create\s+trigger\s+(\w+)\s+.*?\bon\s+(\w+)\s+.*?"
+        r"execute\s+(?:function|procedure)\s+([\w.]+)\s*\(",
+        re.IGNORECASE | re.DOTALL,
+    )
+    return [(m.group(1), m.group(2), m.group(3)) for m in pattern.finditer(schema_text)]
+
+
 # ---------------------------------------------------------------------------
 # 1-7: table presence and structure
 # ---------------------------------------------------------------------------
@@ -1013,9 +1027,27 @@ def test_105_no_approvals_lifecycle_trigger_exists():
     assert "trg_approvals" not in schema_text.lower()
 
 
-def test_106_no_approval_specific_trigger_function_exists():
+def test_106_no_trigger_targets_approvals_or_invokes_the_consumption_rpc():
+    # test_106 originally used a blanket regex ("no CREATE OR REPLACE
+    # FUNCTION whose name contains 'approval' may exist"), which was only
+    # ever a proxy for its real intent: approvals must never gain a
+    # trigger-support function wired to a trigger, the way investigations
+    # has set_investigations_updated_at(). That blanket proxy broke once
+    # Block 5 added a legitimate, explicitly invoked RPC,
+    # public.consume_approval_and_update_investigation_state -- a callable
+    # function, never a trigger target and never trigger-invoked. This
+    # corrected version inspects actual CREATE TRIGGER declarations only
+    # (never comments, GRANT/REVOKE statements, or bare function-name
+    # mentions), so an explicit approval RPC is allowed to exist while a
+    # trigger on approvals, or a trigger invoking the consumption RPC,
+    # remains forbidden.
     schema_text = _schema_text()
-    assert not re.search(r"create\s+or\s+replace\s+function\s+\S*approval\S*", schema_text, re.IGNORECASE)
+    triggers = _create_trigger_statements(schema_text)
+    assert triggers, "expected at least the existing investigations updated_at trigger to be found"
+    for _trigger_name, table_name, function_name in triggers:
+        assert table_name.lower() != "approvals"
+        assert function_name.lower() != "consume_approval_and_update_investigation_state"
+        assert not function_name.lower().endswith(".consume_approval_and_update_investigation_state")
 
 
 def test_107_no_generic_updated_at_column_or_behavior_was_copied():

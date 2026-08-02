@@ -455,3 +455,210 @@ alter table handoffs enable row level security;
 alter table detection_results enable row level security;
 alter table retests enable row level security;
 alter table approvals enable row level security;
+
+-- ============================================================================
+-- Function: consume_approval_and_update_investigation_state
+-- ----------------------------------------------------------------------------
+-- Atomically consumes one approved, unconsumed approval whose action_type is
+-- update_investigation_state, and applies its stored action_payload (status
+-- and/or confidence only) to the referenced investigations row -- both
+-- changes commit together or neither does. The approval-consumption
+-- conditional UPDATE is the only row lock and concurrency boundary; a
+-- zero-row result means a conflict (missing, rejected, already consumed,
+-- expired, or mismatched approval) and is returned as zero rows, never a
+-- detailed exception, so the specific cause is never revealed to a caller.
+-- This function never accepts a caller-supplied status, confidence, or
+-- action_payload -- the investigation update is derived exclusively from the
+-- just-consumed approval rows own stored action_payload, read within the
+-- same transaction. It never authenticates anyone; p_consumed_by remains a
+-- claimed, not verified, identity, exactly as core.approval_transition
+-- already treats it.
+-- ============================================================================
+create or replace function public.consume_approval_and_update_investigation_state(
+    p_approval_id uuid,
+    p_expected_investigation_id uuid,
+    p_expected_action_type text,
+    p_consumed_by text,
+    p_consumed_at timestamptz
+)
+returns table (
+    id uuid,
+    investigation_id uuid,
+    action_type text,
+    action_payload jsonb,
+    requested_by text,
+    requested_at timestamptz,
+    status text,
+    approved_by text,
+    approved_at timestamptz,
+    rejected_by text,
+    rejected_at timestamptz,
+    rejection_reason text,
+    expires_at timestamptz,
+    consumed_by text,
+    consumed_at timestamptz,
+    created_at timestamptz,
+    investigation_status text,
+    investigation_confidence text,
+    investigation_updated_at timestamptz
+)
+language plpgsql
+volatile
+security invoker
+as $$
+declare
+    v_approval public.approvals%rowtype;
+    v_investigation public.investigations%rowtype;
+    v_has_status boolean;
+    v_has_confidence boolean;
+    v_stored_status text;
+    v_stored_confidence text;
+begin
+    -- Defense in depth only: the Python consume plan already supplies a
+    -- canonical, already-trimmed p_consumed_by and a resolved p_consumed_at.
+    if p_consumed_by is null
+        or btrim(p_consumed_by) = ''
+        or p_consumed_by <> btrim(p_consumed_by)
+        or p_consumed_at is null
+    then
+        raise exception 'Invalid approval consumption request.';
+    end if;
+
+    -- The only mutation of public.approvals: one conditional UPDATE. Its own
+    -- row lock is the entire concurrency boundary -- no preliminary SELECT
+    -- and no SELECT ... FOR UPDATE precede it. Zero matched rows means a
+    -- conflict of any kind and is handled by the "if not found" branch below,
+    -- never by a separate lifecycle-specific exception.
+    update public.approvals
+    set
+        status = 'consumed',
+        consumed_by = p_consumed_by,
+        consumed_at = p_consumed_at
+    where
+        public.approvals.id = p_approval_id
+        and public.approvals.status = 'approved'
+        and public.approvals.consumed_by is null
+        and public.approvals.consumed_at is null
+        and public.approvals.approved_by is not null
+        and public.approvals.approved_at is not null
+        and public.approvals.rejected_by is null
+        and public.approvals.rejected_at is null
+        and public.approvals.rejection_reason is null
+        and public.approvals.investigation_id = p_expected_investigation_id
+        and public.approvals.action_type = p_expected_action_type
+        and public.approvals.action_type = 'update_investigation_state'
+        and p_consumed_at >= public.approvals.approved_at
+        and (public.approvals.expires_at is null or p_consumed_at < public.approvals.expires_at)
+    returning public.approvals.* into v_approval;
+
+    if not found then
+        return;
+    end if;
+
+    -- Stored action_payload validation happens only after the approval has
+    -- been conditionally consumed, using the just-returned row -- never a
+    -- separate read. Any exception raised from here rolls back the approval
+    -- UPDATE above automatically.
+    if jsonb_typeof(v_approval.action_payload) <> 'object' then
+        raise exception 'Stored approval action was invalid.';
+    end if;
+
+    v_has_status := v_approval.action_payload ? 'status';
+    v_has_confidence := v_approval.action_payload ? 'confidence';
+
+    if not v_has_status and not v_has_confidence then
+        raise exception 'Stored approval action was invalid.';
+    end if;
+
+    if exists (
+        select 1
+        from jsonb_object_keys(v_approval.action_payload) as key
+        where key not in ('status', 'confidence')
+    ) then
+        raise exception 'Stored approval action was invalid.';
+    end if;
+
+    if v_has_status then
+        if jsonb_typeof(v_approval.action_payload -> 'status') <> 'string' then
+            raise exception 'Stored approval action was invalid.';
+        end if;
+        v_stored_status := v_approval.action_payload ->> 'status';
+        if v_stored_status is null
+            or btrim(v_stored_status) = ''
+            or v_stored_status <> btrim(v_stored_status)
+        then
+            raise exception 'Stored approval action was invalid.';
+        end if;
+    end if;
+
+    if v_has_confidence then
+        if jsonb_typeof(v_approval.action_payload -> 'confidence') <> 'string' then
+            raise exception 'Stored approval action was invalid.';
+        end if;
+        v_stored_confidence := v_approval.action_payload ->> 'confidence';
+        if v_stored_confidence is null
+            or btrim(v_stored_confidence) = ''
+            or v_stored_confidence <> btrim(v_stored_confidence)
+        then
+            raise exception 'Stored approval action was invalid.';
+        end if;
+    end if;
+
+    -- Investigation status/confidence vocabulary is deliberately not
+    -- duplicated here -- investigations.status and investigations.confidence
+    -- already carry their own CHECK constraints, which reject an invalid
+    -- derived value and roll back this entire function, exactly like any
+    -- other write path to this table.
+    update public.investigations
+    set
+        status = case when v_has_status then v_stored_status else public.investigations.status end,
+        confidence = case when v_has_confidence then v_stored_confidence else public.investigations.confidence end
+    where public.investigations.id = v_approval.investigation_id
+    returning public.investigations.* into v_investigation;
+
+    if not found then
+        raise exception 'Approval investigation update failed.';
+    end if;
+
+    return query
+    select
+        v_approval.id,
+        v_approval.investigation_id,
+        v_approval.action_type,
+        v_approval.action_payload,
+        v_approval.requested_by,
+        v_approval.requested_at,
+        v_approval.status,
+        v_approval.approved_by,
+        v_approval.approved_at,
+        v_approval.rejected_by,
+        v_approval.rejected_at,
+        v_approval.rejection_reason,
+        v_approval.expires_at,
+        v_approval.consumed_by,
+        v_approval.consumed_at,
+        v_approval.created_at,
+        v_investigation.status,
+        v_investigation.confidence,
+        v_investigation.updated_at;
+end;
+$$;
+
+comment on function public.consume_approval_and_update_investigation_state(uuid, uuid, text, text, timestamptz) is
+    'Atomically consumes one approved, unconsumed update_investigation_state approval and applies its stored action_payload to the referenced investigation -- both changes commit together or neither does.';
+
+revoke execute on function public.consume_approval_and_update_investigation_state(
+    uuid,
+    uuid,
+    text,
+    text,
+    timestamptz
+) from public;
+
+grant execute on function public.consume_approval_and_update_investigation_state(
+    uuid,
+    uuid,
+    text,
+    text,
+    timestamptz
+) to service_role;
