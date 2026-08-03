@@ -619,8 +619,9 @@ def test_069_expires_at_may_be_none():
 
 def test_070_expires_at_canonicalizes_to_utc():
     record = _pending_record(expires_at="2026-08-03T00:00:00Z")
+    now = datetime(2026, 8, 2, 23, 0, 0, tzinfo=timezone.utc)
 
-    result = validate_approval_transition(record, _approve_request())
+    result = validate_approval_transition(record, _approve_request(), now=now)
     assert result["to_status"] == "approved"
 
 
@@ -648,8 +649,9 @@ def test_073_invalid_current_lifecycle_timestamp_rejected():
 def test_074_current_record_strings_and_timestamps_are_not_mutated():
     record = _pending_record(expires_at=EXPIRES_AT)
     snapshot = copy.deepcopy(record)
+    now = datetime(2026, 8, 2, 23, 0, 0, tzinfo=timezone.utc)
 
-    validate_approval_transition(record, _approve_request())
+    validate_approval_transition(record, _approve_request(), now=now)
 
     assert record == snapshot
 
