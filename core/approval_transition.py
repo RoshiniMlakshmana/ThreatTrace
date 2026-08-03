@@ -58,7 +58,7 @@ module applies itself.
 from __future__ import annotations
 
 import uuid
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
 from typing import Any
 
@@ -90,6 +90,54 @@ _CURRENT_RECORD_FIELDS = (
     "created_at",
 )
 _CURRENT_RECORD_FIELDS_SET = frozenset(_CURRENT_RECORD_FIELDS)
+
+# ---------------------------------------------------------------------------
+# Offline multi-review contract (Block 6, Step 2) -- an additional,
+# independent public function, `validate_multi_review_transition`, layered
+# on top of the fields and helpers above without changing any of them.
+# `partially_approved` is a transitional status this new function alone
+# understands; it is deliberately never added to APPROVAL_STATUSES or to
+# `validate_approval_record`'s own sixteen-field contract in this step, so
+# every existing caller of those two names is completely unaffected.
+#
+# The canonical risk_level -> required_approvals mapping is owned by
+# `core.approval_risk`. This module intentionally does not import that
+# module (avoiding a cycle, since `core.approval_request` already imports
+# `core.approval_risk`, and this module already imports
+# `core.approval_request`) -- so this small, closed mapping is
+# independently re-declared here, exactly as instructed, purely to check
+# that a stored current_record's own risk_level/required_approvals pair is
+# internally consistent, never to reclassify anything.
+# ---------------------------------------------------------------------------
+
+_MULTI_REVIEW_RISK_LEVELS = frozenset({"low", "medium", "high", "critical"})
+
+_MULTI_REVIEW_REQUIRED_APPROVALS_BY_RISK = {
+    "low": 1,
+    "medium": 1,
+    "high": 2,
+    "critical": 2,
+}
+
+_MULTI_REVIEW_STATUSES = APPROVAL_STATUSES | frozenset({"partially_approved"})
+
+_MULTI_REVIEW_CURRENT_RECORD_EXTRA_FIELDS = ("risk_level", "required_approvals")
+_MULTI_REVIEW_CURRENT_RECORD_FIELDS = _CURRENT_RECORD_FIELDS + _MULTI_REVIEW_CURRENT_RECORD_EXTRA_FIELDS
+_MULTI_REVIEW_CURRENT_RECORD_FIELDS_SET = frozenset(_MULTI_REVIEW_CURRENT_RECORD_FIELDS)
+
+_REVIEW_SUMMARY_FIELDS = (
+    "approval_id",
+    "reviewer_identity",
+    "reviewer_identity_normalized",
+    "decision",
+    "decided_at",
+)
+_REVIEW_SUMMARY_FIELDS_SET = frozenset(_REVIEW_SUMMARY_FIELDS)
+
+_REVIEW_DECISIONS = frozenset({"approve", "reject"})
+
+_MULTI_REVIEW_APPROVE_REQUIRED_FIELDS = frozenset({"decision", "reviewed_by"})
+_MULTI_REVIEW_REJECT_REQUIRED_FIELDS = frozenset({"decision", "reviewed_by", "rejection_reason"})
 
 _TRANSITIONS = frozenset({"approve", "reject", "consume"})
 
@@ -692,3 +740,428 @@ def validate_approval_transition(
     if transition == "reject":
         return _validate_reject(record, transition_request, now)
     return _validate_consume(record, transition_request, now)
+
+
+# ---------------------------------------------------------------------------
+# Offline multi-review contract (Block 6, Step 2)
+# ---------------------------------------------------------------------------
+
+
+def _validate_multi_review_current_record(current_record: Any) -> dict[str, Any]:
+    if not isinstance(current_record, Mapping):
+        raise ApprovalTransitionError("current_record must be a mapping")
+
+    unknown_fields = set(current_record) - _MULTI_REVIEW_CURRENT_RECORD_FIELDS_SET
+    if unknown_fields:
+        raise ApprovalTransitionError(
+            "unrecognized current_record field(s): " + ", ".join(sorted(unknown_fields))
+        )
+
+    missing_fields = [field for field in _MULTI_REVIEW_CURRENT_RECORD_FIELDS if field not in current_record]
+    if missing_fields:
+        raise ApprovalTransitionError(
+            "missing required current_record field(s): " + ", ".join(missing_fields)
+        )
+
+    risk_level = current_record["risk_level"]
+    if not isinstance(risk_level, str) or risk_level not in _MULTI_REVIEW_RISK_LEVELS:
+        raise ApprovalTransitionError(
+            f"current_record.risk_level must be one of {sorted(_MULTI_REVIEW_RISK_LEVELS)}"
+        )
+
+    required_approvals = current_record["required_approvals"]
+    if (
+        not isinstance(required_approvals, int)
+        or isinstance(required_approvals, bool)
+        or required_approvals not in (1, 2)
+    ):
+        raise ApprovalTransitionError("current_record.required_approvals must be 1 or 2")
+
+    if _MULTI_REVIEW_REQUIRED_APPROVALS_BY_RISK[risk_level] != required_approvals:
+        raise ApprovalTransitionError(
+            "current_record.risk_level and current_record.required_approvals are inconsistent"
+        )
+
+    raw_status = current_record["status"]
+    if not isinstance(raw_status, str):
+        raise ApprovalTransitionError("current_record.status must be a string")
+    normalized_status = raw_status.strip().lower()
+    if not normalized_status or normalized_status not in _MULTI_REVIEW_STATUSES:
+        raise ApprovalTransitionError(
+            f"current_record.status must be one of {sorted(_MULTI_REVIEW_STATUSES)}, got {normalized_status!r}"
+        )
+
+    if normalized_status == "partially_approved" and required_approvals != 2:
+        raise ApprovalTransitionError(
+            "current_record.status 'partially_approved' requires required_approvals == 2"
+        )
+
+    # partially_approved shares the exact same null-lifecycle-field shape as
+    # pending (see the module docstring for _validate_current_record's own
+    # pending-status branch) -- substituting "pending" here reuses every
+    # existing sixteen-field structural, chronology, and timestamp rule
+    # unchanged, rather than duplicating any of it.
+    base_record = {field: current_record[field] for field in _CURRENT_RECORD_FIELDS}
+    if normalized_status == "partially_approved":
+        base_record["status"] = "pending"
+
+    validated_base = _validate_current_record(base_record)
+
+    if normalized_status == "partially_approved":
+        validated_base["status"] = "partially_approved"
+
+    validated_base["risk_level"] = risk_level
+    validated_base["required_approvals"] = required_approvals
+    return validated_base
+
+
+def _validate_existing_reviews(
+    existing_reviews: Any,
+    validated_current_record: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    if isinstance(existing_reviews, (str, bytes)) or not isinstance(existing_reviews, Sequence):
+        raise ApprovalTransitionError("existing_reviews must be a sequence")
+
+    validated_reviews: list[dict[str, Any]] = []
+    seen_normalized_identities: set[str] = set()
+    has_rejection = False
+
+    for review in existing_reviews:
+        if not isinstance(review, Mapping):
+            raise ApprovalTransitionError("each existing review must be a mapping")
+
+        if set(review) != _REVIEW_SUMMARY_FIELDS_SET:
+            raise ApprovalTransitionError(
+                "each existing review must contain exactly: " + ", ".join(_REVIEW_SUMMARY_FIELDS)
+            )
+
+        review_approval_id = _validate_uuid_string(review["approval_id"], "existing_review.approval_id")
+        if review_approval_id != validated_current_record["id"]:
+            raise ApprovalTransitionError("existing_review.approval_id must match current_record.id")
+
+        reviewer_identity_value = review["reviewer_identity"]
+        if not isinstance(reviewer_identity_value, str):
+            raise ApprovalTransitionError("existing_review.reviewer_identity must be a string")
+        stripped_identity = reviewer_identity_value.strip()
+        if not stripped_identity:
+            raise ApprovalTransitionError("existing_review.reviewer_identity must not be blank")
+        if reviewer_identity_value != stripped_identity:
+            raise ApprovalTransitionError(
+                "existing_review.reviewer_identity must already be stored in trimmed form"
+            )
+
+        normalized_value = review["reviewer_identity_normalized"]
+        expected_normalized = reviewer_identity_value.strip().casefold()
+        if normalized_value != expected_normalized:
+            raise ApprovalTransitionError(
+                "existing_review.reviewer_identity_normalized must equal reviewer_identity.strip().casefold()"
+            )
+
+        if normalized_value in seen_normalized_identities:
+            raise ApprovalTransitionError("duplicate reviewer identity in existing_reviews")
+        seen_normalized_identities.add(normalized_value)
+
+        decision_value = review["decision"]
+        if decision_value not in _REVIEW_DECISIONS:
+            raise ApprovalTransitionError(
+                f"existing_review.decision must be one of {sorted(_REVIEW_DECISIONS)}"
+            )
+
+        decided_at = _normalize_timestamp(review["decided_at"], "existing_review.decided_at")
+
+        if decision_value == "reject":
+            has_rejection = True
+
+        validated_reviews.append({
+            "approval_id": review_approval_id,
+            "reviewer_identity": stripped_identity,
+            "reviewer_identity_normalized": normalized_value,
+            "decision": decision_value,
+            "decided_at": decided_at,
+        })
+
+    if has_rejection and validated_current_record["status"] in ("pending", "partially_approved"):
+        raise ApprovalTransitionError(
+            "an existing rejection is incompatible with an active pending or partially_approved record"
+        )
+
+    return validated_reviews
+
+
+def _validate_multi_review_transition_request(transition_request: Any) -> tuple[str, str, str, str | None]:
+    if not isinstance(transition_request, Mapping):
+        raise ApprovalTransitionError("transition_request must be a mapping")
+
+    if "decision" not in transition_request:
+        raise ApprovalTransitionError("transition_request is missing required field: decision")
+
+    decision_value = transition_request["decision"]
+    if not isinstance(decision_value, str):
+        raise ApprovalTransitionError("decision must be a string")
+    decision = decision_value.strip().lower()
+    if decision not in _REVIEW_DECISIONS:
+        raise ApprovalTransitionError(
+            f"decision must be one of {sorted(_REVIEW_DECISIONS)}, got {decision!r}"
+        )
+
+    if decision == "approve":
+        required_fields = _MULTI_REVIEW_APPROVE_REQUIRED_FIELDS
+    else:
+        required_fields = _MULTI_REVIEW_REJECT_REQUIRED_FIELDS
+
+    unknown_fields = set(transition_request) - required_fields
+    if unknown_fields:
+        raise ApprovalTransitionError(
+            "unrecognized field(s): " + ", ".join(sorted(unknown_fields))
+        )
+    missing_fields = [field for field in required_fields if field not in transition_request]
+    if missing_fields:
+        raise ApprovalTransitionError(
+            "missing required field(s): " + ", ".join(sorted(missing_fields))
+        )
+
+    reviewed_by_value = transition_request["reviewed_by"]
+    if not isinstance(reviewed_by_value, str):
+        raise ApprovalTransitionError("reviewed_by must be a string")
+    reviewed_by = reviewed_by_value.strip()
+    if not reviewed_by:
+        raise ApprovalTransitionError("reviewed_by must not be blank")
+    reviewed_by_normalized = reviewed_by.casefold()
+
+    rejection_reason: str | None = None
+    if decision == "reject":
+        rejection_reason_value = transition_request["rejection_reason"]
+        if not isinstance(rejection_reason_value, str):
+            raise ApprovalTransitionError("rejection_reason must be a string")
+        rejection_reason = rejection_reason_value.strip()
+        if not rejection_reason:
+            raise ApprovalTransitionError("rejection_reason must not be blank")
+
+    return decision, reviewed_by, reviewed_by_normalized, rejection_reason
+
+
+def validate_multi_review_transition(
+    current_record: Mapping[str, Any],
+    existing_reviews: Sequence[Mapping[str, Any]],
+    transition_request: Mapping[str, Any],
+    *,
+    reviewed_at: str | datetime | None = None,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Validate one proposed review decision (approve or reject) against one
+    risk-aware approval snapshot and its already-recorded review history,
+    producing a single immutable, persistence-ready transition plan.
+
+    This is an additional, independent public function -- it does not
+    replace, alter, or share any mutable state with `validate_approval_transition`.
+    Existing single-review Block 5 behavior (`pending -> approved`,
+    `pending -> rejected`, `approved -> consumed`) is untouched by this
+    function's existence.
+
+    `current_record` must contain the same sixteen fields
+    `validate_approval_record` already requires, plus exactly `risk_level`
+    (one of `low`/`medium`/`high`/`critical`) and `required_approvals` (`1`
+    or `2`), consistent with the canonical `core.approval_risk` mapping.
+    `current_record.status` may additionally be `"partially_approved"` --
+    a transitional status this function alone understands; it is never
+    added to `APPROVAL_STATUSES` or to `validate_approval_record`'s own
+    sixteen-field contract by this function.
+
+    `existing_reviews` must be a sequence of already-verified review
+    summaries, each containing exactly `approval_id`, `reviewer_identity`,
+    `reviewer_identity_normalized`, `decision` (`"approve"` or `"reject"`),
+    and `decided_at`. Every summary must belong to `current_record["id"]`,
+    `reviewer_identity` must already be stored trimmed and nonblank,
+    `reviewer_identity_normalized` must exactly equal
+    `reviewer_identity.strip().casefold()` (never PostgreSQL `lower()`,
+    exactly like this project's existing `reviewed_by != requested_by`
+    comparison), duplicate normalized identities are rejected, and an
+    existing rejection recorded against an otherwise still-`pending`/
+    `partially_approved` current record is rejected as an internal
+    inconsistency.
+
+    `transition_request` must contain `decision` (`"approve"` or
+    `"reject"`) and `reviewed_by`; a reject decision additionally requires
+    a nonblank `rejection_reason`, and an approve decision forbids it. No
+    other field is accepted. `reviewed_by` is a caller-supplied claimed
+    identity, normalized by `.strip()` (display form) and
+    `.strip().casefold()` (comparison form), exactly like every other
+    claimed identity in this module.
+
+    `reviewed_at`/`now` resolve the decision's timestamp exactly like
+    `validate_approval_transition`'s own timestamp parameters: an explicit
+    `reviewed_at` is validated and used as-is; otherwise `now` (when
+    supplied, must be an aware datetime) is used as the generation basis;
+    otherwise the real current UTC time is used.
+
+    Approve behavior:
+
+    - `required_approvals == 1`: `current_record.status` must be
+      `"pending"` with zero existing approve reviews; the decision moves
+      `pending -> approved` directly, with `set_fields` containing
+      exactly `status`, `approved_by`, `approved_at`.
+    - `required_approvals == 2`, zero existing approve reviews:
+      `current_record.status` must be `"pending"`; the decision moves
+      `pending -> partially_approved`, with `set_fields` containing
+      exactly `status`.
+    - `required_approvals == 2`, exactly one existing approve review:
+      `current_record.status` must be `"partially_approved"`; the
+      decision moves `partially_approved -> approved`, with `set_fields`
+      containing exactly `status`, `approved_by`, `approved_at` -- the
+      completing (second) reviewer becomes `approved_by`.
+    - Every approve attempt independently requires `reviewed_by` to differ,
+      by trimmed casefold comparison, from both `current_record.requested_by`
+      and every existing approve review's own `reviewer_identity_normalized`
+      -- the same reviewer can never count twice, and the requester can
+      never approve their own request, regardless of `required_approvals`.
+    - An approve decision strictly before `current_record.expires_at` (when
+      set) may succeed; at or after it, it is rejected -- identical to
+      `validate_approval_transition`'s own approve-expiry rule.
+
+    Reject behavior: allowed from `"pending"` or `"partially_approved"`
+    only, from any claimed identity including the original requester
+    (self-withdrawal remains allowed, exactly like Block 5), moves directly
+    to `"rejected"` with `set_fields` containing exactly `status`,
+    `rejected_by`, `rejected_at`, `rejection_reason`, and is never subject
+    to the expiry check (a rejection after expiry remains allowed, exactly
+    like Block 5).
+
+    Neither an approve nor a reject decision is accepted when
+    `current_record.status` is already `"approved"`, `"rejected"`, or
+    `"consumed"`.
+
+    Returns exactly:
+
+        {
+            "approval_id": "...",
+            "from_status": "...",
+            "to_status": "...",
+            "required_approvals": 1 | 2,
+            "approval_count_before": 0 | 1,
+            "approval_count_after": 0 | 1 | 2,
+            "review_record": {
+                "approval_id": "...",
+                "reviewer_identity": "...",
+                "reviewer_identity_normalized": "...",
+                "decision": "approve" | "reject",
+                "decided_at": "...",
+            },
+            "set_fields": {...},
+        }
+
+    Dictionary key order is never security-significant anywhere in this
+    result, exactly like every other transition plan this module produces.
+    This plan contains no SQL, table name, RPC name, MCP argument, or
+    persistence operation name of any kind -- it remains a
+    **validated transition plan -- not persisted**, exactly like
+    `validate_approval_transition`'s own output.
+
+    Raises `ApprovalTransitionError` for any structurally invalid
+    `current_record`, `existing_reviews`, or `transition_request`, an
+    inconsistent stored `risk_level`/`required_approvals` pair, an
+    unsupported state transition, a same-principal or duplicate approval
+    attempt, a chronological inconsistency, or an expired approval attempt.
+    Never mutates `current_record`, `existing_reviews`, or
+    `transition_request` (nor any nested mapping within any of them), and
+    never retains a reference to any caller-supplied mutable object.
+    """
+    validated_record = _validate_multi_review_current_record(current_record)
+    validated_reviews = _validate_existing_reviews(existing_reviews, validated_record)
+    decision, reviewer_identity, reviewer_identity_normalized, rejection_reason = (
+        _validate_multi_review_transition_request(transition_request)
+    )
+
+    status = validated_record["status"]
+    required_approvals = validated_record["required_approvals"]
+    requested_by_normalized = validated_record["requested_by"].strip().casefold()
+
+    approve_reviews = [review for review in validated_reviews if review["decision"] == "approve"]
+    approval_count_before = len(approve_reviews)
+
+    if status not in ("pending", "partially_approved"):
+        raise ApprovalTransitionError(
+            f"cannot review: current status must be 'pending' or 'partially_approved', got {status!r}"
+        )
+
+    decided_at = _resolve_transition_timestamp(reviewed_at, now, "decided_at")
+
+    if _parse_canonical(decided_at) < _parse_canonical(validated_record["requested_at"]):
+        raise ApprovalTransitionError("decided_at must be at or after requested_at")
+
+    if decision == "reject":
+        review_record = {
+            "approval_id": validated_record["id"],
+            "reviewer_identity": reviewer_identity,
+            "reviewer_identity_normalized": reviewer_identity_normalized,
+            "decision": "reject",
+            "decided_at": decided_at,
+        }
+
+        return {
+            "approval_id": validated_record["id"],
+            "from_status": status,
+            "to_status": "rejected",
+            "required_approvals": required_approvals,
+            "approval_count_before": approval_count_before,
+            "approval_count_after": approval_count_before,
+            "review_record": review_record,
+            "set_fields": {
+                "status": "rejected",
+                "rejected_by": reviewer_identity,
+                "rejected_at": decided_at,
+                "rejection_reason": rejection_reason,
+            },
+        }
+
+    # decision == "approve"
+    if reviewer_identity_normalized == requested_by_normalized:
+        raise ApprovalTransitionError("reviewed_by must differ from the original requester")
+
+    for review in approve_reviews:
+        if review["reviewer_identity_normalized"] == reviewer_identity_normalized:
+            raise ApprovalTransitionError("reviewed_by has already reviewed this approval")
+
+    if (
+        validated_record["expires_at"] is not None
+        and _parse_canonical(decided_at) >= _parse_canonical(validated_record["expires_at"])
+    ):
+        raise ApprovalTransitionError("decided_at must be strictly before expires_at")
+
+    if required_approvals == 1:
+        if status != "pending" or approval_count_before != 0:
+            raise ApprovalTransitionError("cannot approve: an approve review already exists")
+        to_status = "approved"
+        set_fields = {"status": "approved", "approved_by": reviewer_identity, "approved_at": decided_at}
+    elif approval_count_before == 0:
+        if status != "pending":
+            raise ApprovalTransitionError("cannot record first approval: current status must be 'pending'")
+        to_status = "partially_approved"
+        set_fields = {"status": "partially_approved"}
+    elif approval_count_before == 1:
+        if status != "partially_approved":
+            raise ApprovalTransitionError(
+                "cannot record second approval: current status must be 'partially_approved'"
+            )
+        to_status = "approved"
+        set_fields = {"status": "approved", "approved_by": reviewer_identity, "approved_at": decided_at}
+    else:
+        raise ApprovalTransitionError("cannot approve: required approvals are already satisfied")
+
+    review_record = {
+        "approval_id": validated_record["id"],
+        "reviewer_identity": reviewer_identity,
+        "reviewer_identity_normalized": reviewer_identity_normalized,
+        "decision": "approve",
+        "decided_at": decided_at,
+    }
+
+    return {
+        "approval_id": validated_record["id"],
+        "from_status": status,
+        "to_status": to_status,
+        "required_approvals": required_approvals,
+        "approval_count_before": approval_count_before,
+        "approval_count_after": approval_count_before + 1,
+        "review_record": review_record,
+        "set_fields": set_fields,
+    }

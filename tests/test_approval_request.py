@@ -19,6 +19,7 @@ from core.approval_request import (
     ACTION_TYPES,
     ApprovalRequestError,
     validate_approval_request,
+    validate_risk_aware_approval_request,
 )
 from core.decision_context import INVESTIGATION_STATUSES
 from core.evidence_normalizer import CONFIDENCE_LEVELS
@@ -1074,8 +1075,77 @@ def test_150_module_uses_only_stdlib_and_two_approved_constant_sources():
             if node.module:
                 imported.add(node.module)
 
-    allowed = {"__future__", "uuid", "collections.abc", "datetime", "typing", "core.decision_context", "core.evidence_normalizer"}
+    allowed = {
+        "__future__",
+        "uuid",
+        "collections.abc",
+        "datetime",
+        "typing",
+        "core.decision_context",
+        "core.evidence_normalizer",
+        "core.approval_risk",
+    }
     assert imported <= allowed
+
+
+# ---------------------------------------------------------------------------
+# 151-155: risk-aware request validation
+# ---------------------------------------------------------------------------
+
+def test_151_confidence_only_request_returns_low_and_one_required_approval():
+    result = validate_risk_aware_approval_request(
+        _payload(action_payload={"confidence": "high"}),
+        {"status": "investigating", "confidence": "low"},
+    )
+
+    assert result["risk_level"] == "low"
+    assert result["required_approvals"] == 1
+
+
+def test_152_ordinary_status_request_returns_medium_and_one_required_approval():
+    result = validate_risk_aware_approval_request(
+        _payload(action_payload={"status": "investigating"}),
+        {"status": "open", "confidence": "medium"},
+    )
+
+    assert result["risk_level"] == "medium"
+    assert result["required_approvals"] == 1
+
+
+def test_153_closing_request_returns_high_and_two_required_approvals():
+    result = validate_risk_aware_approval_request(
+        _payload(action_payload={"status": "closed"}),
+        {"status": "investigating", "confidence": "medium"},
+    )
+
+    assert result["risk_level"] == "high"
+    assert result["required_approvals"] == 2
+
+
+def test_154_caller_supplied_risk_level_or_required_approvals_remains_rejected():
+    with pytest.raises(ApprovalRequestError):
+        validate_risk_aware_approval_request(
+            _payload(risk_level="low"),
+            {"status": "investigating", "confidence": "medium"},
+        )
+
+    with pytest.raises(ApprovalRequestError):
+        validate_risk_aware_approval_request(
+            _payload(required_approvals=1),
+            {"status": "investigating", "confidence": "medium"},
+        )
+
+
+def test_155_request_and_current_investigation_are_not_mutated():
+    payload = _payload(action_payload={"status": "closed"})
+    payload_snapshot = copy.deepcopy(payload)
+    current_investigation = {"status": "investigating", "confidence": "medium"}
+    investigation_snapshot = copy.deepcopy(current_investigation)
+
+    validate_risk_aware_approval_request(payload, current_investigation)
+
+    assert payload == payload_snapshot
+    assert current_investigation == investigation_snapshot
 
 
 # ---------------------------------------------------------------------------

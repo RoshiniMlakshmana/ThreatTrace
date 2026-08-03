@@ -39,6 +39,7 @@ from collections.abc import Mapping
 from datetime import datetime, timezone
 from typing import Any
 
+from core.approval_risk import ApprovalRiskError, classify_approval_risk, required_approvals_for_risk
 from core.decision_context import INVESTIGATION_STATUSES
 from core.evidence_normalizer import CONFIDENCE_LEVELS
 
@@ -56,6 +57,8 @@ _OPTIONAL_TOP_LEVEL_FIELDS = ("requested_at",)
 _ALLOWED_TOP_LEVEL_FIELDS = frozenset(_REQUIRED_TOP_LEVEL_FIELDS + _OPTIONAL_TOP_LEVEL_FIELDS)
 
 _ALLOWED_ACTION_PAYLOAD_FIELDS = frozenset({"status", "confidence"})
+
+_RISK_AWARE_CURRENT_INVESTIGATION_FIELDS = frozenset({"status", "confidence"})
 
 
 class ApprovalRequestError(ValueError):
@@ -230,3 +233,75 @@ def validate_approval_request(
         "requested_by": requested_by,
         "requested_at": requested_at,
     }
+
+
+def validate_risk_aware_approval_request(
+    request: Mapping[str, Any],
+    current_investigation: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Validate one proposed approval request exactly like
+    `validate_approval_request`, then additionally derive its deterministic
+    `risk_level` and `required_approvals`.
+
+    `request` is validated by calling `validate_approval_request` first,
+    entirely unchanged -- every existing rule (allowed top-level fields,
+    UUID/timestamp canonicalization, action-payload shape, vocabulary
+    membership) applies exactly as it already does, and that call alone is
+    why a caller can never submit `risk_level`, `required_approvals`, a
+    required-approval count, or a second-decision identity: none of those
+    has ever been an allowed top-level field, so `validate_approval_request`
+    itself already rejects any of them as an unrecognized field. This
+    function never adds a second, separate allow-list of its own.
+
+    `current_investigation` must be a mapping containing exactly `status`
+    and `confidence` -- the investigation's own current values, supplied
+    by the caller. This function never queries Supabase or reads an
+    investigation itself.
+
+    Risk classification is delegated entirely to
+    `core.approval_risk.classify_approval_risk`, called only with the
+    already-validated request's own `action_type`/`action_payload` and
+    `current_investigation`'s own `status`/`confidence` -- never with a
+    caller-supplied risk level, since no such field exists anywhere in
+    either input's contract. `required_approvals` is derived from the
+    classified risk level via
+    `core.approval_risk.required_approvals_for_risk`.
+
+    Returns a new, independently-owned dictionary containing every field
+    `validate_approval_request` itself returns, plus exactly `risk_level`
+    and `required_approvals`. Neither `request` nor `current_investigation`
+    (nor any nested mapping within either) is ever mutated.
+
+    Raises `ApprovalRequestError` for any failure `validate_approval_request`
+    itself would raise, for a non-mapping `current_investigation`, for a
+    `current_investigation` that does not contain exactly `status` and
+    `confidence`, or for any risk-classification failure
+    (`core.approval_risk.ApprovalRiskError` is caught and re-raised as this
+    module's own exception type, never propagated directly).
+    """
+    validated_request = validate_approval_request(request)
+
+    if not isinstance(current_investigation, Mapping):
+        raise ApprovalRequestError("current_investigation must be a mapping")
+
+    if set(current_investigation) != _RISK_AWARE_CURRENT_INVESTIGATION_FIELDS:
+        raise ApprovalRequestError(
+            "current_investigation must contain exactly: "
+            + ", ".join(sorted(_RISK_AWARE_CURRENT_INVESTIGATION_FIELDS))
+        )
+
+    try:
+        risk_level = classify_approval_risk(
+            action_type=validated_request["action_type"],
+            action_payload=validated_request["action_payload"],
+            current_status=current_investigation["status"],
+            current_confidence=current_investigation["confidence"],
+        )
+        required_approvals = required_approvals_for_risk(risk_level)
+    except ApprovalRiskError as exc:
+        raise ApprovalRequestError("risk classification failed") from exc
+
+    result = dict(validated_request)
+    result["risk_level"] = risk_level
+    result["required_approvals"] = required_approvals
+    return result

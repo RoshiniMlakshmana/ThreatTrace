@@ -19,6 +19,7 @@ from core.approval_transition import (
     APPROVAL_STATUSES,
     ApprovalTransitionError,
     validate_approval_transition,
+    validate_multi_review_transition,
 )
 from core.approval_request import ACTION_TYPES, ApprovalRequestError
 
@@ -2508,6 +2509,192 @@ def test_294_no_requested_by_validation_logic_duplicated():
     # in this module.
     assert 'current_record["requested_by"]' in source
     assert source.count('_validate_optional_identity(current_record["requested_by"]') == 0
+
+
+# ---------------------------------------------------------------------------
+# 295-305: offline multi-review contract (Block 6, Step 2)
+# ---------------------------------------------------------------------------
+
+def _multi_review_record(**overrides):
+    return _pending_record(risk_level="high", required_approvals=2, **overrides)
+
+
+def _approve_decision(reviewed_by):
+    return {"decision": "approve", "reviewed_by": reviewed_by}
+
+
+def _reject_decision(reviewed_by, rejection_reason=REJECTION_REASON):
+    return {"decision": "reject", "reviewed_by": reviewed_by, "rejection_reason": rejection_reason}
+
+
+def test_295_one_review_approval_pending_to_approved():
+    record = _pending_record(risk_level="medium", required_approvals=1)
+    now = datetime(2026, 8, 1, 12, 0, 0, tzinfo=timezone.utc)
+
+    plan = validate_multi_review_transition(record, [], _approve_decision("reviewer-one"), now=now)
+
+    assert plan["from_status"] == "pending"
+    assert plan["to_status"] == "approved"
+    assert plan["required_approvals"] == 1
+    assert plan["approval_count_before"] == 0
+    assert plan["approval_count_after"] == 1
+    assert plan["set_fields"] == {
+        "status": "approved",
+        "approved_by": "reviewer-one",
+        "approved_at": "2026-08-01T12:00:00Z",
+    }
+
+
+def test_296_first_of_two_approvals_pending_to_partially_approved():
+    record = _multi_review_record()
+    now = datetime(2026, 8, 1, 12, 0, 0, tzinfo=timezone.utc)
+
+    plan = validate_multi_review_transition(record, [], _approve_decision("reviewer-one"), now=now)
+
+    assert plan["from_status"] == "pending"
+    assert plan["to_status"] == "partially_approved"
+    assert plan["approval_count_before"] == 0
+    assert plan["approval_count_after"] == 1
+    assert plan["set_fields"] == {"status": "partially_approved"}
+
+
+def test_297_second_distinct_approval_partially_approved_to_approved():
+    record = _multi_review_record(status="partially_approved")
+    now = datetime(2026, 8, 1, 12, 0, 0, tzinfo=timezone.utc)
+    existing_reviews = [{
+        "approval_id": APPROVAL_ID,
+        "reviewer_identity": "reviewer-one",
+        "reviewer_identity_normalized": "reviewer-one",
+        "decision": "approve",
+        "decided_at": "2026-08-01T11:00:00Z",
+    }]
+
+    plan = validate_multi_review_transition(record, existing_reviews, _approve_decision("reviewer-two"), now=now)
+
+    assert plan["from_status"] == "partially_approved"
+    assert plan["to_status"] == "approved"
+    assert plan["approval_count_before"] == 1
+    assert plan["approval_count_after"] == 2
+    assert plan["set_fields"] == {
+        "status": "approved",
+        "approved_by": "reviewer-two",
+        "approved_at": "2026-08-01T12:00:00Z",
+    }
+
+
+def test_298_requester_self_approval_rejected():
+    record = _multi_review_record()
+    now = datetime(2026, 8, 1, 12, 0, 0, tzinfo=timezone.utc)
+
+    with pytest.raises(ApprovalTransitionError):
+        validate_multi_review_transition(record, [], _approve_decision("analyst-jane"), now=now)
+
+
+def test_299_duplicate_reviewer_rejected_after_trim_and_casefold_normalization():
+    record = _multi_review_record(status="partially_approved")
+    now = datetime(2026, 8, 1, 12, 0, 0, tzinfo=timezone.utc)
+    existing_reviews = [{
+        "approval_id": APPROVAL_ID,
+        "reviewer_identity": "Reviewer-One",
+        "reviewer_identity_normalized": "reviewer-one",
+        "decision": "approve",
+        "decided_at": "2026-08-01T11:00:00Z",
+    }]
+
+    with pytest.raises(ApprovalTransitionError):
+        validate_multi_review_transition(
+            record, existing_reviews, _approve_decision("  REVIEWER-ONE  "), now=now
+        )
+
+
+def test_300_rejection_from_pending_succeeds():
+    record = _multi_review_record()
+    now = datetime(2026, 8, 1, 12, 0, 0, tzinfo=timezone.utc)
+
+    plan = validate_multi_review_transition(record, [], _reject_decision("rejecter"), now=now)
+
+    assert plan["from_status"] == "pending"
+    assert plan["to_status"] == "rejected"
+    assert plan["set_fields"] == {
+        "status": "rejected",
+        "rejected_by": "rejecter",
+        "rejected_at": "2026-08-01T12:00:00Z",
+        "rejection_reason": REJECTION_REASON,
+    }
+
+
+def test_301_rejection_from_partially_approved_succeeds():
+    record = _multi_review_record(status="partially_approved")
+    now = datetime(2026, 8, 1, 12, 0, 0, tzinfo=timezone.utc)
+    existing_reviews = [{
+        "approval_id": APPROVAL_ID,
+        "reviewer_identity": "reviewer-one",
+        "reviewer_identity_normalized": "reviewer-one",
+        "decision": "approve",
+        "decided_at": "2026-08-01T11:00:00Z",
+    }]
+
+    plan = validate_multi_review_transition(record, existing_reviews, _reject_decision("rejecter"), now=now)
+
+    assert plan["from_status"] == "partially_approved"
+    assert plan["to_status"] == "rejected"
+    assert plan["approval_count_before"] == 1
+    assert plan["approval_count_after"] == 1
+
+
+def test_302_approval_at_expiry_fails():
+    record = _multi_review_record(expires_at="2026-08-01T12:00:00Z")
+    now = datetime(2026, 8, 1, 12, 0, 0, tzinfo=timezone.utc)
+
+    with pytest.raises(ApprovalTransitionError):
+        validate_multi_review_transition(record, [], _approve_decision("reviewer-one"), now=now)
+
+
+def test_303_rejection_after_expiry_succeeds():
+    record = _multi_review_record(expires_at="2026-08-01T11:00:00Z")
+    now = datetime(2026, 8, 1, 12, 0, 0, tzinfo=timezone.utc)
+
+    plan = validate_multi_review_transition(record, [], _reject_decision("rejecter"), now=now)
+
+    assert plan["to_status"] == "rejected"
+
+
+def test_304_terminal_records_reject_further_reviews():
+    now = datetime(2026, 8, 1, 12, 0, 0, tzinfo=timezone.utc)
+
+    approved = _approved_record(risk_level="high", required_approvals=2)
+    with pytest.raises(ApprovalTransitionError):
+        validate_multi_review_transition(approved, [], _approve_decision("reviewer-two"), now=now)
+
+    rejected = _rejected_record(risk_level="high", required_approvals=2)
+    with pytest.raises(ApprovalTransitionError):
+        validate_multi_review_transition(rejected, [], _approve_decision("reviewer-two"), now=now)
+
+    consumed = _consumed_record(risk_level="high", required_approvals=2)
+    with pytest.raises(ApprovalTransitionError):
+        validate_multi_review_transition(consumed, [], _approve_decision("reviewer-two"), now=now)
+
+
+def test_305_current_record_existing_reviews_and_transition_request_are_not_mutated():
+    record = _multi_review_record(status="partially_approved")
+    record_snapshot = copy.deepcopy(record)
+    existing_reviews = [{
+        "approval_id": APPROVAL_ID,
+        "reviewer_identity": "reviewer-one",
+        "reviewer_identity_normalized": "reviewer-one",
+        "decision": "approve",
+        "decided_at": "2026-08-01T11:00:00Z",
+    }]
+    reviews_snapshot = copy.deepcopy(existing_reviews)
+    transition_request = _approve_decision("reviewer-two")
+    request_snapshot = copy.deepcopy(transition_request)
+    now = datetime(2026, 8, 1, 12, 0, 0, tzinfo=timezone.utc)
+
+    validate_multi_review_transition(record, existing_reviews, transition_request, now=now)
+
+    assert record == record_snapshot
+    assert existing_reviews == reviews_snapshot
+    assert transition_request == request_snapshot
 
 
 # ---------------------------------------------------------------------------
