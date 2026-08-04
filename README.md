@@ -10,7 +10,11 @@ For the current architecture, approval boundary, filesystem boundaries, security
 
 **Block 6 — Risk-Aware Multi-Review Approval Workflow is complete.** See [docs/block6-risk-aware-approvals.md](docs/block6-risk-aware-approvals.md) for the full design, the security-control table, and live Supabase verification evidence.
 
-Investigation-changing actions are now gated by deterministic risk classification, one- or two-person approval depending on that risk, an immutable review history, atomic execution, and replay protection. 3,800+ automated tests pass, and the workflow has been verified live against a real Supabase project. **Block 7 — Shadow Execution / Digital Twin** is the next development block.
+Investigation-changing actions are now gated by deterministic risk classification, one- or two-person approval depending on that risk, an immutable review history, atomic execution, and replay protection.
+
+**Block 7 — Shadow Execution / Digital Twin MVP is complete.** See [docs/block7-shadow-execution.md](docs/block7-shadow-execution.md) for the full design, the security-control table, and honest live-verification status. `/simulate-case-update` calculates a deterministic before/after preview of an approved case-update action — current state, proposed state, changed and unchanged fields, fixed deterministic warnings, and a rollback-feasibility classification — through a mutation-free command that never touches the database beyond two existing read-only lookups.
+
+3,800+ automated tests pass. A read-only live verification was attempted against the connected Supabase project and was honestly blocked (`LIVE_VERIFICATION_BLOCKED_NO_EXISTING_APPROVAL`) because no approval record currently exists there; no synthetic data was created to force it. **Block 8 — AI Agent Gateway / Runtime Firewall** is the next development block.
 
 ## Project Structure
 
