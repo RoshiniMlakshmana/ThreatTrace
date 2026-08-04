@@ -49,13 +49,15 @@ FAILURE_CATEGORIES = (
     "PERSISTENCE_CONFLICT",
 )
 
+# Block 6: the pipeline now performs a trusted investigation-context
+# lookup and a deterministic risk-classification preview before the
+# actual (now live-context-guarded) insertion -- four top-level stages,
+# not the original six single-CLI-call Block 5 stages.
 STAGE_HEADINGS_IN_ORDER = (
-    "## Stage 1 — Approval Request Validation CLI",
-    "## Stage 2 — Approval Bridge Prepare",
-    "## Stage 3 — MCP Adapter Prepare Call",
-    "## Stage 4 — Execute Through Supabase MCP",
-    "## Stage 5 — MCP Adapter Normalize Response",
-    "## Stage 6 — Approval Bridge Verify",
+    "## Stage 1 — Trusted Investigation-Context Lookup",
+    "## Stage 2 — Deterministic Risk Classification Preview",
+    "## Stage 3 — Risk-Aware Approval Insertion",
+    "## Stage 4 — Cross-Check the Created Approval",
 )
 
 EXAMPLE_HEADINGS_IN_ORDER = (
@@ -214,9 +216,30 @@ def test_009_requested_by_never_described_as_authenticated_or_verified(command_t
     def _in_exclusion(pos):
         return any(start <= pos < end for start, end in exclusion_ranges)
 
+    # Block 6 legitimately and repeatedly describes the trusted
+    # investigation-context lookup mechanism itself (a real, correct
+    # security property of that data source) as "trusted investigation
+    # context" / "trusted lookup" / "trusted context lookup" / "trusted
+    # investigation-context lookup" -- a categorically different subject
+    # from any claim about requested_by's own identity, which remains
+    # never authenticated/verified/trusted anywhere in this document. Any
+    # occurrence of "trusted" immediately followed by one of these safe
+    # continuation words describes that lookup mechanism, never
+    # requested_by, and is excluded from the negation-marker requirement
+    # below on that basis alone.
+    _safe_trusted_continuations = ("investigation", "context", "lookup", "data")
+
+    def _is_safe_trusted_usage(lowered_text, index, term):
+        if term != "trusted":
+            return False
+        following = lowered_text[index + len(term):index + len(term) + 20].lstrip()
+        return any(following.startswith(word) for word in _safe_trusted_continuations)
+
     for term in ("authenticated", "verified", "trusted", "cryptographically proven"):
         for index in _find_all(command_text.lower(), term):
             if _in_exclusion(index):
+                continue
+            if _is_safe_trusted_usage(command_text.lower(), index, term):
                 continue
             preceding = command_text.lower()[max(0, index - 150) : index]
             assert any(marker in preceding for marker in _NEGATION_MARKERS), (
@@ -252,9 +275,16 @@ def test_012_uses_canonical_request_validator_cli(command_text):
 
 
 def test_013_uses_bridge_prepare(command_text):
+    # Block 6: the actual mutation this command performs now uses the
+    # live-context-guarded insert_risk_aware_pending_approval operation,
+    # never the plain Block 5 insert_pending_approval operation -- the old
+    # operation name is only ever mentioned in a "never fall back to"
+    # safety negation, verified separately by
+    # test_insertion_uses_risk_aware_operation_with_trusted_context_and_rejects_forged_expected_context
+    # below.
     assert "core.approval_bridge_cli" in command_text
     assert '"phase": "prepare"' in command_text
-    assert '"operation": "insert_pending_approval"' in command_text
+    assert '"operation": "insert_risk_aware_pending_approval"' in command_text
 
 
 def test_014_uses_adapter_prepare_call(command_text):
@@ -407,9 +437,14 @@ def test_examples_use_syntactically_valid_uuids_and_timestamps():
 # ---------------------------------------------------------------------------
 
 def test_037_action_payload_uses_only_status_and_confidence(command_text):
-    stage1_start = command_text.find("## Stage 1 — Approval Request Validation CLI")
-    stage1_end = command_text.find("## Stage 2", stage1_start)
-    section = command_text[stage1_start:stage1_end]
+    # Block 6: the original legitimate request (including its
+    # action_payload) is now first constructed in Stage 2 (Deterministic
+    # Risk Classification Preview), not in a standalone Stage 1 request-
+    # validation CLI call -- Stage 1 is now the trusted investigation-
+    # context lookup, which builds no action_payload of its own.
+    stage2_start = command_text.find("## Stage 2 — Deterministic Risk Classification Preview")
+    stage2_end = command_text.find("## Stage 3", stage2_start)
+    section = command_text[stage2_start:stage2_end]
     payload_block_start = section.find('"action_payload"')
     payload_block_end = section.find("}", payload_block_start)
     payload_block = section[payload_block_start:payload_block_end]
@@ -463,7 +498,7 @@ def test_040_two_phase_architecture_named(command_text):
     assert "two-phase prepare/verify approval bridge" in command_text
 
 
-def test_040b_all_six_stages_appear_in_order(command_text):
+def test_040b_all_four_stages_appear_in_order(command_text):
     indices = []
     search_start = 0
     for heading in STAGE_HEADINGS_IN_ORDER:
@@ -517,9 +552,14 @@ def test_python_launcher_fallback_documented(command_text):
 
 
 def test_all_three_cli_modules_checked_for_import(command_text):
+    # Block 6: no standalone core.approval_request_cli invocation remains
+    # in this workflow (core.approval_risk_request_cli already delegates
+    # to its validator internally) -- it is replaced in this import-check
+    # list by core.approval_risk_request_cli, the module Stage 2 actually
+    # invokes. The set is still exactly three modules.
     section_start = command_text.find("confirm the selected launcher can import all three required modules")
     section = command_text[section_start : section_start + 400]
-    for module_name in ("core.approval_request_cli", "core.approval_bridge_cli", "core.approval_mcp_adapter_cli"):
+    for module_name in ("core.approval_risk_request_cli", "core.approval_bridge_cli", "core.approval_mcp_adapter_cli"):
         assert module_name in section
 
 
@@ -530,6 +570,217 @@ def test_clis_invoked_through_stdin_only(command_text):
 
 def test_no_temporary_json_files_allowed(command_text):
     assert "create a temporary JSON file" in command_text
+
+
+# ---------------------------------------------------------------------------
+# Block 6, Step 11: trusted risk-aware approval creation
+# ---------------------------------------------------------------------------
+
+
+def test_trusted_context_lookup_precedes_risk_classification_and_insertion(command_text):
+    """1. The command performs trusted investigation-context lookup before
+    risk classification and insertion."""
+    stage1_idx = command_text.find("## Stage 1 — Trusted Investigation-Context Lookup")
+    stage2_idx = command_text.find("## Stage 2 — Deterministic Risk Classification Preview")
+    stage3_idx = command_text.find("## Stage 3 — Risk-Aware Approval Insertion")
+    assert stage1_idx != -1
+    assert stage2_idx != -1
+    assert stage3_idx != -1
+    assert stage1_idx < stage2_idx < stage3_idx
+
+    # The genuine operation names, not just the stage titles, must appear
+    # in this same relative order: the lookup operation is prepared and
+    # verified entirely within Stage 1, strictly before the risk-aware
+    # insert operation ever appears.
+    lookup_operation_idx = command_text.find('"operation": "load_investigation_approval_context"')
+    insert_operation_idx = command_text.find('"operation": "insert_risk_aware_pending_approval"')
+    assert lookup_operation_idx != -1
+    assert insert_operation_idx != -1
+    assert lookup_operation_idx < insert_operation_idx
+
+    # The lookup's own verify phase result -- the trusted context -- is
+    # named as the thing risk classification is based on.
+    assert "trusted investigation context" in command_text.lower()
+    trusted_context_idx = command_text.lower().find("call this the **trusted investigation context**")
+    assert trusted_context_idx != -1
+    assert stage2_idx > trusted_context_idx > stage1_idx
+
+
+def test_risk_classification_cli_receives_only_original_request_and_trusted_context(command_text):
+    """2. The risk-classification CLI receives only: original request;
+    trusted status/confidence."""
+    stage2_start = command_text.find("## Stage 2 — Deterministic Risk Classification Preview")
+    stage3_start = command_text.find("## Stage 3 — Risk-Aware Approval Insertion")
+    assert stage2_start != -1 and stage3_start != -1
+    section = command_text[stage2_start:stage3_start]
+
+    assert "core.approval_risk_request_cli" in section
+
+    # The envelope sent to the risk-classification CLI is exactly request
+    # + current_investigation, in that order.
+    envelope_start = section.find('"request": "<the original legitimate request>"')
+    assert envelope_start != -1
+    envelope_block = section[envelope_start : envelope_start + 300]
+    assert '"current_investigation"' in envelope_block
+    assert envelope_block.find('"request"') < envelope_block.find('"current_investigation"')
+
+    # current_investigation carries only status/confidence -- investigation_id
+    # is explicitly excluded, and the command says so.
+    current_investigation_block_start = envelope_block.find('"current_investigation"')
+    current_investigation_block = envelope_block[current_investigation_block_start:]
+    assert '"status"' in current_investigation_block
+    assert '"confidence"' in current_investigation_block
+    assert "Do not include `investigation_id` inside `current_investigation`" in section
+
+    # The caller never chooses the derived fields this stage produces.
+    assert "The caller never chooses `risk_level` or `required_approvals`" in section
+
+
+def test_insertion_uses_risk_aware_operation_with_trusted_context_and_rejects_forged_expected_context(command_text):
+    """3. The insertion uses: insert_risk_aware_pending_approval; the
+    original request without derived risk fields; trusted status/
+    confidence; no caller-forged expected context."""
+    stage3_start = command_text.find("## Stage 3 — Risk-Aware Approval Insertion")
+    stage4_start = command_text.find("## Stage 4 — Cross-Check the Created Approval")
+    assert stage3_start != -1 and stage4_start != -1
+    section = command_text[stage3_start:stage4_start]
+
+    assert '"operation": "insert_risk_aware_pending_approval"' in section
+
+    # The insertion's own input envelope is exactly request,
+    # current_investigation, expires_at, in that exact key order --
+    # matching core.approval_bridge's own _OPERATION_INPUT_FIELDS
+    # ordering requirement for this operation.
+    envelope_start = section.find('"input": {')
+    envelope_end = section.find("}\n}", envelope_start)
+    envelope_block = section[envelope_start:envelope_end]
+    request_idx = envelope_block.find('"request"')
+    current_investigation_idx = envelope_block.find('"current_investigation"')
+    expires_at_idx = envelope_block.find('"expires_at"')
+    assert -1 not in (request_idx, current_investigation_idx, expires_at_idx)
+    assert request_idx < current_investigation_idx < expires_at_idx
+
+    # request is explicitly the same object from Stage 2, never the risk
+    # preview, and never a caller-supplied risk field.
+    assert "the exact same object built in Stage 2" in section
+    assert "never the risk classification preview" in section
+    assert "never a caller-supplied `risk_level`/`required_approvals`/`requested_by_normalized`" in section
+
+    # expected_current_status/expected_current_confidence are produced by
+    # the persistence layer alone, from the trusted context, never a
+    # separate caller field, and never stored inside values.
+    assert "expected_current_status" in section
+    assert "expected_current_confidence" in section
+    assert "never inside `values`, never new `approvals` columns" in section
+    assert "This command never manually constructs or alters this descriptor" in section
+
+    # The Block 5, non-context-guarded operation is never the one this
+    # command actually uses -- it is only ever named in a "never fall
+    # back to" safety negation (the negation-introducing "must never:"
+    # line sits at the top of the same bulleted Security Boundaries list,
+    # several items above -- a wide lookback window, matching the same
+    # convention already used elsewhere in this file, e.g. test_020).
+    fallback_idx = command_text.find("fall back to the plain, non-context-guarded `insert_pending_approval`")
+    assert fallback_idx != -1
+    preceding = command_text[max(0, fallback_idx - 1400) : fallback_idx].lower()
+    assert "must never" in preceding
+
+
+def test_block6_caller_fields_rejected_before_any_external_execution(command_text):
+    """4. Caller-supplied risk, required approvals, current context,
+    expected context, SQL, or descriptors are rejected before external
+    execution."""
+    prohibited_block6_fields = (
+        "current_investigation",
+        "current_status",
+        "current_confidence",
+        "risk_level",
+        "required_approvals",
+        "requested_by_normalized",
+        "expected_current_status",
+        "expected_current_confidence",
+        "approval_count",
+        "reviewer",
+        "reviewed_by",
+        "descriptor",
+    )
+    section_start = command_text.find("Also always reject every one of these additional Block 6 fields")
+    assert section_start != -1
+    section = command_text[section_start : section_start + 1400]
+    for field in prohibited_block6_fields:
+        assert f"`{field}`" in section, f"missing forbidden Block 6 field: {field}"
+
+    # This rejection happens locally, before Stage 1 (the first external
+    # Supabase/MCP operation) ever runs.
+    validation_section_start = command_text.find("## Request Validation")
+    validation_section = command_text[validation_section_start : validation_section_start + 700]
+    assert "before any Supabase or MCP operation" in validation_section
+    assert "Reject any field not listed under Input Envelope (including every Block 6 field named above)" in validation_section
+
+    # A caller can never supply the SQL/descriptor mechanisms directly --
+    # this command builds no SQL and accepts no ready-made descriptor.
+    assert "a caller can never supply a bridge or adapter descriptor directly" in command_text
+
+
+def test_stale_context_conflict_stops_without_retry_fallback_or_success_output(command_text):
+    """5. A stale-context/zero-row conflict stops without retry, fallback,
+    or success output."""
+    conflict_section_start = command_text.find("### PERSISTENCE_CONFLICT")
+    assert conflict_section_start != -1
+    conflict_section = command_text[conflict_section_start : conflict_section_start + 900]
+
+    assert "contained zero rows" in conflict_section
+    assert "no longer matched the trusted context" in conflict_section
+    assert "No approval was created." in conflict_section
+    assert "Never retried automatically" in conflict_section
+    assert "fallback unconditional insertion" in conflict_section
+    assert "re-issue" in conflict_section.lower()
+
+    # The Stage 3e exit-code table explicitly ties approval_conflict to
+    # PERSISTENCE_CONFLICT and states plainly that no approval was created.
+    stage3e_start = command_text.find("### Stage 3e — Approval Bridge Verify")
+    stage4_start = command_text.find("## Stage 4 — Cross-Check the Created Approval")
+    stage3e_section = command_text[stage3e_start:stage4_start]
+    assert "code `approval_conflict`" in stage3e_section
+    assert "PERSISTENCE_CONFLICT" in stage3e_section
+    assert "No approval was created." in stage3e_section
+
+    # No automatic retry of either external stage, and no fallback
+    # insertion path, anywhere in this document.
+    assert "never automatically re-run stage 1" in command_text.lower()
+    assert "never automatically re-attempt stage 3" in command_text.lower()
+    assert "Never fall back to the plain `insert_pending_approval` operation or to an unconditional `VALUES` insertion" in command_text
+
+
+def test_success_output_shows_safe_fields_and_correct_review_count_guidance_while_hiding_secrets(command_text):
+    """6. Success output contains safe approval ID, pending status,
+    derived risk, required approval count, expiry, and correct one-review/
+    two-review next-action guidance while hiding SQL, normalized identity,
+    payload secrets, and internal errors."""
+    output_section_start = command_text.find("## Required Success Output")
+    output_section_end = command_text.find("## Required Failure Behavior")
+    assert output_section_start != -1 and output_section_end != -1
+    section = command_text[output_section_start:output_section_end]
+
+    assert "Approval ID" in section
+    assert "Approval Status: `pending`" in section
+    assert "Derived Risk Level" in section
+    assert "Required Approval Count" in section
+    assert "Expires At" in section
+    assert "Requested At" in section
+
+    # One-review vs two-distinct-review guidance is explicitly
+    # distinguished, and both branches still point at /review-approval.
+    assert 'required_approvals` is `1`' in section
+    assert 'required_approvals` is `2`' in section
+    assert "two distinct reviewers" in section.lower()
+    assert "partially_approved" in section
+    assert section.count("/review-approval <approval-id>") >= 2
+
+    # Sensitive/internal content is explicitly excluded from this output.
+    assert "Never display any of the following anywhere in the success output" in section
+    for hidden_field in ("raw SQL", "MCP tool-call descriptor", "requested_by_normalized", "expected_current_status"):
+        assert hidden_field in section
 
 
 # ---------------------------------------------------------------------------
