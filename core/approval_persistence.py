@@ -34,15 +34,22 @@ from __future__ import annotations
 
 import copy
 import uuid
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
 from typing import Any, Protocol
 
-from core.approval_request import ApprovalRequestError, validate_approval_request
+from core.approval_request import (
+    ApprovalRequestError,
+    validate_approval_request,
+    validate_risk_aware_approval_request,
+)
 from core.approval_transition import (
     ApprovalTransitionError,
     validate_approval_record,
+    validate_approval_review_record,
     validate_approval_transition,
+    validate_multi_review_transition,
+    validate_risk_aware_approval_record,
 )
 from core.decision_context import INVESTIGATION_STATUSES
 from core.evidence_normalizer import CONFIDENCE_LEVELS
@@ -187,6 +194,69 @@ _INVESTIGATION_RESULT_FIELDS = (
 )
 _CONSUMPTION_ROW_FIELDS_SET = _RECORD_FIELDS_SET | frozenset(_INVESTIGATION_RESULT_FIELDS)
 
+# ---------------------------------------------------------------------------
+# Risk-aware persistence operations (Block 6, Step 4)
+# ---------------------------------------------------------------------------
+
+_RISK_AWARE_RECORD_FIELDS = _RECORD_FIELDS + ("risk_level", "required_approvals")
+_RISK_AWARE_RECORD_FIELDS_SET = frozenset(_RISK_AWARE_RECORD_FIELDS)
+
+_REVIEW_LOOKUP_COLUMNS = (
+    "approval_id",
+    "reviewer_identity",
+    "reviewer_identity_normalized",
+    "decision",
+    "decided_at",
+)
+# Comfortably exceeds any currently-possible required_approvals count (max
+# 2 today) -- a defensive bound, not a real limit on review history size.
+_REVIEW_LOOKUP_LIMIT = 10
+
+_INVALID_RISK_AWARE_REQUEST_MESSAGE = "Invalid risk-aware approval request."
+_RISK_AWARE_INSERT_RESPONSE_MESSAGE = "Risk-aware approval insert response was invalid."
+_RISK_AWARE_LOOKUP_RESPONSE_MESSAGE = "Risk-aware approval lookup response was invalid."
+_REVIEW_LOOKUP_RESPONSE_MESSAGE = "Approval review lookup response was invalid."
+
+_INVALID_MULTI_REVIEW_INPUT_MESSAGE = "Invalid multi-review transition input."
+_INVALID_MULTI_REVIEW_PLAN_MESSAGE = "Invalid multi-review transition plan."
+_MULTI_REVIEW_RESPONSE_MESSAGE = "Multi-review transition response was invalid."
+_MULTI_REVIEW_CONFLICT_MESSAGE = "Multi-review transition conflicted."
+
+_MULTI_REVIEW_TRANSITION_PLAN_FIELDS = frozenset({
+    "approval_id",
+    "from_status",
+    "to_status",
+    "required_approvals",
+    "approval_count_before",
+    "approval_count_after",
+    "review_record",
+    "set_fields",
+})
+
+_REVIEW_RPC_FUNCTION_NAME = "record_approval_review_and_promote_status"
+_REVIEW_RPC_PARAMETER_ORDER = (
+    "approval_id",
+    "expected_from_status",
+    "expected_to_status",
+    "expected_required_approvals",
+    "expected_approval_count_before",
+    "reviewer_identity",
+    "reviewer_identity_normalized",
+    "decision",
+    "decided_at",
+    "rejection_reason",
+)
+
+_REVIEW_RPC_RESULT_EXTRA_FIELDS = (
+    "review_approval_id",
+    "reviewer_identity",
+    "reviewer_identity_normalized",
+    "review_decision",
+    "review_decided_at",
+    "approval_count",
+)
+_REVIEW_RPC_RESULT_FIELDS_SET = _RISK_AWARE_RECORD_FIELDS_SET | frozenset(_REVIEW_RPC_RESULT_EXTRA_FIELDS)
+
 
 def _validate_validated_request(validated_request: Any) -> dict[str, Any]:
     if not isinstance(validated_request, Mapping):
@@ -274,6 +344,23 @@ def _validate_row_shape(row: Any, generic_message: str) -> dict[str, Any]:
 
     try:
         record = validate_approval_record(restored)
+    except ApprovalTransitionError:
+        raise ApprovalResponseError(generic_message) from None
+
+    return record
+
+
+def _validate_risk_aware_row_shape(row: Any, generic_message: str) -> dict[str, Any]:
+    if not isinstance(row, Mapping):
+        raise ApprovalResponseError(generic_message)
+
+    restored = dict(row)
+    for field_name in _NULLABLE_RECORD_FIELDS:
+        if field_name not in restored:
+            restored[field_name] = None
+
+    try:
+        record = validate_risk_aware_approval_record(restored)
     except ApprovalTransitionError:
         raise ApprovalResponseError(generic_message) from None
 
@@ -922,4 +1009,478 @@ def apply_approval_consumption(
         "transition_plan": copy.deepcopy(dict(recomputed_plan)),
         "updated_record": copy.deepcopy(approval_record),
         "investigation_result": investigation_result,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Risk-aware persistence operations (Block 6, Step 4)
+# ---------------------------------------------------------------------------
+
+
+def insert_risk_aware_pending_approval(
+    executor: ApprovalExecutor,
+    request: Mapping[str, Any],
+    current_investigation: Mapping[str, Any],
+    *,
+    expires_at: str | datetime | None = None,
+) -> dict[str, Any]:
+    """Validate one proposed approval request and its investigation's
+    current state, derive its deterministic risk classification, and
+    insert one new risk-aware pending approval row.
+
+    Unlike `insert_pending_approval` (which trusts an already-validated
+    Block 5 request), this function receives the *original* `request` and
+    `current_investigation` and calls
+    `core.approval_request.validate_risk_aware_approval_request` itself --
+    caller-supplied risk metadata is never trusted, because no such field
+    exists anywhere in that validator's own input contract (exactly as
+    that module's own docstring already establishes). `risk_level` and
+    `required_approvals` are always derived, never accepted.
+
+    `requested_by_normalized` (`requested_by.strip().casefold()`) is
+    computed here and written to the insert descriptor's `values`, but is
+    never requested back via `returning` and never appears in the
+    returned record -- it exists purely for later database-side
+    enforcement in `record_approval_review_and_promote_status` and
+    `consume_approval_and_update_investigation_state`, and this module
+    never reproduces Python `casefold()` with PostgreSQL `lower()`.
+
+    Invokes `executor` exactly once with an insert operation descriptor
+    for the `approvals` table, whose `returning` list is exactly the
+    eighteen risk-aware fields (the existing sixteen plus `risk_level` and
+    `required_approvals`). The executor's response must be a Python list
+    containing exactly one row mapping; that row is normalized and
+    validated through `validate_risk_aware_approval_record` exactly once,
+    then checked to confirm it actually reflects the request that was
+    submitted.
+
+    Raises `ApprovalPersistenceError` for invalid `request` or
+    `current_investigation` input (before the executor is ever invoked,
+    covering every failure `validate_risk_aware_approval_request` itself
+    raises) or invalid `expires_at`, `ApprovalResponseError` for any
+    malformed, mismatched, or invalid executor response, and
+    `ApprovalTransportError` if `executor` itself raises. Never mutates
+    `request` or `current_investigation`, and never returns
+    `requested_by_normalized`, a persistence receipt, row count, or
+    operation descriptor -- only the validated eighteen-field record
+    itself.
+    """
+    try:
+        validated_request = validate_risk_aware_approval_request(request, current_investigation)
+    except ApprovalRequestError:
+        raise ApprovalPersistenceError(_INVALID_RISK_AWARE_REQUEST_MESSAGE) from None
+
+    canonical_expires_at = _validate_expiry(expires_at, validated_request["requested_at"])
+
+    requested_by_normalized = validated_request["requested_by"].strip().casefold()
+
+    values: dict[str, Any] = {
+        "investigation_id": validated_request["investigation_id"],
+        "action_type": validated_request["action_type"],
+        "action_payload": copy.deepcopy(validated_request["action_payload"]),
+        "requested_by": validated_request["requested_by"],
+        "requested_at": validated_request["requested_at"],
+        "status": "pending",
+        "risk_level": validated_request["risk_level"],
+        "required_approvals": validated_request["required_approvals"],
+        "requested_by_normalized": requested_by_normalized,
+    }
+    if canonical_expires_at is not None:
+        values["expires_at"] = canonical_expires_at
+
+    operation = {
+        "operation": "insert",
+        "table": "approvals",
+        "values": values,
+        "returning": list(_RISK_AWARE_RECORD_FIELDS),
+    }
+
+    response = _invoke_executor(executor, operation)
+
+    if not isinstance(response, list):
+        raise ApprovalResponseError(_RISK_AWARE_INSERT_RESPONSE_MESSAGE)
+    if len(response) != 1:
+        raise ApprovalResponseError(_RISK_AWARE_INSERT_RESPONSE_MESSAGE)
+
+    record = _validate_risk_aware_row_shape(response[0], _RISK_AWARE_INSERT_RESPONSE_MESSAGE)
+
+    if (
+        record["investigation_id"] != validated_request["investigation_id"]
+        or record["action_type"] != validated_request["action_type"]
+        or record["action_payload"] != validated_request["action_payload"]
+        or record["requested_by"] != validated_request["requested_by"]
+        or record["requested_at"] != validated_request["requested_at"]
+        or record["risk_level"] != validated_request["risk_level"]
+        or record["required_approvals"] != validated_request["required_approvals"]
+    ):
+        raise ApprovalResponseError(_RISK_AWARE_INSERT_RESPONSE_MESSAGE)
+
+    if record["status"] != "pending":
+        raise ApprovalResponseError(_RISK_AWARE_INSERT_RESPONSE_MESSAGE)
+
+    if record["expires_at"] != canonical_expires_at:
+        raise ApprovalResponseError(_RISK_AWARE_INSERT_RESPONSE_MESSAGE)
+
+    return record
+
+
+def load_risk_aware_approval_record(
+    executor: ApprovalExecutor,
+    approval_id: str,
+) -> dict[str, Any]:
+    """Load one existing approval row by its canonical `id` and return its
+    validated, canonical eighteen-field risk-aware record.
+
+    `approval_id` is canonicalized as a UUID before the executor is ever
+    invoked. Invokes `executor` exactly once with a primary-key-only
+    select operation descriptor for the `approvals` table (`columns` is
+    exactly the eighteen risk-aware fields; `filters` contains only `id`;
+    no investigation, status, or claimed-identity filter is ever added).
+    Risk metadata is never defaulted in Python -- `risk_level` and
+    `required_approvals` must actually be present in the executor's
+    response, exactly like every other field.
+
+    The executor's response must be a Python list. Zero rows raises
+    `ApprovalNotFoundError`; more than one row raises
+    `ApprovalResponseError`. The single returned row is normalized and
+    validated through `validate_risk_aware_approval_record` exactly once.
+
+    Raises `ApprovalPersistenceError` for a malformed `approval_id`
+    (before the executor is ever invoked), `ApprovalResponseError` for
+    any malformed or invalid executor response, and
+    `ApprovalTransportError` if `executor` itself raises. Never raises
+    `ApprovalTransitionError` directly, and never returns anything beyond
+    the validated eighteen-field record.
+    """
+    canonical_id = _validate_approval_id(approval_id)
+
+    operation = {
+        "operation": "select",
+        "table": "approvals",
+        "columns": list(_RISK_AWARE_RECORD_FIELDS),
+        "filters": {"id": canonical_id},
+        "limit": 2,
+    }
+
+    response = _invoke_executor(executor, operation)
+
+    if not isinstance(response, list):
+        raise ApprovalResponseError(_RISK_AWARE_LOOKUP_RESPONSE_MESSAGE)
+    if len(response) == 0:
+        raise ApprovalNotFoundError(_NOT_FOUND_MESSAGE)
+    if len(response) > 1:
+        raise ApprovalResponseError(_RISK_AWARE_LOOKUP_RESPONSE_MESSAGE)
+
+    record = _validate_risk_aware_row_shape(response[0], _RISK_AWARE_LOOKUP_RESPONSE_MESSAGE)
+
+    if record["id"] != canonical_id:
+        raise ApprovalResponseError(_RISK_AWARE_LOOKUP_RESPONSE_MESSAGE)
+
+    return record
+
+
+def load_approval_reviews(
+    executor: ApprovalExecutor,
+    approval_id: str,
+) -> list[dict[str, Any]]:
+    """Load every existing review row recorded against one approval, in
+    deterministic (`decided_at`-ascending) order, and return only the
+    five-field review-summary contract for each.
+
+    `approval_id` is canonicalized as a UUID before the executor is ever
+    invoked. Invokes `executor` exactly once with an ordered select
+    operation descriptor for the `approval_reviews` table, bound only to
+    the supplied `approval_id`. `columns` is exactly the five fields
+    `approval_id`, `reviewer_identity`, `reviewer_identity_normalized`,
+    `decision`, `decided_at` -- the internal review row `id` and
+    `created_at` are never selected or returned.
+
+    The executor's response must be a Python list (zero rows is a valid,
+    non-error result -- a not-yet-reviewed approval). Every returned row
+    is validated through `core.approval_transition.validate_approval_review_record`
+    exactly once, and each row's own `approval_id` is confirmed to equal
+    the canonical `approval_id` supplied.
+
+    Raises `ApprovalPersistenceError` for a malformed `approval_id`
+    (before the executor is ever invoked), `ApprovalResponseError` for
+    any malformed executor response or a row whose `approval_id` does not
+    match, and `ApprovalTransportError` if `executor` itself raises.
+    Never returns an internal review row `id` or `created_at`.
+    """
+    canonical_id = _validate_approval_id(approval_id)
+
+    operation = {
+        "operation": "select",
+        "table": "approval_reviews",
+        "columns": list(_REVIEW_LOOKUP_COLUMNS),
+        "filters": {"approval_id": canonical_id},
+        "order_by": "decided_at",
+        "limit": _REVIEW_LOOKUP_LIMIT,
+    }
+
+    response = _invoke_executor(executor, operation)
+
+    if not isinstance(response, list):
+        raise ApprovalResponseError(_REVIEW_LOOKUP_RESPONSE_MESSAGE)
+
+    reviews: list[dict[str, Any]] = []
+    for row in response:
+        try:
+            validated = validate_approval_review_record(row)
+        except ApprovalTransitionError:
+            raise ApprovalResponseError(_REVIEW_LOOKUP_RESPONSE_MESSAGE) from None
+
+        if validated["approval_id"] != canonical_id:
+            raise ApprovalResponseError(_REVIEW_LOOKUP_RESPONSE_MESSAGE)
+
+        reviews.append(validated)
+
+    return reviews
+
+
+def _validate_current_record_for_multi_review(current_record: Any) -> dict[str, Any]:
+    if not isinstance(current_record, Mapping):
+        raise ApprovalPersistenceError(_INVALID_MULTI_REVIEW_INPUT_MESSAGE)
+
+    try:
+        validated = validate_risk_aware_approval_record(current_record)
+    except ApprovalTransitionError:
+        raise ApprovalPersistenceError(_INVALID_MULTI_REVIEW_INPUT_MESSAGE) from None
+
+    if validated != dict(current_record):
+        raise ApprovalPersistenceError(_INVALID_MULTI_REVIEW_INPUT_MESSAGE)
+
+    if validated["status"] not in ("pending", "partially_approved"):
+        raise ApprovalPersistenceError(_INVALID_MULTI_REVIEW_INPUT_MESSAGE)
+
+    return validated
+
+
+def _validate_existing_reviews_for_multi_review(existing_reviews: Any) -> list[dict[str, Any]]:
+    if isinstance(existing_reviews, (str, bytes)) or not isinstance(existing_reviews, Sequence):
+        raise ApprovalPersistenceError(_INVALID_MULTI_REVIEW_INPUT_MESSAGE)
+
+    validated_reviews: list[dict[str, Any]] = []
+    for review in existing_reviews:
+        try:
+            validated = validate_approval_review_record(review)
+        except ApprovalTransitionError:
+            raise ApprovalPersistenceError(_INVALID_MULTI_REVIEW_INPUT_MESSAGE) from None
+
+        if not isinstance(review, Mapping) or validated != dict(review):
+            raise ApprovalPersistenceError(_INVALID_MULTI_REVIEW_INPUT_MESSAGE)
+
+        validated_reviews.append(validated)
+
+    return validated_reviews
+
+
+def _validate_multi_review_transition_plan(transition_plan: Any) -> dict[str, Any]:
+    if not isinstance(transition_plan, Mapping):
+        raise ApprovalPersistenceError(_INVALID_MULTI_REVIEW_PLAN_MESSAGE)
+
+    if set(transition_plan) != _MULTI_REVIEW_TRANSITION_PLAN_FIELDS:
+        raise ApprovalPersistenceError(_INVALID_MULTI_REVIEW_PLAN_MESSAGE)
+
+    return dict(transition_plan)
+
+
+def _compute_expected_risk_aware_updated_record(
+    validated_current_record: Mapping[str, Any],
+    set_fields: Mapping[str, Any],
+    generic_message: str,
+) -> dict[str, Any]:
+    candidate = dict(copy.deepcopy(dict(validated_current_record)))
+    candidate.update(copy.deepcopy(dict(set_fields)))
+    try:
+        return validate_risk_aware_approval_record(candidate)
+    except ApprovalTransitionError:
+        raise ApprovalPersistenceError(generic_message) from None
+
+
+def apply_multi_review_transition(
+    executor: ApprovalExecutor,
+    current_record: Mapping[str, Any],
+    existing_reviews: Sequence[Mapping[str, Any]],
+    transition_plan: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Apply one genuine review decision (approve or reject) atomically,
+    via a single PostgreSQL RPC call that records the immutable review row
+    and promotes the approval's own summary status together, and return
+    the verified updated record, review record, and approval count.
+
+    `current_record` must already be the exact, canonical output of
+    `validate_risk_aware_approval_record`, with `status` equal to
+    `"pending"` or `"partially_approved"` -- an approved, rejected, or
+    consumed record is rejected before the executor is ever invoked, as
+    is any record validation would change. `existing_reviews` must be a
+    sequence whose every entry is already the exact, canonical output of
+    `validate_approval_review_record`.
+
+    The supplied `transition_plan` is never trusted at face value: this
+    function reconstructs the equivalent transition request from the
+    plan's own `review_record` (and, for a reject decision, its
+    `set_fields.rejection_reason`) and recomputes the plan by calling
+    `core.approval_transition.validate_multi_review_transition` exactly
+    once, requiring the result to equal the supplied plan exactly (plain
+    dict equality, so key insertion order is never significant, exactly
+    like every other plan-verification check in this module). This
+    re-derives (and cannot bypass) self-approval prevention, duplicate-
+    reviewer prevention, Unicode casefold comparison, expiry enforcement,
+    the correct next status, and the correct approval count -- a forged
+    approval ID, `from_status`, `to_status`, `required_approvals`,
+    approval count, reviewer identity, normalization, decision, timestamp,
+    or rejection reason is rejected before the executor is ever invoked,
+    as is a missing or extra plan field.
+
+    Invokes `executor` exactly once with one RPC operation descriptor
+    naming `record_approval_review_and_promote_status` and exactly its
+    ten parameters, generated entirely from the recomputed plan -- the
+    caller never supplies an RPC descriptor directly. Zero returned rows
+    raises `ApprovalConflictError` (never retried). Exactly one row is
+    required; it must contain the eighteen risk-aware approval fields
+    plus exactly `review_approval_id`, `reviewer_identity`,
+    `reviewer_identity_normalized`, `review_decision`,
+    `review_decided_at`, and `approval_count` -- the complete twenty-four-
+    field atomic review RPC return contract. The approval portion is
+    validated through `validate_risk_aware_approval_record` and required
+    to equal an independently computed expected updated record exactly;
+    the review portion is validated through `validate_approval_review_record`
+    and required to equal the recomputed plan's own `review_record`
+    exactly; `approval_count` is required to equal the recomputed plan's
+    own `approval_count_after` exactly.
+
+    Returns exactly:
+
+        {
+            "updated_record": {...},
+            "review_record": {...},
+            "approval_count": 0 | 1 | 2,
+        }
+
+    Raises `ApprovalPersistenceError` for invalid `current_record`,
+    `existing_reviews`, or `transition_plan` input (before the executor is
+    ever invoked), `ApprovalConflictError` for a genuine plan matched
+    against zero rows, `ApprovalResponseError` for any other malformed or
+    mismatched executor response, and `ApprovalTransportError` if
+    `executor` itself raises. Never raises `ApprovalTransitionError`
+    directly. Never mutates `current_record`, `existing_reviews`, or
+    `transition_plan` (nor any nested mapping within any of them), and
+    never returns a persistence receipt, row count, operation descriptor,
+    or authentication result.
+    """
+    validated_current_record = _validate_current_record_for_multi_review(current_record)
+    validated_reviews = _validate_existing_reviews_for_multi_review(existing_reviews)
+    supplied_plan = _validate_multi_review_transition_plan(transition_plan)
+
+    review_record = supplied_plan.get("review_record")
+    if not isinstance(review_record, Mapping):
+        raise ApprovalPersistenceError(_INVALID_MULTI_REVIEW_PLAN_MESSAGE)
+
+    decision = review_record.get("decision")
+    if decision == "approve":
+        reconstructed_request: dict[str, Any] = {
+            "decision": "approve",
+            "reviewed_by": review_record.get("reviewer_identity"),
+        }
+    elif decision == "reject":
+        set_fields = supplied_plan.get("set_fields")
+        rejection_reason = set_fields.get("rejection_reason") if isinstance(set_fields, Mapping) else None
+        reconstructed_request = {
+            "decision": "reject",
+            "reviewed_by": review_record.get("reviewer_identity"),
+            "rejection_reason": rejection_reason,
+        }
+    else:
+        raise ApprovalPersistenceError(_INVALID_MULTI_REVIEW_PLAN_MESSAGE)
+
+    reviewed_at = review_record.get("decided_at")
+
+    try:
+        recomputed_plan = validate_multi_review_transition(
+            validated_current_record,
+            validated_reviews,
+            reconstructed_request,
+            reviewed_at=reviewed_at,
+        )
+    except ApprovalTransitionError:
+        raise ApprovalPersistenceError(_INVALID_MULTI_REVIEW_PLAN_MESSAGE) from None
+
+    if recomputed_plan != supplied_plan:
+        raise ApprovalPersistenceError(_INVALID_MULTI_REVIEW_PLAN_MESSAGE)
+
+    genuine_review_record = recomputed_plan["review_record"]
+    genuine_set_fields = recomputed_plan["set_fields"]
+
+    parameters = {
+        "approval_id": recomputed_plan["approval_id"],
+        "expected_from_status": recomputed_plan["from_status"],
+        "expected_to_status": recomputed_plan["to_status"],
+        "expected_required_approvals": recomputed_plan["required_approvals"],
+        "expected_approval_count_before": recomputed_plan["approval_count_before"],
+        "reviewer_identity": genuine_review_record["reviewer_identity"],
+        "reviewer_identity_normalized": genuine_review_record["reviewer_identity_normalized"],
+        "decision": genuine_review_record["decision"],
+        "decided_at": genuine_review_record["decided_at"],
+        "rejection_reason": genuine_set_fields.get("rejection_reason"),
+    }
+
+    operation = {
+        "operation": "rpc",
+        "function": _REVIEW_RPC_FUNCTION_NAME,
+        "parameters": parameters,
+    }
+
+    response = _invoke_executor(executor, operation)
+
+    if not isinstance(response, list):
+        raise ApprovalResponseError(_MULTI_REVIEW_RESPONSE_MESSAGE)
+    if len(response) == 0:
+        raise ApprovalConflictError(_MULTI_REVIEW_CONFLICT_MESSAGE)
+    if len(response) > 1:
+        raise ApprovalResponseError(_MULTI_REVIEW_RESPONSE_MESSAGE)
+
+    row = response[0]
+    if not isinstance(row, Mapping):
+        raise ApprovalResponseError(_MULTI_REVIEW_RESPONSE_MESSAGE)
+
+    if set(row) != _REVIEW_RPC_RESULT_FIELDS_SET:
+        raise ApprovalResponseError(_MULTI_REVIEW_RESPONSE_MESSAGE)
+
+    approval_portion = {key: value for key, value in row.items() if key in _RISK_AWARE_RECORD_FIELDS_SET}
+    updated_record = _validate_risk_aware_row_shape(approval_portion, _MULTI_REVIEW_RESPONSE_MESSAGE)
+
+    expected_updated_record = _compute_expected_risk_aware_updated_record(
+        validated_current_record, genuine_set_fields, _MULTI_REVIEW_RESPONSE_MESSAGE
+    )
+    if updated_record != expected_updated_record:
+        raise ApprovalResponseError(_MULTI_REVIEW_RESPONSE_MESSAGE)
+
+    if row["review_approval_id"] != recomputed_plan["approval_id"]:
+        raise ApprovalResponseError(_MULTI_REVIEW_RESPONSE_MESSAGE)
+
+    try:
+        result_review_record = validate_approval_review_record({
+            "approval_id": row["review_approval_id"],
+            "reviewer_identity": row["reviewer_identity"],
+            "reviewer_identity_normalized": row["reviewer_identity_normalized"],
+            "decision": row["review_decision"],
+            "decided_at": row["review_decided_at"],
+        })
+    except ApprovalTransitionError:
+        raise ApprovalResponseError(_MULTI_REVIEW_RESPONSE_MESSAGE) from None
+
+    if result_review_record != genuine_review_record:
+        raise ApprovalResponseError(_MULTI_REVIEW_RESPONSE_MESSAGE)
+
+    approval_count = row["approval_count"]
+    if not isinstance(approval_count, int) or isinstance(approval_count, bool):
+        raise ApprovalResponseError(_MULTI_REVIEW_RESPONSE_MESSAGE)
+    if approval_count != recomputed_plan["approval_count_after"]:
+        raise ApprovalResponseError(_MULTI_REVIEW_RESPONSE_MESSAGE)
+
+    return {
+        "updated_record": copy.deepcopy(updated_record),
+        "review_record": copy.deepcopy(result_review_record),
+        "approval_count": approval_count,
     }

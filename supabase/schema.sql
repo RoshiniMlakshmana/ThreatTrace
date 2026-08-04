@@ -237,8 +237,18 @@ create table if not exists approvals (
     consumed_at timestamptz,
     created_at timestamptz not null default now(),
 
+    -- Block 6: risk-based approval strength. Existing Block 5 rows default
+    -- to risk_level = 'medium' / required_approvals = 1 and
+    -- requested_by_normalized = null (the legacy compatibility path) --
+    -- these three columns are purely additive and never reinterpret an
+    -- existing row's own approved_by/approved_at as needing a second
+    -- reviewer it never had.
+    risk_level text not null default 'medium',
+    required_approvals smallint not null default 1,
+    requested_by_normalized text,
+
     constraint chk_approvals_status
-        check (status in ('pending', 'approved', 'rejected', 'consumed')),
+        check (status in ('pending', 'partially_approved', 'approved', 'rejected', 'consumed')),
 
     constraint chk_approvals_action_type
         check (action_type in ('update_investigation_state')),
@@ -276,6 +286,52 @@ create table if not exists approvals (
             or (
                 consumed_by = btrim(consumed_by)
                 and btrim(consumed_by) <> ''
+            )
+        ),
+
+    -- requested_by_normalized is a Python-produced
+    -- requested_by.strip().casefold() value, used only for database-side
+    -- distinct-reviewer and requester-exclusion enforcement -- never
+    -- reproduced with PostgreSQL lower() (see approvals.approved_by's own
+    -- comment on why lower() is not equivalent to Python casefold()).
+    -- Legacy Block 5 rows keep this null; new risk-aware rows always set
+    -- it at insert time.
+    constraint chk_approvals_requested_by_normalized_nonblank
+        check (
+            requested_by_normalized is null
+            or (
+                requested_by_normalized = btrim(requested_by_normalized)
+                and btrim(requested_by_normalized) <> ''
+            )
+        ),
+
+    constraint chk_approvals_risk_level
+        check (risk_level in ('low', 'medium', 'high', 'critical')),
+
+    constraint chk_approvals_required_approvals_range
+        check (required_approvals in (1, 2)),
+
+    -- Canonical risk_level -> required_approvals mapping, owned in Python
+    -- by core.approval_risk.REQUIRED_APPROVALS_BY_RISK. Enforced here too
+    -- so the database never accepts an internally inconsistent pair,
+    -- independent of whatever Python believes it already validated.
+    constraint chk_approvals_risk_required_approvals_mapping
+        check (
+            (risk_level in ('low', 'medium') and required_approvals = 1)
+            or (risk_level in ('high', 'critical') and required_approvals = 2)
+        ),
+
+    constraint chk_approvals_lifecycle_partially_approved
+        check (
+            status <> 'partially_approved'
+            or (
+                approved_by is null
+                and approved_at is null
+                and rejected_by is null
+                and rejected_at is null
+                and rejection_reason is null
+                and consumed_by is null
+                and consumed_at is null
             )
         ),
 
@@ -389,6 +445,66 @@ comment on column approvals.approved_by is
     'Claimed, not authenticated, reviewer identity. Two-person separation (reviewed_by != requested_by) is enforced only by core.approval_transition.validate_approval_transition using a trimmed Unicode casefold comparison -- PostgreSQL lower() is not equivalent (e.g. it does not fold characters such as German ß the way Python str.casefold() does), so this schema intentionally does not approximate that rule in SQL.';
 comment on column approvals.consumed_by is
     'Claimed, not authenticated, identity of whatever executed the approved action.';
+comment on column approvals.risk_level is
+    'Block 6 deterministic risk classification (core.approval_risk.classify_approval_risk); defaults to medium for legacy Block 5 rows.';
+comment on column approvals.required_approvals is
+    'Number of distinct approve reviews required before this approval may reach approved; defaults to 1 for legacy Block 5 rows.';
+comment on column approvals.requested_by_normalized is
+    'Python-produced requested_by.strip().casefold() value, used only for database-side distinct-reviewer and requester-exclusion enforcement in public.record_approval_review_and_promote_status and public.consume_approval_and_update_investigation_state. Null on legacy Block 5 rows, which use the legacy one-review consumption path instead. Never reproduced with PostgreSQL lower().';
+
+-- ============================================================================
+-- Table: approval_reviews
+-- ----------------------------------------------------------------------------
+-- Block 6: one immutable row per individual reviewer decision (approve or
+-- reject) recorded against one approvals row, supporting risk-based
+-- multi-reviewer requirements. Rows are inserted only by the atomic
+-- public.record_approval_review_and_promote_status function during normal
+-- operation -- this table has no UPDATE path, and no anon/authenticated
+-- policy is defined, matching every other table in this schema's own RLS
+-- convention (RLS enabled, no permissive public-access policy).
+-- ============================================================================
+create table if not exists approval_reviews (
+    id uuid primary key default gen_random_uuid(),
+    approval_id uuid not null
+        references approvals (id) on delete cascade,
+    reviewer_identity text not null,
+    reviewer_identity_normalized text not null,
+    decision text not null,
+    decided_at timestamptz not null,
+    created_at timestamptz not null default now(),
+
+    constraint chk_approval_reviews_reviewer_identity_nonblank
+        check (
+            reviewer_identity = btrim(reviewer_identity)
+            and btrim(reviewer_identity) <> ''
+        ),
+
+    -- reviewer_identity_normalized is a Python-produced
+    -- reviewer_identity.strip().casefold() value -- never reproduced with
+    -- PostgreSQL lower() (see approvals.requested_by_normalized's own
+    -- comment).
+    constraint chk_approval_reviews_reviewer_identity_normalized_nonblank
+        check (
+            reviewer_identity_normalized = btrim(reviewer_identity_normalized)
+            and btrim(reviewer_identity_normalized) <> ''
+        ),
+
+    constraint chk_approval_reviews_decision
+        check (decision in ('approve', 'reject')),
+
+    -- One normalized reviewer identity may appear at most once per
+    -- approval -- the database's own independent distinct-reviewer
+    -- guarantee, never relying on Python alone.
+    constraint uq_approval_reviews_approval_reviewer
+        unique (approval_id, reviewer_identity_normalized)
+);
+
+comment on table approval_reviews is
+    'Immutable per-reviewer decision rows supporting Block 6 risk-based multi-reviewer requirements. Insert-only through public.record_approval_review_and_promote_status; no UPDATE path exists for this table.';
+comment on column approval_reviews.reviewer_identity is
+    'Claimed, not authenticated, reviewer identity, exactly like approvals.approved_by/rejected_by.';
+comment on column approval_reviews.reviewer_identity_normalized is
+    'Python-produced reviewer_identity.strip().casefold() value, used for database-side distinct-reviewer and requester-exclusion enforcement. Never reproduced with PostgreSQL lower().';
 
 -- ============================================================================
 -- Indexes
@@ -416,6 +532,8 @@ create index if not exists idx_retests_created_at on retests (created_at);
 create index if not exists idx_approvals_investigation_id on approvals (investigation_id);
 create index if not exists idx_approvals_status on approvals (status);
 create index if not exists idx_approvals_created_at on approvals (created_at);
+
+create index if not exists idx_approval_reviews_approval_id on approval_reviews (approval_id);
 
 -- ============================================================================
 -- Trigger: auto-update investigations.updated_at
@@ -455,6 +573,294 @@ alter table handoffs enable row level security;
 alter table detection_results enable row level security;
 alter table retests enable row level security;
 alter table approvals enable row level security;
+alter table approval_reviews enable row level security;
+
+-- ============================================================================
+-- Function: record_approval_review_and_promote_status
+-- ----------------------------------------------------------------------------
+-- Block 6: atomically records one immutable reviewer decision (approve or
+-- reject) in approval_reviews and, on approve, promotes the referenced
+-- approvals row's own summary status -- both changes commit together or
+-- neither does. The approval row is locked with SELECT ... FOR UPDATE at
+-- the start of the function and held for the remainder of the
+-- transaction; every guard below is re-verified against that locked row
+-- and its live approval_reviews rows, never trusted from the caller's own
+-- claimed p_expected_* arguments. A zero-row result means any conflict
+-- (missing approval, stale expected state, duplicate reviewer, an
+-- existing rejection, self-review, expiry, or a mismatched expected
+-- outcome) and is returned as zero rows, never a detailed exception, so
+-- the specific cause is never revealed to a caller. This function never
+-- accepts risk_level, action_payload, arbitrary SQL, a table name, or a
+-- column name from the caller. It never authenticates anyone;
+-- p_reviewer_identity/p_reviewer_identity_normalized remain claimed, not
+-- verified, identities, exactly as core.approval_transition already
+-- treats reviewer identities. p_reviewer_identity_normalized is trusted
+-- only insofar as it is compared byte-for-byte against other
+-- already-Python-normalized stored text -- this function never calls
+-- PostgreSQL lower() to reproduce or verify Python casefold() itself.
+-- ============================================================================
+create or replace function public.record_approval_review_and_promote_status(
+    p_approval_id uuid,
+    p_expected_from_status text,
+    p_expected_to_status text,
+    p_expected_required_approvals smallint,
+    p_expected_approval_count_before integer,
+    p_reviewer_identity text,
+    p_reviewer_identity_normalized text,
+    p_decision text,
+    p_decided_at timestamptz,
+    p_rejection_reason text
+)
+returns table (
+    id uuid,
+    investigation_id uuid,
+    action_type text,
+    action_payload jsonb,
+    status text,
+    requested_by text,
+    requested_at timestamptz,
+    expires_at timestamptz,
+    approved_by text,
+    approved_at timestamptz,
+    rejected_by text,
+    rejected_at timestamptz,
+    rejection_reason text,
+    consumed_by text,
+    consumed_at timestamptz,
+    created_at timestamptz,
+    risk_level text,
+    required_approvals smallint,
+    review_approval_id uuid,
+    reviewer_identity text,
+    reviewer_identity_normalized text,
+    review_decision text,
+    review_decided_at timestamptz,
+    approval_count integer
+)
+language plpgsql
+volatile
+security invoker
+as $$
+declare
+    v_approval public.approvals%rowtype;
+    v_approve_count_before integer;
+    v_approve_count_after integer;
+    v_next_status text;
+    v_review_id uuid;
+begin
+    -- Defense in depth only: the Python transition plan already supplies
+    -- canonical, already-trimmed/normalized values and a structurally
+    -- valid envelope.
+    if p_approval_id is null
+        or p_expected_from_status is null
+        or p_expected_to_status is null
+        or p_expected_required_approvals is null
+        or p_expected_approval_count_before is null
+        or p_reviewer_identity is null
+        or btrim(p_reviewer_identity) = ''
+        or p_reviewer_identity <> btrim(p_reviewer_identity)
+        or p_reviewer_identity_normalized is null
+        or btrim(p_reviewer_identity_normalized) = ''
+        or p_reviewer_identity_normalized <> btrim(p_reviewer_identity_normalized)
+        or p_decision is null
+        or p_decided_at is null
+        or p_expected_from_status not in ('pending', 'partially_approved')
+        or p_expected_to_status not in ('partially_approved', 'approved', 'rejected')
+        or p_expected_required_approvals not in (1, 2)
+        or p_decision not in ('approve', 'reject')
+    then
+        return;
+    end if;
+
+    if p_decision = 'reject'
+        and (
+            p_rejection_reason is null
+            or btrim(p_rejection_reason) = ''
+            or p_rejection_reason <> btrim(p_rejection_reason)
+        )
+    then
+        return;
+    end if;
+
+    if p_decision = 'approve' and p_rejection_reason is not null then
+        return;
+    end if;
+
+    -- The only row lock and concurrency boundary: held for the remainder
+    -- of this transaction, exactly like the consumption function's own
+    -- single conditional UPDATE achieves for its own target row.
+    select * into v_approval
+    from public.approvals
+    where public.approvals.id = p_approval_id
+    for update;
+
+    if not found then
+        return;
+    end if;
+
+    if v_approval.status <> p_expected_from_status then
+        return;
+    end if;
+
+    if v_approval.required_approvals <> p_expected_required_approvals then
+        return;
+    end if;
+
+    if not (
+        (v_approval.risk_level in ('low', 'medium') and v_approval.required_approvals = 1)
+        or (v_approval.risk_level in ('high', 'critical') and v_approval.required_approvals = 2)
+    ) then
+        return;
+    end if;
+
+    if v_approval.requested_by_normalized is null then
+        -- This RPC serves the Block 6 risk-aware path only -- a legacy
+        -- Block 5 approval with no stored normalized requester identity
+        -- is never eligible here.
+        return;
+    end if;
+
+    select count(*) into v_approve_count_before
+    from public.approval_reviews
+    where public.approval_reviews.approval_id = p_approval_id
+      and public.approval_reviews.decision = 'approve';
+
+    if v_approve_count_before <> p_expected_approval_count_before then
+        return;
+    end if;
+
+    if exists (
+        select 1 from public.approval_reviews
+        where public.approval_reviews.approval_id = p_approval_id
+          and public.approval_reviews.decision = 'reject'
+    ) then
+        return;
+    end if;
+
+    if exists (
+        select 1 from public.approval_reviews
+        where public.approval_reviews.approval_id = p_approval_id
+          and public.approval_reviews.reviewer_identity_normalized = p_reviewer_identity_normalized
+    ) then
+        return;
+    end if;
+
+    if p_decision = 'approve' then
+        if p_reviewer_identity_normalized = v_approval.requested_by_normalized then
+            return;
+        end if;
+
+        if v_approval.expires_at is not null and p_decided_at >= v_approval.expires_at then
+            return;
+        end if;
+
+        if v_approval.required_approvals = 1 then
+            v_next_status := 'approved';
+        elsif v_approve_count_before = 0 then
+            v_next_status := 'partially_approved';
+        elsif v_approve_count_before = 1 then
+            v_next_status := 'approved';
+        else
+            return;
+        end if;
+    else
+        v_next_status := 'rejected';
+    end if;
+
+    if v_next_status <> p_expected_to_status then
+        return;
+    end if;
+
+    -- The only mutation of approval_reviews anywhere in this schema:
+    -- one immutable insert. No UPDATE path exists for this table.
+    insert into public.approval_reviews (
+        approval_id, reviewer_identity, reviewer_identity_normalized, decision, decided_at
+    ) values (
+        p_approval_id, p_reviewer_identity, p_reviewer_identity_normalized, p_decision, p_decided_at
+    )
+    returning public.approval_reviews.id into v_review_id;
+
+    if p_decision = 'reject' then
+        update public.approvals
+        set
+            status = 'rejected',
+            rejected_by = p_reviewer_identity,
+            rejected_at = p_decided_at,
+            rejection_reason = p_rejection_reason
+        where public.approvals.id = p_approval_id
+        returning public.approvals.* into v_approval;
+    elsif v_next_status = 'partially_approved' then
+        update public.approvals
+        set status = 'partially_approved'
+        where public.approvals.id = p_approval_id
+        returning public.approvals.* into v_approval;
+    else
+        update public.approvals
+        set
+            status = 'approved',
+            approved_by = p_reviewer_identity,
+            approved_at = p_decided_at
+        where public.approvals.id = p_approval_id
+        returning public.approvals.* into v_approval;
+    end if;
+
+    if not found then
+        -- Unreachable in practice (the row is already locked by this same
+        -- transaction), but never insert a review without its matching
+        -- summary update succeeding: roll back the whole transaction,
+        -- including the just-inserted review row, rather than leaving
+        -- them inconsistent.
+        raise exception 'Approval review summary update failed.';
+    end if;
+
+    v_approve_count_after := v_approve_count_before;
+    if p_decision = 'approve' then
+        v_approve_count_after := v_approve_count_before + 1;
+    end if;
+
+    return query
+    select
+        v_approval.id,
+        v_approval.investigation_id,
+        v_approval.action_type,
+        v_approval.action_payload,
+        v_approval.status,
+        v_approval.requested_by,
+        v_approval.requested_at,
+        v_approval.expires_at,
+        v_approval.approved_by,
+        v_approval.approved_at,
+        v_approval.rejected_by,
+        v_approval.rejected_at,
+        v_approval.rejection_reason,
+        v_approval.consumed_by,
+        v_approval.consumed_at,
+        v_approval.created_at,
+        v_approval.risk_level,
+        v_approval.required_approvals,
+        v_approval.id,
+        p_reviewer_identity,
+        p_reviewer_identity_normalized,
+        p_decision,
+        p_decided_at,
+        v_approve_count_after;
+end;
+$$;
+
+comment on function public.record_approval_review_and_promote_status(uuid, text, text, smallint, integer, text, text, text, timestamptz, text) is
+    'Atomically records one immutable reviewer decision in approval_reviews and, on approve, promotes the referenced approvals row''s own summary status -- both changes commit together or neither does.';
+
+revoke execute on function public.record_approval_review_and_promote_status(
+    uuid, text, text, smallint, integer, text, text, text, timestamptz, text
+) from public;
+
+revoke execute on function public.record_approval_review_and_promote_status(
+    uuid, text, text, smallint, integer, text, text, text, timestamptz, text
+) from anon, authenticated;
+
+grant execute on function public.record_approval_review_and_promote_status(
+    uuid, text, text, smallint, integer, text, text, text, timestamptz, text
+) to service_role;
 
 -- ============================================================================
 -- Function: consume_approval_and_update_investigation_state
@@ -473,6 +879,16 @@ alter table approvals enable row level security;
 -- same transaction. It never authenticates anyone; p_consumed_by remains a
 -- claimed, not verified, identity, exactly as core.approval_transition
 -- already treats it.
+--
+-- Block 6: the same conditional UPDATE additionally re-verifies, from the
+-- live row, that the required distinct-approval count for a risk-aware
+-- row (requested_by_normalized is not null) actually exists in
+-- approval_reviews, with no rejection review and no requester-as-reviewer
+-- among the counted approvals -- approved status alone is never
+-- sufficient. A legacy Block 5 row (requested_by_normalized is null)
+-- keeps the original one-review consumption path, and can never satisfy
+-- it with required_approvals = 2. This function's own five parameters
+-- and nineteen-field result contract are unchanged by this addition.
 -- ============================================================================
 create or replace function public.consume_approval_and_update_investigation_state(
     p_approval_id uuid,
@@ -549,6 +965,46 @@ begin
         and public.approvals.action_type = 'update_investigation_state'
         and p_consumed_at >= public.approvals.approved_at
         and (public.approvals.expires_at is null or p_consumed_at < public.approvals.expires_at)
+        -- Block 6 final authorization guard: approved status alone is
+        -- never sufficient for a risk-aware row. When
+        -- requested_by_normalized is set, the required distinct-approval
+        -- count must actually exist in approval_reviews, no rejection
+        -- review may exist, and no counted reviewer may be the requester
+        -- -- approvals.status is never trusted alone. When
+        -- requested_by_normalized is null (a legacy Block 5 row that
+        -- never had review rows), required_approvals must be exactly 1,
+        -- preserving the original Block 5 one-review consumption path
+        -- unchanged; required_approvals = 2 can never use this legacy
+        -- path.
+        and (
+            (
+                public.approvals.requested_by_normalized is null
+                and public.approvals.required_approvals = 1
+            )
+            or (
+                public.approvals.requested_by_normalized is not null
+                and (
+                    (public.approvals.risk_level in ('low', 'medium') and public.approvals.required_approvals = 1)
+                    or (public.approvals.risk_level in ('high', 'critical') and public.approvals.required_approvals = 2)
+                )
+                and (
+                    select count(*) from public.approval_reviews
+                    where public.approval_reviews.approval_id = public.approvals.id
+                      and public.approval_reviews.decision = 'approve'
+                ) >= public.approvals.required_approvals
+                and not exists (
+                    select 1 from public.approval_reviews
+                    where public.approval_reviews.approval_id = public.approvals.id
+                      and public.approval_reviews.decision = 'reject'
+                )
+                and not exists (
+                    select 1 from public.approval_reviews
+                    where public.approval_reviews.approval_id = public.approvals.id
+                      and public.approval_reviews.decision = 'approve'
+                      and public.approval_reviews.reviewer_identity_normalized = public.approvals.requested_by_normalized
+                )
+            )
+        )
     returning public.approvals.* into v_approval;
 
     if not found then

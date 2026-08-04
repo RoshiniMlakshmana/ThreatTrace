@@ -1165,3 +1165,119 @@ def validate_multi_review_transition(
         "review_record": review_record,
         "set_fields": set_fields,
     }
+
+
+def validate_risk_aware_approval_record(record: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate one complete risk-aware approval-record snapshot in isolation.
+
+    This is a thin public wrapper around the same eighteen-field current-
+    record validation `validate_multi_review_transition` itself relies on
+    -- no validation logic is duplicated. `record` must contain exactly
+    the sixteen fields `validate_approval_record` already requires, plus
+    `risk_level` (one of `low`/`medium`/`high`/`critical`) and
+    `required_approvals` (`1` or `2`, consistent with the canonical
+    `core.approval_risk` mapping). `record["status"]` may additionally be
+    `"partially_approved"` -- a transitional status only this function and
+    `validate_multi_review_transition` understand; it is never added to
+    `APPROVAL_STATUSES` or to `validate_approval_record`'s own sixteen-
+    field contract by this function. A `partially_approved` record must
+    have no `approved_by`/`approved_at`/`rejected_by`/`rejected_at`/
+    `rejection_reason`/`consumed_by`/`consumed_at` summary field set,
+    exactly like a `pending` record.
+
+    Returns a new dict containing exactly the same eighteen fields.
+    `record` is never mutated, and no mutable object from it is retained
+    by reference in the result.
+
+    Raises `ApprovalTransitionError` for any structurally invalid input,
+    including an unrecognized type, an unknown or missing field, a
+    malformed UUID or timestamp, an unsupported `risk_level`, a malformed
+    `required_approvals`, an inconsistent `risk_level`/`required_approvals`
+    pair, a non-canonical (padded) stored identity/reason value, or an
+    internally inconsistent lifecycle-field combination for the record's
+    status.
+    """
+    return _validate_multi_review_current_record(record)
+
+
+def validate_approval_review_record(record: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate one complete approval-review record snapshot in isolation,
+    independent of any specific approval or review history.
+
+    `record` must contain exactly `approval_id`, `reviewer_identity`,
+    `reviewer_identity_normalized`, `decision` (`"approve"` or
+    `"reject"`), and `decided_at` -- the same five fields
+    `validate_multi_review_transition`'s own `existing_reviews` entries
+    require. `reviewer_identity` must already be stored trimmed and
+    nonblank; `reviewer_identity_normalized` must exactly equal
+    `reviewer_identity.strip().casefold()` (never PostgreSQL `lower()`,
+    exactly like every other claimed-identity normalization in this
+    module); `decided_at` must be a valid, canonicalizable timestamp.
+
+    Unlike `validate_multi_review_transition`'s own `existing_reviews`
+    validation, this function checks only this one record's own internal
+    structure -- it never compares `approval_id` against any other record,
+    never checks for duplicate reviewers across a list, and never checks
+    for an incompatible existing rejection, since none of those concerns
+    exist for a single record validated in isolation.
+
+    Returns a new dict containing exactly the same five fields, with
+    `reviewer_identity` trimmed and `decided_at` canonicalized to UTC `Z`
+    form. `record` is never mutated, and no mutable object from it is
+    retained by reference in the result.
+
+    Raises `ApprovalTransitionError` for any structurally invalid input,
+    including an unrecognized type, an unknown or missing field, a
+    malformed UUID, a blank or non-trimmed `reviewer_identity`, a
+    `reviewer_identity_normalized` that does not equal
+    `reviewer_identity.strip().casefold()`, an unsupported `decision`, or
+    a malformed `decided_at`.
+    """
+    if not isinstance(record, Mapping):
+        raise ApprovalTransitionError("record must be a mapping")
+
+    unknown_fields = set(record) - _REVIEW_SUMMARY_FIELDS_SET
+    if unknown_fields:
+        raise ApprovalTransitionError(
+            "unrecognized field(s): " + ", ".join(sorted(unknown_fields))
+        )
+
+    missing_fields = [field for field in _REVIEW_SUMMARY_FIELDS if field not in record]
+    if missing_fields:
+        raise ApprovalTransitionError(
+            "missing required field(s): " + ", ".join(missing_fields)
+        )
+
+    approval_id = _validate_uuid_string(record["approval_id"], "approval_id")
+
+    reviewer_identity_value = record["reviewer_identity"]
+    if not isinstance(reviewer_identity_value, str):
+        raise ApprovalTransitionError("reviewer_identity must be a string")
+    stripped_identity = reviewer_identity_value.strip()
+    if not stripped_identity:
+        raise ApprovalTransitionError("reviewer_identity must not be blank")
+    if reviewer_identity_value != stripped_identity:
+        raise ApprovalTransitionError("reviewer_identity must already be stored in trimmed form")
+
+    normalized_value = record["reviewer_identity_normalized"]
+    expected_normalized = reviewer_identity_value.strip().casefold()
+    if normalized_value != expected_normalized:
+        raise ApprovalTransitionError(
+            "reviewer_identity_normalized must equal reviewer_identity.strip().casefold()"
+        )
+
+    decision_value = record["decision"]
+    if decision_value not in _REVIEW_DECISIONS:
+        raise ApprovalTransitionError(
+            f"decision must be one of {sorted(_REVIEW_DECISIONS)}, got {decision_value!r}"
+        )
+
+    decided_at = _normalize_timestamp(record["decided_at"], "decided_at")
+
+    return {
+        "approval_id": approval_id,
+        "reviewer_identity": stripped_identity,
+        "reviewer_identity_normalized": normalized_value,
+        "decision": decision_value,
+        "decided_at": decided_at,
+    }

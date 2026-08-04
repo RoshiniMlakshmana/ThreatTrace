@@ -19,7 +19,11 @@ from core.approval_transition import APPROVAL_STATUSES
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCHEMA_PATH = REPO_ROOT / "supabase" / "schema.sql"
 
-EXPECTED_COLUMN_ORDER = (
+# Block 5's own original sixteen-field order, preserved unchanged and
+# still used by name below -- Block 6 appended exactly three additive
+# columns (risk_level, required_approvals, requested_by_normalized) after
+# created_at, never reordering or removing any of the original sixteen.
+EXPECTED_BLOCK5_COLUMN_ORDER = (
     "id",
     "investigation_id",
     "action_type",
@@ -38,7 +42,19 @@ EXPECTED_COLUMN_ORDER = (
     "created_at",
 )
 
-EXPECTED_CONSTRAINT_NAMES = (
+# Block 6, Step 4: three additive risk-metadata columns, appended after
+# the original sixteen, in their exact schema order.
+EXPECTED_BLOCK6_COLUMN_ORDER = (
+    "risk_level",
+    "required_approvals",
+    "requested_by_normalized",
+)
+
+EXPECTED_COLUMN_ORDER = EXPECTED_BLOCK5_COLUMN_ORDER + EXPECTED_BLOCK6_COLUMN_ORDER
+
+# Block 5's own original eighteen named constraints, preserved unchanged
+# and still used by name below.
+EXPECTED_BLOCK5_CONSTRAINT_NAMES = (
     "chk_approvals_status",
     "chk_approvals_action_type",
     "chk_approvals_action_payload_object",
@@ -58,6 +74,22 @@ EXPECTED_CONSTRAINT_NAMES = (
     "chk_approvals_approved_before_expires",
     "chk_approvals_consumed_before_expires",
 )
+
+# Block 6, Step 4: five additive named constraints -- one nonblank/trimmed
+# check for requested_by_normalized, the risk_level vocabulary check, the
+# required_approvals range check, the canonical risk/required-approvals
+# mapping check, and the partially_approved lifecycle-shape check.
+EXPECTED_BLOCK6_CONSTRAINT_NAMES = (
+    "chk_approvals_requested_by_normalized_nonblank",
+    "chk_approvals_risk_level",
+    "chk_approvals_required_approvals_range",
+    "chk_approvals_risk_required_approvals_mapping",
+    "chk_approvals_lifecycle_partially_approved",
+)
+
+EXPECTED_CONSTRAINT_NAMES = EXPECTED_BLOCK5_CONSTRAINT_NAMES + EXPECTED_BLOCK6_CONSTRAINT_NAMES
+
+DATABASE_STATUS_VOCABULARY = set(APPROVAL_STATUSES) | {"partially_approved"}
 
 EXISTING_TABLE_NAMES = (
     "investigations",
@@ -90,8 +122,18 @@ def _find_table_start(schema_text, table_name):
 def _extract_table_block(schema_text, table_name):
     """Return the exact column/constraint body of one CREATE TABLE
     statement, using balanced-parenthesis tracking that correctly skips
-    over nested constraint parentheses and single-quoted SQL string
-    literals (including doubled '' escapes)."""
+    over nested constraint parentheses, single-quoted SQL string literals
+    (including doubled '' escapes), and `-- ...` line comments.
+
+    Comment-skipping happens before quote-tracking (mirroring
+    _strip_line_comments's own precedence) specifically so a comment
+    containing an ordinary English possessive apostrophe (e.g. "the
+    approved_by column's own comment") can never be misread as opening a
+    SQL string literal and desynchronizing paren-depth tracking for the
+    rest of the table body. The returned substring still contains the
+    original comment text unchanged -- only the scanner's own
+    interpretation of what it sees is comment-aware, not the output.
+    """
     start_search_pos = _find_table_start(schema_text, table_name)
     open_paren_index = schema_text.find("(", start_search_pos)
     assert open_paren_index != -1, f"no opening parenthesis found for table {table_name}"
@@ -110,6 +152,13 @@ def _extract_table_block(schema_text, table_name):
                     continue
                 in_string = False
             index += 1
+            continue
+
+        if char == "-" and index + 1 < length and schema_text[index + 1] == "-":
+            newline_index = schema_text.find("\n", index)
+            if newline_index == -1:
+                break
+            index = newline_index + 1
             continue
 
         if char == "'":
@@ -347,13 +396,22 @@ def test_004_table_block_is_syntactically_closed():
 
 
 def test_005_exactly_sixteen_column_entries():
+    # Name retained from Block 5 (this test is never renamed) -- the
+    # table now legitimately carries nineteen columns: Block 5's original
+    # sixteen (EXPECTED_BLOCK5_COLUMN_ORDER) plus Block 6's three
+    # additive risk-metadata columns (EXPECTED_BLOCK6_COLUMN_ORDER).
     columns, _constraints = _approvals_columns_and_constraints()
-    assert len(columns) == 16
+    assert len(columns) == len(EXPECTED_BLOCK5_COLUMN_ORDER) + len(EXPECTED_BLOCK6_COLUMN_ORDER)
+    assert len(columns) == 19
 
 
 def test_006_exactly_eighteen_named_constraint_entries():
+    # Name retained from Block 5 -- the table now legitimately carries
+    # twenty-three named constraints: Block 5's original eighteen plus
+    # Block 6's five additive risk/partially_approved constraints.
     _columns, constraints = _approvals_columns_and_constraints()
-    assert len(constraints) == 18
+    assert len(constraints) == len(EXPECTED_BLOCK5_CONSTRAINT_NAMES) + len(EXPECTED_BLOCK6_CONSTRAINT_NAMES)
+    assert len(constraints) == 23
 
 
 def test_007_no_unexpected_top_level_table_entry():
@@ -562,6 +620,8 @@ def test_038_no_approval_version_column():
 # ---------------------------------------------------------------------------
 
 def test_039_constraint_name_set_equals_exact_eighteen():
+    # Name retained from Block 5 -- EXPECTED_CONSTRAINT_NAMES itself now
+    # legitimately combines Block 5's eighteen with Block 6's five.
     _columns, constraints = _approvals_columns_and_constraints()
     names = {_constraint_name(item) for item in constraints}
     assert names == set(EXPECTED_CONSTRAINT_NAMES)
@@ -599,9 +659,17 @@ def test_043_parse_status_vocabulary():
 
 
 def test_044_sql_status_values_equal_python_approval_statuses():
+    # Block 6, Step 4B: the database status vocabulary intentionally
+    # diverges from core.approval_transition.APPROVAL_STATUSES by exactly
+    # one value, "partially_approved" -- a transitional status the
+    # database must accept for multi-review storage, deliberately never
+    # added to the original Block 5 Python validator/vocabulary (that
+    # remains this additive risk-aware validator's own concern instead,
+    # per DATABASE_STATUS_VOCABULARY = APPROVAL_STATUSES | {"partially_approved"}).
     constraint_text = _constraint_map()["chk_approvals_status"]
     values = set(_quoted_values(constraint_text))
-    assert values == set(APPROVAL_STATUSES)
+    assert values == DATABASE_STATUS_VOCABULARY
+    assert values == set(APPROVAL_STATUSES) | {"partially_approved"}
 
 
 def test_045_completed_absent_from_status_vocabulary():
@@ -1151,6 +1219,432 @@ def test_120_no_decision_analysis_table_was_added():
 def test_121_no_approval_events_table_was_added():
     schema_text = _schema_text()
     assert not re.search(r"create\s+table\s+if\s+not\s+exists\s+approval_events", schema_text, re.IGNORECASE)
+
+
+# ---------------------------------------------------------------------------
+# Block 6, Step 4: risk-aware columns, approval_reviews, and the two RPCs
+# (static source inspection only -- no SQL is ever executed).
+# ---------------------------------------------------------------------------
+
+def _approval_reviews_body():
+    return _strip_line_comments(_extract_table_block(_schema_text(), "approval_reviews"))
+
+
+def _approval_reviews_columns_and_constraints():
+    return _classify_items(_split_top_level(_approval_reviews_body()))
+
+
+def _approval_reviews_constraint_map():
+    _columns, constraints = _approval_reviews_columns_and_constraints()
+    return {_constraint_name(item): item for item in constraints}
+
+
+def _approval_reviews_column_text_by_name():
+    columns, _constraints = _approval_reviews_columns_and_constraints()
+    return {_column_name(item): item for item in columns}
+
+
+def _function_declaration_parts(schema_text, function_name):
+    """Return (parameter_list_text, returns_table_column_names, body_text)
+    for one `create or replace function public.<function_name>(...)
+    returns table (...) ... as $$ ... $$` statement, using the same
+    balanced-parenthesis scanning style as _extract_table_block (no
+    third-party SQL parser)."""
+    pattern = re.compile(
+        r"create\s+or\s+replace\s+function\s+public\." + re.escape(function_name) + r"\s*\(",
+        re.IGNORECASE,
+    )
+    match = pattern.search(schema_text)
+    assert match is not None, f"could not locate function {function_name} in schema.sql"
+    index = match.end() - 1
+    length = len(schema_text)
+
+    def _scan_balanced(start_index):
+        depth = 1
+        pos = start_index + 1
+        while pos < length:
+            char = schema_text[pos]
+            if char == "(":
+                depth += 1
+            elif char == ")":
+                depth -= 1
+                if depth == 0:
+                    return pos
+            pos += 1
+        raise AssertionError(f"unbalanced parentheses while scanning {function_name}")
+
+    param_close = _scan_balanced(index)
+    parameter_text = schema_text[index + 1 : param_close]
+
+    returns_match = re.compile(r"returns\s+table\s*\(", re.IGNORECASE).search(schema_text, param_close)
+    assert returns_match is not None, f"no RETURNS TABLE clause found for {function_name}"
+    returns_open = returns_match.end() - 1
+    returns_close = _scan_balanced(returns_open)
+    returns_text = schema_text[returns_open + 1 : returns_close]
+    returns_columns = [entry.strip().split()[0] for entry in returns_text.split(",") if entry.strip()]
+
+    first_dollar = schema_text.index("$$", returns_close)
+    second_dollar = schema_text.index("$$", first_dollar + 2)
+    body_text = schema_text[first_dollar + 2 : second_dollar]
+
+    return parameter_text, returns_columns, body_text
+
+
+def _parse_parameter_list(parameter_text):
+    """Return an ordered list of (name, type) pairs from a function
+    parameter-list text. Neither RPC's parameter list contains nested
+    parentheses, defaults, or string literals, so a simple comma split
+    is sufficient here (unlike the table-body splitter above)."""
+    entries = [entry.strip() for entry in parameter_text.split(",") if entry.strip()]
+    parsed = []
+    for entry in entries:
+        tokens = entry.split()
+        parsed.append((tokens[0], " ".join(tokens[1:])))
+    return parsed
+
+
+def _privilege_statements_for_function(schema_text, function_name):
+    """Return (verb, preposition, role_list_text) for every
+    REVOKE/GRANT EXECUTE ... ON FUNCTION public.<function_name>(...) ...
+    statement in the schema."""
+    pattern = re.compile(
+        r"(revoke|grant)\s+execute\s+on\s+function\s+public\." + re.escape(function_name)
+        + r"\s*\([^)]*\)\s*(from|to)\s+([^;]+);",
+        re.IGNORECASE | re.DOTALL,
+    )
+    return [
+        (m.group(1).lower(), m.group(2).lower(), m.group(3).strip())
+        for m in pattern.finditer(schema_text)
+    ]
+
+
+def _revoked_and_granted_roles(schema_text, function_name):
+    privileges = _privilege_statements_for_function(schema_text, function_name)
+    revoked_from = {
+        role.strip() for verb, _prep, roles in privileges if verb == "revoke" for role in roles.split(",")
+    }
+    granted_to = {
+        role.strip() for verb, _prep, roles in privileges if verb == "grant" for role in roles.split(",")
+    }
+    return revoked_from, granted_to
+
+
+def _normalized_function_body(schema_text, function_name):
+    _params, _returns, body_text = _function_declaration_parts(schema_text, function_name)
+    return _normalize_sql(_strip_line_comments(body_text)).lower()
+
+
+def test_block6_001_risk_columns_and_defaults():
+    columns = _column_text_by_name()
+
+    risk_level_text = columns["risk_level"].lower()
+    assert risk_level_text.startswith("risk_level text")
+    assert "not null" in risk_level_text
+    assert "default 'medium'" in risk_level_text
+
+    required_approvals_text = columns["required_approvals"].lower()
+    assert required_approvals_text.startswith("required_approvals smallint")
+    assert "not null" in required_approvals_text
+    assert "default 1" in required_approvals_text
+
+    # requested_by_normalized is the legacy-compatibility column: nullable,
+    # and -- unlike risk_level/required_approvals -- carries no default at
+    # all, so an existing Block 5 row inserted with no knowledge of this
+    # column stays exactly null rather than silently gaining a fabricated
+    # value.
+    normalized_text = columns["requested_by_normalized"].lower()
+    assert normalized_text.startswith("requested_by_normalized text")
+    assert "not null" not in normalized_text
+    assert "default" not in normalized_text
+
+
+def test_block6_002_exact_risk_required_approvals_mapping():
+    risk_level_text = _constraint_map()["chk_approvals_risk_level"].lower()
+    risk_values = set(_quoted_values(risk_level_text))
+    assert risk_values == {"low", "medium", "high", "critical"}
+
+    required_range_text = _constraint_map()["chk_approvals_required_approvals_range"].lower()
+    assert "required_approvals in (1, 2)" in required_range_text
+
+    # The mapping itself must be one joint constraint referencing both
+    # columns together -- never two independent per-column checks that
+    # could be satisfied by an inconsistent pair (e.g. risk_level='low'
+    # with required_approvals=2).
+    mapping_text = _constraint_map()["chk_approvals_risk_required_approvals_mapping"].lower()
+    assert "risk_level" in mapping_text and "required_approvals" in mapping_text
+    assert "'low', 'medium'" in mapping_text or "'low','medium'" in mapping_text.replace(" ", "")
+    assert "required_approvals = 1" in mapping_text
+    assert "'high', 'critical'" in mapping_text or "'high','critical'" in mapping_text.replace(" ", "")
+    assert "required_approvals = 2" in mapping_text
+
+
+def test_block6_003_requested_by_normalized_compatibility_and_validation():
+    nonblank_text = _constraint_map()["chk_approvals_requested_by_normalized_nonblank"].lower()
+    assert "requested_by_normalized is null" in nonblank_text
+    assert "requested_by_normalized = btrim(requested_by_normalized)" in nonblank_text
+    assert "btrim(requested_by_normalized) <> ''" in nonblank_text
+
+    schema_text = _schema_text()
+    # No PostgreSQL lower() is ever used to derive or compare the
+    # Python-produced casefold value, and no backfill UPDATE populates it
+    # with lower() anywhere in the schema.
+    assert "lower(requested_by_normalized)" not in schema_text.lower()
+    assert "lower(requested_by)" not in schema_text.lower()
+    assert not re.search(r"update\s+[^;]*requested_by_normalized\s*=\s*lower\(", schema_text, re.IGNORECASE | re.DOTALL)
+    assert not re.search(r"update\s+public\.approvals\s+set\s+requested_by_normalized", schema_text, re.IGNORECASE | re.DOTALL)
+
+
+def test_block6_004_exact_database_status_vocabulary():
+    constraint_text = _constraint_map()["chk_approvals_status"]
+    values = set(_quoted_values(constraint_text))
+    assert values == {"pending", "partially_approved", "approved", "rejected", "consumed"}
+    assert len(values) == 5
+    # The original Block 5 Python validator's own vocabulary is
+    # deliberately not required to accept partially_approved -- only the
+    # database constraint is.
+    assert values == set(APPROVAL_STATUSES) | {"partially_approved"}
+
+
+def test_block6_005_approval_reviews_table_contract():
+    columns = _approval_reviews_column_text_by_name()
+
+    id_text = columns["id"].lower()
+    assert "uuid" in id_text and "primary key" in id_text and "gen_random_uuid()" in id_text
+
+    approval_id_text = columns["approval_id"].lower()
+    assert approval_id_text.startswith("approval_id uuid")
+    assert "not null" in approval_id_text
+    assert "references approvals (id)" in approval_id_text or "references approvals(id)" in approval_id_text
+
+    for field in ("reviewer_identity", "reviewer_identity_normalized", "decision"):
+        text = columns[field].lower()
+        assert text.startswith(f"{field} text")
+        assert "not null" in text
+
+    decided_at_text = columns["decided_at"].lower()
+    assert decided_at_text.startswith("decided_at timestamptz")
+    assert "not null" in decided_at_text
+
+    created_at_text = columns["created_at"].lower()
+    assert created_at_text.startswith("created_at timestamptz")
+    assert "not null" in created_at_text
+    assert "default now()" in created_at_text
+
+    constraint_map = _approval_reviews_constraint_map()
+
+    reviewer_nonblank = constraint_map["chk_approval_reviews_reviewer_identity_nonblank"].lower()
+    assert "btrim(reviewer_identity)" in reviewer_nonblank
+    assert "<> ''" in reviewer_nonblank
+
+    normalized_nonblank = constraint_map["chk_approval_reviews_reviewer_identity_normalized_nonblank"].lower()
+    assert "reviewer_identity_normalized = btrim(reviewer_identity_normalized)" in normalized_nonblank
+    assert "<> ''" in normalized_nonblank
+
+    decision_text = constraint_map["chk_approval_reviews_decision"].lower()
+    assert set(_quoted_values(decision_text)) == {"approve", "reject"}
+
+    schema_text = _schema_text()
+    assert re.search(
+        r"create\s+index\s+if\s+not\s+exists\s+idx_approval_reviews_approval_id\s+on\s+approval_reviews\s*\(\s*approval_id\s*\)",
+        schema_text,
+        re.IGNORECASE,
+    )
+
+    uniqueness_text = constraint_map["uq_approval_reviews_approval_reviewer"].lower()
+    assert "unique" in uniqueness_text
+    assert "approval_id" in uniqueness_text
+    assert "reviewer_identity_normalized" in uniqueness_text
+
+
+def test_block6_006_approval_reviews_rls_and_privileges():
+    schema_text = _schema_text()
+
+    assert re.search(
+        r"alter\s+table\s+approval_reviews\s+enable\s+row\s+level\s+security", schema_text, re.IGNORECASE
+    )
+    # No anon/authenticated policy exists for this table, exactly like
+    # every other table in this schema -- RLS enabled, no permissive
+    # policy, matching the established project-wide convention.
+    assert not re.search(r"create\s+policy\s+\S*\s+on\s+approval_reviews\b", schema_text, re.IGNORECASE)
+    assert not re.search(r"grant\s+.*\bapproval_reviews\b", schema_text, re.IGNORECASE)
+    # No UPDATE path exists for this table anywhere in the schema --
+    # rows are inserted only, through the atomic review RPC.
+    assert not re.search(r"update\s+(public\.)?approval_reviews\b", schema_text, re.IGNORECASE)
+    # The table owner's own default privileges are never revoked --
+    # only anon/authenticated/PUBLIC lack a policy or grant.
+    assert not re.search(r"revoke\s+.*\bapproval_reviews\b", schema_text, re.IGNORECASE)
+
+
+def test_block6_007_review_rpc_signature_and_hardening():
+    schema_text = _schema_text()
+    function_name = "record_approval_review_and_promote_status"
+    parameter_text, _returns, body_text = _function_declaration_parts(schema_text, function_name)
+    parameters = _parse_parameter_list(parameter_text)
+
+    assert [name for name, _type in parameters] == [
+        "p_approval_id", "p_expected_from_status", "p_expected_to_status",
+        "p_expected_required_approvals", "p_expected_approval_count_before",
+        "p_reviewer_identity", "p_reviewer_identity_normalized", "p_decision",
+        "p_decided_at", "p_rejection_reason",
+    ]
+    expected_types = {
+        "p_approval_id": "uuid",
+        "p_expected_from_status": "text",
+        "p_expected_to_status": "text",
+        "p_expected_required_approvals": "smallint",
+        "p_expected_approval_count_before": "integer",
+        "p_reviewer_identity": "text",
+        "p_reviewer_identity_normalized": "text",
+        "p_decision": "text",
+        "p_decided_at": "timestamptz",
+        "p_rejection_reason": "text",
+    }
+    for name, type_text in parameters:
+        assert type_text.lower() == expected_types[name]
+
+    declaration_start = schema_text.index(f"create or replace function public.{function_name}")
+    header_text = schema_text[declaration_start : schema_text.index("as $$", declaration_start)].lower()
+    assert "security invoker" in header_text
+    assert "volatile" in header_text
+    assert "language plpgsql" in header_text
+
+    normalized_body = _normalize_sql(_strip_line_comments(body_text)).lower()
+    assert "execute" not in normalized_body
+    assert "format(" not in normalized_body
+
+    revoked_from, granted_to = _revoked_and_granted_roles(schema_text, function_name)
+    assert "public" in revoked_from
+    assert "anon" in revoked_from
+    assert "authenticated" in revoked_from
+    assert "service_role" in granted_to
+
+
+def test_block6_008_review_rpc_lifecycle_enforcement():
+    schema_text = _schema_text()
+    normalized_body = _normalized_function_body(schema_text, "record_approval_review_and_promote_status")
+
+    # Approval-row locking is the sole concurrency boundary.
+    assert "for update" in normalized_body
+
+    # Expected from-status, required-approval count, and live approve count.
+    assert "p_expected_from_status not in ('pending', 'partially_approved')" in normalized_body
+    assert "v_approval.status <> p_expected_from_status" in normalized_body
+    assert "v_approval.required_approvals <> p_expected_required_approvals" in normalized_body
+    assert "count(*)" in normalized_body
+    assert "v_approve_count_before <> p_expected_approval_count_before" in normalized_body
+
+    # Duplicate normalized-reviewer rejection.
+    assert "reviewer_identity_normalized = p_reviewer_identity_normalized" in normalized_body
+
+    # Requester exclusion, approve-only.
+    assert "p_reviewer_identity_normalized = v_approval.requested_by_normalized" in normalized_body
+
+    # Status derivation: one-review path, and both steps of the
+    # two-review path.
+    assert "v_approval.required_approvals = 1" in normalized_body
+    assert "v_approve_count_before = 0" in normalized_body
+    assert "v_approve_count_before = 1" in normalized_body
+    assert "'partially_approved'" in normalized_body
+    assert "'approved'" in normalized_body
+
+    # Rejection reason required; expiry strictly blocks approve only.
+    assert "p_rejection_reason is null" in normalized_body
+    assert "p_decided_at >= v_approval.expires_at" in normalized_body
+
+    # Rejection is never expiry-checked: the reject branch itself
+    # (between its own "else" and the enclosing "end if;") contains no
+    # reference to expires_at at all.
+    reject_branch_match = re.search(r"else\s+v_next_status\s*:=\s*'rejected';\s*end\s+if;", normalized_body)
+    assert reject_branch_match is not None
+    assert "expires_at" not in reject_branch_match.group(0)
+
+    # Atomic review insertion happens before the approval-summary update.
+    assert "insert into public.approval_reviews" in normalized_body
+    assert "update public.approvals" in normalized_body
+    assert normalized_body.index("insert into public.approval_reviews") < normalized_body.index("update public.approvals")
+
+    # Multiple independent zero-row/conflict exit points exist -- stale
+    # or ineligible input is never surfaced as a raised exception.
+    assert normalized_body.count("return;") >= 5
+
+
+def test_block6_009_consumption_rpc_risk_aware_guard_and_compatibility():
+    schema_text = _schema_text()
+    function_name = "consume_approval_and_update_investigation_state"
+    parameter_text, returns_columns, body_text = _function_declaration_parts(schema_text, function_name)
+    parameters = _parse_parameter_list(parameter_text)
+
+    assert [name for name, _type in parameters] == [
+        "p_approval_id", "p_expected_investigation_id", "p_expected_action_type", "p_consumed_by", "p_consumed_at",
+    ]
+    assert len(returns_columns) == 19
+
+    normalized_body = _normalize_sql(_strip_line_comments(body_text)).lower()
+
+    # Risk-aware path: canonical mapping, live distinct-approval count,
+    # no rejection review, no self-approving requester.
+    assert "requested_by_normalized is not null" in normalized_body
+    assert "select count(*) from public.approval_reviews" in normalized_body
+    assert ">= public.approvals.required_approvals" in normalized_body
+    assert "decision = 'reject'" in normalized_body
+    assert "reviewer_identity_normalized = public.approvals.requested_by_normalized" in normalized_body
+    assert "status = 'approved'" in normalized_body
+
+    # Existing Block 5 guards remain present, unchanged.
+    assert "consumed_by is null" in normalized_body
+    assert "consumed_at is null" in normalized_body
+    assert "expires_at is null or p_consumed_at < public.approvals.expires_at" in normalized_body
+
+    # partially_approved can never satisfy this WHERE clause -- the only
+    # status value ever compared against is 'approved'.
+    assert "status = 'partially_approved'" not in normalized_body
+
+    # required_approvals = 2 can never take the legacy (null-normalized)
+    # branch: that branch explicitly pins required_approvals = 1.
+    legacy_branch_match = re.search(
+        r"\(\s*public\.approvals\.requested_by_normalized is null\s+and\s+public\.approvals\.required_approvals = 1\s*\)",
+        normalized_body,
+    )
+    assert legacy_branch_match is not None
+
+
+def test_block6_010_legacy_compatibility_and_static_sql_safety():
+    schema_text = _schema_text()
+    consume_function_name = "consume_approval_and_update_investigation_state"
+    review_function_name = "record_approval_review_and_promote_status"
+
+    normalized_consume_body = _normalized_function_body(schema_text, consume_function_name)
+
+    # Legacy path requirements: approved status, approved_by/approved_at
+    # present (both already required unconditionally by the existing
+    # Block 5 WHERE clause, never conditioned on requested_by_normalized).
+    assert "status = 'approved'" in normalized_consume_body
+    assert "approved_by is not null" in normalized_consume_body
+    assert "approved_at is not null" in normalized_consume_body
+
+    # Existing Block 5 stored-action binding and atomic investigation
+    # update remain present, unchanged.
+    assert "update public.investigations" in normalized_consume_body
+    assert "v_approval.action_payload" in normalized_consume_body
+    assert "'update_investigation_state'" in normalized_consume_body
+
+    # Nineteen-field result contract unchanged.
+    _params, consume_returns, _body = _function_declaration_parts(schema_text, consume_function_name)
+    assert len(consume_returns) == 19
+
+    # No dynamic SQL or caller-supplied identifier execution in either RPC.
+    for function_name in (consume_function_name, review_function_name):
+        normalized_body = _normalized_function_body(schema_text, function_name)
+        assert "execute" not in normalized_body
+        assert "format(" not in normalized_body
+
+    # Hardened privilege statements remain present for both RPCs.
+    for function_name in (consume_function_name, review_function_name):
+        revoked_from, granted_to = _revoked_and_granted_roles(schema_text, function_name)
+        assert "public" in revoked_from
+        assert "anon" in revoked_from
+        assert "authenticated" in revoked_from
+        assert "service_role" in granted_to
 
 
 # ---------------------------------------------------------------------------

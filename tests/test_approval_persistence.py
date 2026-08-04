@@ -39,14 +39,19 @@ from core.approval_persistence import (
     ApprovalTransportError,
     apply_approval_consumption,
     apply_approval_review_transition,
+    apply_multi_review_transition,
     insert_pending_approval,
+    insert_risk_aware_pending_approval,
     load_approval_record,
+    load_approval_reviews,
+    load_risk_aware_approval_record,
 )
 from core.approval_request import ApprovalRequestError
 from core.approval_transition import (
     ApprovalTransitionError,
     validate_approval_record,
     validate_approval_transition,
+    validate_multi_review_transition,
 )
 
 APPROVAL_ID = "51111111-1111-4111-8111-111111111111"
@@ -1915,6 +1920,9 @@ def test_review_no_rpc_or_consume_operation_descriptor_exists():
 
 
 def test_review_no_investigation_table_descriptor_exists_after_expansion():
+    # The module now legitimately builds descriptors against a second
+    # table, approval_reviews (Block 6's load_approval_reviews) -- never
+    # against investigations, which remains the real assertion here.
     tree = _module_ast()
     table_values = set()
     for node in ast.walk(tree):
@@ -1926,7 +1934,8 @@ def test_review_no_investigation_table_descriptor_exists_after_expansion():
                     and isinstance(value_node, ast.Constant)
                 ):
                     table_values.add(value_node.value)
-    assert table_values == {"approvals"}
+    assert table_values == {"approvals", "approval_reviews"}
+    assert "investigations" not in table_values
 
 
 def test_review_forged_approve_plan_fails():
@@ -2325,6 +2334,9 @@ def test_review_no_consume_descriptor_ever_built():
 
 
 def test_review_no_investigation_table_descriptor():
+    # The module now legitimately builds descriptors against a second
+    # table, approval_reviews (Block 6's load_approval_reviews) -- never
+    # against investigations, which remains the real assertion here.
     tree = _module_ast()
     table_values = set()
     for node in ast.walk(tree):
@@ -2336,7 +2348,8 @@ def test_review_no_investigation_table_descriptor():
                     and isinstance(value_node, ast.Constant)
                 ):
                     table_values.add(value_node.value)
-    assert table_values == {"approvals"}
+    assert table_values == {"approvals", "approval_reviews"}
+    assert "investigations" not in table_values
 
 
 def test_review_no_transaction_or_rpc_keyword():
@@ -4292,9 +4305,14 @@ def test_consume_no_database_connection_or_client_creation():
 
 
 def test_consume_only_one_rpc_operation_descriptor_exists():
+    # Scoped to apply_approval_consumption's own function body -- the
+    # module as a whole now legitimately contains a second, distinct rpc
+    # descriptor inside apply_multi_review_transition (Block 6), which is
+    # a wholly separate function.
     tree = _module_ast()
+    fn = _function_def(tree, "apply_approval_consumption")
     operation_values = []
-    for node in ast.walk(tree):
+    for node in ast.walk(fn):
         if isinstance(node, ast.Dict):
             for key_node, value_node in zip(node.keys, node.values):
                 if (
@@ -4457,6 +4475,291 @@ def test_persistence_regression_006_sorted_consume_plan_incorrect_key_rejected()
     with pytest.raises(ApprovalPersistenceError):
         apply_approval_consumption(executor, record, tampered)
     assert executor.calls == []
+
+
+# ---------------------------------------------------------------------------
+# Block 6, Step 4: risk-aware persistence operations
+# ---------------------------------------------------------------------------
+
+
+def _risk_aware_pending_row(**overrides):
+    row = _pending_row(risk_level="high", required_approvals=2, expires_at=None)
+    row.update(overrides)
+    return row
+
+
+def _multi_review_rpc_row_for(record, plan, *, approval_count_override=None):
+    approval_row = _apply_set_fields(record, plan["set_fields"])
+    row = {
+        key: approval_row[key]
+        for key in (
+            "id", "investigation_id", "action_type", "action_payload", "status", "requested_by",
+            "requested_at", "expires_at", "approved_by", "approved_at", "rejected_by", "rejected_at",
+            "rejection_reason", "consumed_by", "consumed_at", "created_at", "risk_level", "required_approvals",
+        )
+    }
+    review_record = plan["review_record"]
+    row.update({
+        "review_approval_id": review_record["approval_id"],
+        "reviewer_identity": review_record["reviewer_identity"],
+        "reviewer_identity_normalized": review_record["reviewer_identity_normalized"],
+        "review_decision": review_record["decision"],
+        "review_decided_at": review_record["decided_at"],
+        "approval_count": (
+            approval_count_override if approval_count_override is not None else plan["approval_count_after"]
+        ),
+    })
+    return row
+
+
+def _multi_review_executor_for(record, plan, *, row_override=None):
+    response = row_override if row_override is not None else [_multi_review_rpc_row_for(record, plan)]
+    return _RecordingExecutor(response=response)
+
+
+def test_multi_review_insert_derives_risk_and_normalized_requester():
+    request = {
+        "investigation_id": INVESTIGATION_ID,
+        "action_type": "update_investigation_state",
+        "action_payload": {"status": "closed"},
+        "requested_by": "Roshini Analyst",
+        "requested_at": REQUESTED_AT,
+    }
+    current_investigation = {"status": "investigating", "confidence": "medium"}
+    inserted_row = {
+        "id": APPROVAL_ID,
+        "investigation_id": INVESTIGATION_ID,
+        "action_type": "update_investigation_state",
+        "action_payload": {"status": "closed"},
+        "requested_by": "Roshini Analyst",
+        "requested_at": REQUESTED_AT,
+        "status": "pending",
+        "approved_by": None,
+        "approved_at": None,
+        "rejected_by": None,
+        "rejected_at": None,
+        "rejection_reason": None,
+        "expires_at": None,
+        "consumed_by": None,
+        "consumed_at": None,
+        "created_at": REQUESTED_AT,
+        "risk_level": "high",
+        "required_approvals": 2,
+    }
+    executor = _RecordingExecutor(response=[inserted_row])
+
+    result = insert_risk_aware_pending_approval(executor, request, current_investigation)
+
+    assert result["risk_level"] == "high"
+    assert result["required_approvals"] == 2
+    assert "requested_by_normalized" not in result
+    sent_values = executor.calls[0]["values"]
+    assert sent_values["requested_by_normalized"] == "roshini analyst"
+    assert sent_values["risk_level"] == "high"
+    assert sent_values["required_approvals"] == 2
+
+
+def test_multi_review_insert_caller_forged_risk_rejected():
+    request = {
+        "investigation_id": INVESTIGATION_ID,
+        "action_type": "update_investigation_state",
+        "action_payload": {"status": "closed"},
+        "requested_by": "Roshini Analyst",
+        "requested_at": REQUESTED_AT,
+        "risk_level": "low",
+    }
+    current_investigation = {"status": "investigating", "confidence": "medium"}
+    executor = _RecordingExecutor(response=[])
+
+    with pytest.raises(ApprovalPersistenceError):
+        insert_risk_aware_pending_approval(executor, request, current_investigation)
+
+    assert executor.calls == []
+
+
+def test_multi_review_lookup_validates_eighteen_fields():
+    row = _risk_aware_pending_row()
+    executor = _RecordingExecutor(response=[row])
+
+    result = load_risk_aware_approval_record(executor, APPROVAL_ID)
+
+    assert set(result) == set(_RECORD_FIELDS) | {"risk_level", "required_approvals"}
+    assert len(result) == 18
+    assert result["risk_level"] == "high"
+    assert result["required_approvals"] == 2
+
+
+def test_multi_review_review_lookup_returns_deterministic_five_field_rows():
+    rows = [
+        {
+            "approval_id": APPROVAL_ID,
+            "reviewer_identity": "Reviewer One",
+            "reviewer_identity_normalized": "reviewer one",
+            "decision": "approve",
+            "decided_at": REVIEWED_AT,
+        },
+    ]
+    executor = _RecordingExecutor(response=rows)
+
+    result = load_approval_reviews(executor, APPROVAL_ID)
+
+    assert len(result) == 1
+    assert set(result[0]) == {
+        "approval_id", "reviewer_identity", "reviewer_identity_normalized", "decision", "decided_at",
+    }
+    assert result[0]["reviewer_identity_normalized"] == "reviewer one"
+
+
+def test_multi_review_first_of_two_genuine_plan_creates_correct_rpc_descriptor():
+    record = _risk_aware_pending_row()
+    plan = validate_multi_review_transition(
+        record, [], {"decision": "approve", "reviewed_by": "Reviewer One"}, reviewed_at=REVIEWED_AT
+    )
+    executor = _multi_review_executor_for(record, plan)
+
+    apply_multi_review_transition(executor, record, [], plan)
+
+    assert len(executor.calls) == 1
+    op = executor.calls[0]
+    assert op["operation"] == "rpc"
+    assert op["function"] == "record_approval_review_and_promote_status"
+    assert op["parameters"] == {
+        "approval_id": APPROVAL_ID,
+        "expected_from_status": "pending",
+        "expected_to_status": "partially_approved",
+        "expected_required_approvals": 2,
+        "expected_approval_count_before": 0,
+        "reviewer_identity": "Reviewer One",
+        "reviewer_identity_normalized": "reviewer one",
+        "decision": "approve",
+        "decided_at": REVIEWED_AT,
+        "rejection_reason": None,
+    }
+
+
+def test_multi_review_second_of_two_genuine_plan_creates_correct_rpc_descriptor():
+    record = _risk_aware_pending_row(status="partially_approved")
+    existing = [{
+        "approval_id": APPROVAL_ID,
+        "reviewer_identity": "Reviewer One",
+        "reviewer_identity_normalized": "reviewer one",
+        "decision": "approve",
+        "decided_at": REVIEWED_AT,
+    }]
+    second_reviewed_at = "2026-08-01T17:00:00Z"
+    plan = validate_multi_review_transition(
+        record, existing, {"decision": "approve", "reviewed_by": "Reviewer Two"}, reviewed_at=second_reviewed_at
+    )
+    executor = _multi_review_executor_for(record, plan)
+
+    apply_multi_review_transition(executor, record, existing, plan)
+
+    op = executor.calls[0]
+    assert op["parameters"]["expected_from_status"] == "partially_approved"
+    assert op["parameters"]["expected_to_status"] == "approved"
+    assert op["parameters"]["expected_approval_count_before"] == 1
+    assert op["parameters"]["reviewer_identity"] == "Reviewer Two"
+    assert op["parameters"]["reviewer_identity_normalized"] == "reviewer two"
+
+
+def test_multi_review_rejection_genuine_plan_creates_correct_rpc_descriptor():
+    record = _risk_aware_pending_row()
+    plan = validate_multi_review_transition(
+        record,
+        [],
+        {"decision": "reject", "reviewed_by": "Rejecter", "rejection_reason": "Needs more evidence."},
+        reviewed_at=REVIEWED_AT,
+    )
+    executor = _multi_review_executor_for(record, plan)
+
+    apply_multi_review_transition(executor, record, [], plan)
+
+    op = executor.calls[0]
+    assert op["parameters"]["expected_to_status"] == "rejected"
+    assert op["parameters"]["decision"] == "reject"
+    assert op["parameters"]["rejection_reason"] == "Needs more evidence."
+
+
+def test_multi_review_plan_survives_sort_keys_round_trip():
+    record = _risk_aware_pending_row()
+    plan = validate_multi_review_transition(
+        record, [], {"decision": "approve", "reviewed_by": "Reviewer One"}, reviewed_at=REVIEWED_AT
+    )
+    round_tripped_plan = json.loads(json.dumps(plan, sort_keys=True))
+    before = copy.deepcopy(round_tripped_plan)
+    executor = _multi_review_executor_for(record, round_tripped_plan)
+
+    result = apply_multi_review_transition(executor, record, [], round_tripped_plan)
+
+    assert result["updated_record"]["status"] == "partially_approved"
+    assert round_tripped_plan == before
+
+
+def test_multi_review_forged_plan_fails_before_executor_use():
+    record = _risk_aware_pending_row()
+    genuine_plan = validate_multi_review_transition(
+        record, [], {"decision": "approve", "reviewed_by": "Reviewer One"}, reviewed_at=REVIEWED_AT
+    )
+    forged_plan = copy.deepcopy(genuine_plan)
+    forged_plan["approval_count_before"] = 1
+    executor = _RecordingExecutor(response=[_multi_review_rpc_row_for(record, genuine_plan)])
+
+    with pytest.raises(ApprovalPersistenceError):
+        apply_multi_review_transition(executor, record, [], forged_plan)
+
+    assert executor.calls == []
+
+
+def test_multi_review_zero_row_response_becomes_canonical_conflict():
+    record = _risk_aware_pending_row()
+    plan = validate_multi_review_transition(
+        record, [], {"decision": "approve", "reviewed_by": "Reviewer One"}, reviewed_at=REVIEWED_AT
+    )
+    executor = _RecordingExecutor(response=[])
+
+    with pytest.raises(ApprovalConflictError):
+        apply_multi_review_transition(executor, record, [], plan)
+
+
+def test_multi_review_twenty_four_field_result_verifies_correctly():
+    record = _risk_aware_pending_row()
+    plan = validate_multi_review_transition(
+        record, [], {"decision": "approve", "reviewed_by": "Reviewer One"}, reviewed_at=REVIEWED_AT
+    )
+    row = _multi_review_rpc_row_for(record, plan)
+    assert len(row) == 24
+    executor = _RecordingExecutor(response=[row])
+
+    result = apply_multi_review_transition(executor, record, [], plan)
+
+    assert set(result) == {"updated_record", "review_record", "approval_count"}
+    assert len(result["updated_record"]) == 18
+    assert len(result["review_record"]) == 5
+    assert result["approval_count"] == 1
+
+    # A response with an extra or missing field is rejected.
+    bad_row = dict(row)
+    bad_row["unexpected_field"] = "x"
+    bad_executor = _RecordingExecutor(response=[bad_row])
+    with pytest.raises(ApprovalResponseError):
+        apply_multi_review_transition(bad_executor, record, [], plan)
+
+
+def test_multi_review_inputs_remain_unmodified():
+    record = _risk_aware_pending_row()
+    record_snapshot = copy.deepcopy(record)
+    existing_reviews = []
+    plan = validate_multi_review_transition(
+        record, existing_reviews, {"decision": "approve", "reviewed_by": "Reviewer One"}, reviewed_at=REVIEWED_AT
+    )
+    plan_snapshot = copy.deepcopy(plan)
+    executor = _multi_review_executor_for(record, plan)
+
+    apply_multi_review_transition(executor, record, existing_reviews, plan)
+
+    assert record == record_snapshot
+    assert existing_reviews == []
+    assert plan == plan_snapshot
 
 
 # ---------------------------------------------------------------------------

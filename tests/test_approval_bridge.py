@@ -35,7 +35,7 @@ from core.approval_persistence import (
     ApprovalResponseError,
     ApprovalTransportError,
 )
-from core.approval_transition import validate_approval_transition
+from core.approval_transition import validate_approval_transition, validate_multi_review_transition
 
 APPROVAL_ID = "51111111-1111-4111-8111-111111111111"
 INVESTIGATION_ID = "41111111-1111-4111-8111-111111111111"
@@ -230,10 +230,15 @@ def test_006_no_supabase_or_mcp_type_is_required():
     assert not any(name == "mcp" or name.startswith("mcp.") for name in imports)
 
 
-def test_007_exactly_four_supported_operation_names_exist():
+def test_007_exactly_eight_supported_operation_names_exist():
+    # Block 6 added four additive operations alongside the original four
+    # Block 5 operations -- none of the original four were renamed or
+    # removed.
     assert approval_bridge._SUPPORTED_OPERATIONS_SET == {
         "insert_pending_approval", "load_approval_record",
         "apply_approval_review_transition", "apply_approval_consumption",
+        "insert_risk_aware_pending_approval", "load_risk_aware_approval_record",
+        "load_approval_reviews", "apply_multi_review_transition",
     }
 
 
@@ -1499,6 +1504,226 @@ def test_111_no_duplicate_lifecycle_validation_exists():
     function_defs = [node.name for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)]
     for forbidden in ("validate_approval_record", "validate_approval_transition", "validate_approval_request"):
         assert forbidden not in function_defs
+
+
+# ---------------------------------------------------------------------------
+# Block 6, Step 4: risk-aware bridge operations
+# ---------------------------------------------------------------------------
+
+
+def _risk_aware_pending_row(**overrides):
+    row = _pending_row(risk_level="high", required_approvals=2, expires_at=None)
+    row.update(overrides)
+    return row
+
+
+def _multi_review_rpc_row_for(record, plan, *, approval_count_override=None):
+    approval_row = _apply_set_fields(record, plan["set_fields"])
+    row = {
+        key: approval_row[key]
+        for key in (
+            "id", "investigation_id", "action_type", "action_payload", "status", "requested_by",
+            "requested_at", "expires_at", "approved_by", "approved_at", "rejected_by", "rejected_at",
+            "rejection_reason", "consumed_by", "consumed_at", "created_at", "risk_level", "required_approvals",
+        )
+    }
+    review_record = plan["review_record"]
+    row.update({
+        "review_approval_id": review_record["approval_id"],
+        "reviewer_identity": review_record["reviewer_identity"],
+        "reviewer_identity_normalized": review_record["reviewer_identity_normalized"],
+        "review_decision": review_record["decision"],
+        "review_decided_at": review_record["decided_at"],
+        "approval_count": (
+            approval_count_override if approval_count_override is not None else plan["approval_count_after"]
+        ),
+    })
+    return row
+
+
+def test_multi_review_prepare_verify_risk_aware_insert():
+    request = {
+        "investigation_id": INVESTIGATION_ID,
+        "action_type": "update_investigation_state",
+        "action_payload": {"status": "closed"},
+        "requested_by": "Roshini Analyst",
+        "requested_at": REQUESTED_AT,
+    }
+    current_investigation = {"status": "investigating", "confidence": "medium"}
+    operation_input = {"request": request, "current_investigation": current_investigation, "expires_at": None}
+
+    prepared = prepare_approval_operation("insert_risk_aware_pending_approval", operation_input)
+    assert prepared["descriptor"]["values"]["risk_level"] == "high"
+    assert prepared["descriptor"]["values"]["required_approvals"] == 2
+
+    inserted_row = _risk_aware_pending_row(action_payload={"status": "closed"})
+    result = verify_approval_operation(
+        "insert_risk_aware_pending_approval", operation_input, prepared["descriptor"],
+        {"kind": "rows", "rows": [inserted_row]},
+    )
+    assert result["result"]["risk_level"] == "high"
+    assert result["result"]["required_approvals"] == 2
+
+
+def test_multi_review_prepare_verify_risk_aware_lookup():
+    operation_input = {"approval_id": APPROVAL_ID}
+    prepared = prepare_approval_operation("load_risk_aware_approval_record", operation_input)
+    assert prepared["descriptor"]["columns"][-2:] == ["risk_level", "required_approvals"]
+
+    row = _risk_aware_pending_row()
+    result = verify_approval_operation(
+        "load_risk_aware_approval_record", operation_input, prepared["descriptor"], {"kind": "rows", "rows": [row]}
+    )
+    assert result["result"]["id"] == APPROVAL_ID
+
+    with pytest.raises(ApprovalNotFoundError):
+        verify_approval_operation(
+            "load_risk_aware_approval_record", operation_input, prepared["descriptor"], {"kind": "rows", "rows": []}
+        )
+
+
+def test_multi_review_prepare_verify_review_lookup():
+    operation_input = {"approval_id": APPROVAL_ID}
+    prepared = prepare_approval_operation("load_approval_reviews", operation_input)
+    assert prepared["descriptor"]["table"] == "approval_reviews"
+    assert prepared["descriptor"]["order_by"] == "decided_at"
+
+    # Genuinely zero reviews is a valid success, not a bridge failure.
+    zero_result = verify_approval_operation(
+        "load_approval_reviews", operation_input, prepared["descriptor"], {"kind": "rows", "rows": []}
+    )
+    assert zero_result["result"] == []
+
+    review_row = {
+        "approval_id": APPROVAL_ID,
+        "reviewer_identity": "Reviewer One",
+        "reviewer_identity_normalized": "reviewer one",
+        "decision": "approve",
+        "decided_at": REVIEWED_AT,
+    }
+    one_result = verify_approval_operation(
+        "load_approval_reviews", operation_input, prepared["descriptor"], {"kind": "rows", "rows": [review_row]}
+    )
+    assert one_result["result"] == [review_row]
+
+
+def test_multi_review_prepare_verify_first_approval():
+    record = _risk_aware_pending_row()
+    plan = validate_multi_review_transition(
+        record, [], {"decision": "approve", "reviewed_by": "Reviewer One"}, reviewed_at=REVIEWED_AT
+    )
+    operation_input = {"current_record": record, "existing_reviews": [], "transition_plan": plan}
+
+    prepared = prepare_approval_operation("apply_multi_review_transition", operation_input)
+    assert prepared["descriptor"]["parameters"]["expected_to_status"] == "partially_approved"
+
+    row = _multi_review_rpc_row_for(record, plan)
+    result = verify_approval_operation(
+        "apply_multi_review_transition", operation_input, prepared["descriptor"], {"kind": "rows", "rows": [row]}
+    )
+    assert result["result"]["updated_record"]["status"] == "partially_approved"
+    assert result["result"]["approval_count"] == 1
+
+
+def test_multi_review_prepare_verify_second_approval():
+    record = _risk_aware_pending_row(status="partially_approved")
+    existing = [{
+        "approval_id": APPROVAL_ID,
+        "reviewer_identity": "Reviewer One",
+        "reviewer_identity_normalized": "reviewer one",
+        "decision": "approve",
+        "decided_at": REVIEWED_AT,
+    }]
+    second_reviewed_at = "2026-08-01T17:30:00Z"
+    plan = validate_multi_review_transition(
+        record, existing, {"decision": "approve", "reviewed_by": "Reviewer Two"}, reviewed_at=second_reviewed_at
+    )
+    operation_input = {"current_record": record, "existing_reviews": existing, "transition_plan": plan}
+
+    prepared = prepare_approval_operation("apply_multi_review_transition", operation_input)
+    assert prepared["descriptor"]["parameters"]["expected_approval_count_before"] == 1
+
+    row = _multi_review_rpc_row_for(record, plan)
+    result = verify_approval_operation(
+        "apply_multi_review_transition", operation_input, prepared["descriptor"], {"kind": "rows", "rows": [row]}
+    )
+    assert result["result"]["updated_record"]["status"] == "approved"
+    assert result["result"]["approval_count"] == 2
+
+
+def test_multi_review_prepare_verify_rejection():
+    record = _risk_aware_pending_row()
+    plan = validate_multi_review_transition(
+        record,
+        [],
+        {"decision": "reject", "reviewed_by": "Rejecter", "rejection_reason": "Needs more evidence."},
+        reviewed_at=REVIEWED_AT,
+    )
+    operation_input = {"current_record": record, "existing_reviews": [], "transition_plan": plan}
+
+    prepared = prepare_approval_operation("apply_multi_review_transition", operation_input)
+    assert prepared["descriptor"]["parameters"]["decision"] == "reject"
+
+    row = _multi_review_rpc_row_for(record, plan)
+    result = verify_approval_operation(
+        "apply_multi_review_transition", operation_input, prepared["descriptor"], {"kind": "rows", "rows": [row]}
+    )
+    assert result["result"]["updated_record"]["status"] == "rejected"
+    assert result["result"]["approval_count"] == 0
+
+
+def test_multi_review_malformed_or_zero_row_response_fails_correctly():
+    record = _risk_aware_pending_row()
+    plan = validate_multi_review_transition(
+        record, [], {"decision": "approve", "reviewed_by": "Reviewer One"}, reviewed_at=REVIEWED_AT
+    )
+    operation_input = {"current_record": record, "existing_reviews": [], "transition_plan": plan}
+    prepared = prepare_approval_operation("apply_multi_review_transition", operation_input)
+
+    with pytest.raises(ApprovalConflictError):
+        verify_approval_operation(
+            "apply_multi_review_transition", operation_input, prepared["descriptor"], {"kind": "rows", "rows": []}
+        )
+
+    with pytest.raises(ApprovalTransportError):
+        verify_approval_operation(
+            "apply_multi_review_transition", operation_input, prepared["descriptor"], {"kind": "transport_error"}
+        )
+
+    bad_row = _multi_review_rpc_row_for(record, plan)
+    bad_row["unexpected_field"] = "x"
+    with pytest.raises(ApprovalResponseError):
+        verify_approval_operation(
+            "apply_multi_review_transition", operation_input, prepared["descriptor"],
+            {"kind": "rows", "rows": [bad_row]},
+        )
+
+
+def test_multi_review_sorted_mappings_and_inputs_remain_unmodified():
+    record = _risk_aware_pending_row()
+    record_snapshot = copy.deepcopy(record)
+    existing_reviews = []
+    plan = validate_multi_review_transition(
+        record, existing_reviews, {"decision": "approve", "reviewed_by": "Reviewer One"}, reviewed_at=REVIEWED_AT
+    )
+    # A sort_keys=True round trip of the plan and of operation_input must
+    # still verify correctly -- dict key order is never security-significant.
+    import json as _json
+
+    operation_input = _json.loads(_json.dumps(
+        {"current_record": record, "existing_reviews": existing_reviews, "transition_plan": plan}, sort_keys=True
+    ))
+    operation_input_snapshot = copy.deepcopy(operation_input)
+
+    prepared = prepare_approval_operation("apply_multi_review_transition", operation_input)
+    row = _multi_review_rpc_row_for(record, plan)
+    result = verify_approval_operation(
+        "apply_multi_review_transition", operation_input, prepared["descriptor"], {"kind": "rows", "rows": [row]}
+    )
+
+    assert result["result"]["updated_record"]["status"] == "partially_approved"
+    assert record == record_snapshot
+    assert operation_input == operation_input_snapshot
 
 
 # ---------------------------------------------------------------------------

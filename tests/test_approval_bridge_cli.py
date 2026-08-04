@@ -718,6 +718,149 @@ def test_regression_012_consume_descriptor_identical_across_sort_keys_round_trip
 
 
 # ---------------------------------------------------------------------------
+# Block 6, Step 4: risk-aware operations through the real bridge CLI
+# ---------------------------------------------------------------------------
+
+
+def test_multi_review_cli_risk_aware_insert_prepare_and_verify():
+    request = {
+        "investigation_id": INVESTIGATION_ID,
+        "action_type": "update_investigation_state",
+        "action_payload": {"status": "closed"},
+        "requested_by": "Roshini Analyst",
+        "requested_at": REQUESTED_AT,
+    }
+    current_investigation = {"status": "investigating", "confidence": "medium"}
+    operation_input = {"request": request, "current_investigation": current_investigation, "expires_at": None}
+
+    prepare_exit, prepare_stdout, prepare_stderr = _run(
+        json.dumps(_prepare_envelope("insert_risk_aware_pending_approval", operation_input))
+    )
+    assert prepare_exit == 0
+    assert prepare_stderr == ""
+    prepared = json.loads(prepare_stdout)
+    assert prepared["descriptor"]["values"]["risk_level"] == "high"
+    assert prepared["descriptor"]["values"]["required_approvals"] == 2
+
+    inserted_row = {
+        "id": APPROVAL_ID,
+        "investigation_id": INVESTIGATION_ID,
+        "action_type": "update_investigation_state",
+        "action_payload": {"status": "closed"},
+        "requested_by": "Roshini Analyst",
+        "requested_at": REQUESTED_AT,
+        "status": "pending",
+        "approved_by": None,
+        "approved_at": None,
+        "rejected_by": None,
+        "rejected_at": None,
+        "rejection_reason": None,
+        "expires_at": None,
+        "consumed_by": None,
+        "consumed_at": None,
+        "created_at": REQUESTED_AT,
+        "risk_level": "high",
+        "required_approvals": 2,
+    }
+    verify_exit, verify_stdout, verify_stderr = _run(
+        json.dumps(_verify_envelope(
+            "insert_risk_aware_pending_approval", operation_input, prepared["descriptor"],
+            {"kind": "rows", "rows": [inserted_row]},
+        ))
+    )
+    assert verify_exit == 0
+    assert verify_stderr == ""
+    result = json.loads(verify_stdout)
+    assert result["result"]["risk_level"] == "high"
+    assert result["result"]["required_approvals"] == 2
+
+
+def test_multi_review_cli_record_and_review_lookup():
+    operation_input = {"approval_id": APPROVAL_ID}
+
+    record_prepare_exit, record_prepare_stdout, record_prepare_stderr = _run(
+        json.dumps(_prepare_envelope("load_risk_aware_approval_record", operation_input))
+    )
+    assert record_prepare_exit == 0
+    assert record_prepare_stderr == ""
+    record_prepared = json.loads(record_prepare_stdout)
+
+    risk_aware_row = dict(_pending_row(), risk_level="high", required_approvals=2)
+    record_verify_exit, record_verify_stdout, record_verify_stderr = _run(
+        json.dumps(_verify_envelope(
+            "load_risk_aware_approval_record", operation_input, record_prepared["descriptor"],
+            {"kind": "rows", "rows": [risk_aware_row]},
+        ))
+    )
+    assert record_verify_exit == 0
+    assert record_verify_stderr == ""
+    assert json.loads(record_verify_stdout)["result"]["risk_level"] == "high"
+
+    review_prepare_exit, review_prepare_stdout, review_prepare_stderr = _run(
+        json.dumps(_prepare_envelope("load_approval_reviews", operation_input))
+    )
+    assert review_prepare_exit == 0
+    assert review_prepare_stderr == ""
+    review_prepared = json.loads(review_prepare_stdout)
+    assert review_prepared["descriptor"]["table"] == "approval_reviews"
+
+    # Genuinely zero reviews is a valid success through the real CLI too.
+    review_verify_exit, review_verify_stdout, review_verify_stderr = _run(
+        json.dumps(_verify_envelope(
+            "load_approval_reviews", operation_input, review_prepared["descriptor"], {"kind": "rows", "rows": []},
+        ))
+    )
+    assert review_verify_exit == 0
+    assert review_verify_stderr == ""
+    assert json.loads(review_verify_stdout)["result"] == []
+
+
+def test_multi_review_cli_apply_prepare():
+    record = dict(_pending_row(), risk_level="high", required_approvals=2, expires_at=None)
+    plan = approval_transition.validate_multi_review_transition(
+        record, [], {"decision": "approve", "reviewed_by": "Reviewer One"}, reviewed_at=REVIEWED_AT
+    )
+    # Real JSON serialization boundary: sort_keys=True round trip, exactly
+    # like the plan this real CLI would actually receive from a future
+    # multi-review transition CLI.
+    round_tripped_plan = json.loads(json.dumps(plan, sort_keys=True))
+
+    operation_input = {"current_record": record, "existing_reviews": [], "transition_plan": round_tripped_plan}
+    prepare_exit, prepare_stdout, prepare_stderr = _run(
+        json.dumps(_prepare_envelope("apply_multi_review_transition", operation_input))
+    )
+    assert prepare_exit == 0
+    assert prepare_stderr == ""
+    result = json.loads(prepare_stdout)
+    assert result["descriptor"]["operation"] == "rpc"
+    assert result["descriptor"]["function"] == "record_approval_review_and_promote_status"
+
+
+def test_multi_review_cli_canonical_conflict_verify():
+    record = dict(_pending_row(), risk_level="high", required_approvals=2, expires_at=None)
+    plan = approval_transition.validate_multi_review_transition(
+        record, [], {"decision": "approve", "reviewed_by": "Reviewer One"}, reviewed_at=REVIEWED_AT
+    )
+    operation_input = {"current_record": record, "existing_reviews": [], "transition_plan": plan}
+
+    prepare_exit, prepare_stdout, prepare_stderr = _run(
+        json.dumps(_prepare_envelope("apply_multi_review_transition", operation_input))
+    )
+    assert prepare_exit == 0
+    prepared = json.loads(prepare_stdout)
+
+    verify_exit, verify_stdout, verify_stderr = _run(
+        json.dumps(_verify_envelope(
+            "apply_multi_review_transition", operation_input, prepared["descriptor"], {"kind": "rows", "rows": []},
+        ))
+    )
+    assert verify_exit == 2
+    assert verify_stdout == ""
+    error = json.loads(verify_stderr)
+    assert error["error"]["code"] == "approval_conflict"
+
+
+# ---------------------------------------------------------------------------
 # Test-module source boundary (self-check)
 # ---------------------------------------------------------------------------
 

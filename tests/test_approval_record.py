@@ -30,7 +30,9 @@ import pytest
 from core.approval_transition import (
     ApprovalTransitionError,
     validate_approval_record,
+    validate_approval_review_record,
     validate_approval_transition,
+    validate_risk_aware_approval_record,
 )
 from core.approval_request import ApprovalRequestError
 
@@ -1242,3 +1244,92 @@ def test_164_consume_transition_reflects_expanded_plan_only():
     # either binding field.
     assert "expected_investigation_id" not in record
     assert "expected_action_type" not in record
+
+
+# ---------------------------------------------------------------------------
+# Block 6, Step 4: additive risk-aware record and review-record validators
+# ---------------------------------------------------------------------------
+
+
+def test_165_valid_eighteen_field_one_review_record_accepted():
+    record = _pending_record(risk_level="medium", required_approvals=1)
+    result = validate_risk_aware_approval_record(record)
+    assert set(result) == set(_ALL_FIELDS) | {"risk_level", "required_approvals"}
+    assert len(result) == 18
+    assert result["risk_level"] == "medium"
+    assert result["required_approvals"] == 1
+
+
+def test_166_valid_partially_approved_two_review_record_accepted():
+    record = _pending_record(
+        status="partially_approved", risk_level="high", required_approvals=2
+    )
+    result = validate_risk_aware_approval_record(record)
+    assert result["status"] == "partially_approved"
+    assert result["risk_level"] == "high"
+    assert result["required_approvals"] == 2
+    assert result["approved_by"] is None
+    assert result["approved_at"] is None
+
+
+def test_167_risk_required_approvals_mapping_mismatch_fails():
+    with pytest.raises(ApprovalTransitionError):
+        validate_risk_aware_approval_record(
+            _pending_record(risk_level="low", required_approvals=2)
+        )
+    with pytest.raises(ApprovalTransitionError):
+        validate_risk_aware_approval_record(
+            _pending_record(risk_level="high", required_approvals=1)
+        )
+
+
+def test_168_partially_approved_with_approved_summary_fields_fails():
+    record = _pending_record(
+        status="partially_approved",
+        risk_level="high",
+        required_approvals=2,
+        approved_by="reviewer-one",
+        approved_at=APPROVED_AT,
+    )
+    with pytest.raises(ApprovalTransitionError):
+        validate_risk_aware_approval_record(record)
+
+
+def test_169_valid_five_field_review_record_accepted():
+    review = {
+        "approval_id": APPROVAL_ID,
+        "reviewer_identity": "Security Reviewer",
+        "reviewer_identity_normalized": "security reviewer",
+        "decision": "approve",
+        "decided_at": APPROVED_AT,
+    }
+    result = validate_approval_review_record(review)
+    assert set(result) == {
+        "approval_id", "reviewer_identity", "reviewer_identity_normalized", "decision", "decided_at",
+    }
+    assert result["approval_id"] == APPROVAL_ID
+    assert result["reviewer_identity_normalized"] == "security reviewer"
+
+
+def test_170_malformed_or_incorrectly_normalized_review_record_fails():
+    base_review = {
+        "approval_id": APPROVAL_ID,
+        "reviewer_identity": "Security Reviewer",
+        "reviewer_identity_normalized": "security reviewer",
+        "decision": "approve",
+        "decided_at": APPROVED_AT,
+    }
+
+    # Incorrectly normalized (does not equal strip().casefold()).
+    with pytest.raises(ApprovalTransitionError):
+        validate_approval_review_record(dict(base_review, reviewer_identity_normalized="wrong"))
+
+    # Malformed decision.
+    with pytest.raises(ApprovalTransitionError):
+        validate_approval_review_record(dict(base_review, decision="maybe"))
+
+    # Missing field.
+    incomplete_review = dict(base_review)
+    del incomplete_review["decided_at"]
+    with pytest.raises(ApprovalTransitionError):
+        validate_approval_review_record(incomplete_review)

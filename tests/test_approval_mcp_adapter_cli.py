@@ -171,3 +171,181 @@ class TestEnvelopeAndInputHandling:
         exit_code, stdout, stderr = _run({"action": "prepare_call", "descriptor": {"operation": "bogus"}})
         assert "Traceback" not in stderr
         assert "Traceback" not in stdout
+
+
+# ---------------------------------------------------------------------------
+# Block 6, Step 4R1: risk-aware operations through the real adapter CLI
+# ---------------------------------------------------------------------------
+
+
+_RISK_AWARE_RECORD_FIELDS = _RECORD_FIELDS + ("risk_level", "required_approvals")
+
+_REVIEW_LOOKUP_COLUMNS = (
+    "approval_id", "reviewer_identity", "reviewer_identity_normalized", "decision", "decided_at",
+)
+
+
+def _risk_aware_insert_descriptor() -> dict:
+    return {
+        "operation": "insert",
+        "table": "approvals",
+        "values": {
+            "investigation_id": "11111111-1111-1111-1111-111111111111",
+            "action_type": "update_investigation_state",
+            "action_payload": {"status": "closed"},
+            "requested_by": "analyst@example.com",
+            "requested_at": "2026-01-01T00:00:00Z",
+            "status": "pending",
+            "risk_level": "high",
+            "required_approvals": 2,
+            "requested_by_normalized": "analyst@example.com",
+        },
+        "returning": list(_RISK_AWARE_RECORD_FIELDS),
+    }
+
+
+def _review_select_descriptor() -> dict:
+    return {
+        "operation": "select",
+        "table": "approval_reviews",
+        "columns": list(_REVIEW_LOOKUP_COLUMNS),
+        "filters": {"approval_id": "33333333-3333-3333-3333-333333333333"},
+        "order_by": "decided_at",
+        "limit": 10,
+    }
+
+
+def _review_rpc_descriptor() -> dict:
+    return {
+        "operation": "rpc",
+        "function": "record_approval_review_and_promote_status",
+        "parameters": {
+            "approval_id": "55555555-5555-5555-5555-555555555555",
+            "expected_from_status": "pending",
+            "expected_to_status": "partially_approved",
+            "expected_required_approvals": 2,
+            "expected_approval_count_before": 0,
+            "reviewer_identity": "reviewer@example.com",
+            "reviewer_identity_normalized": "reviewer@example.com",
+            "decision": "approve",
+            "decided_at": "2026-01-01T03:00:00Z",
+            "rejection_reason": None,
+        },
+    }
+
+
+class TestBlock6RiskAwarePrepareCall:
+    def test_risk_aware_insert_prepare_call(self):
+        exit_code, stdout, stderr = _run({"action": "prepare_call", "descriptor": _risk_aware_insert_descriptor()})
+        assert exit_code == 0
+        assert stderr == ""
+        parsed = json.loads(stdout)
+        assert set(parsed) == {"tool", "arguments"}
+        assert parsed["tool"] == "mcp__supabase__execute_sql"
+        query = parsed["arguments"]["query"]
+        assert query.startswith("INSERT INTO public.approvals (")
+        assert "risk_level" in query
+        assert "required_approvals" in query
+        assert "requested_by_normalized" in query
+        assert query.endswith("RETURNING " + ", ".join(_RISK_AWARE_RECORD_FIELDS) + ";")
+
+    def test_review_lookup_prepare_call(self):
+        exit_code, stdout, stderr = _run({"action": "prepare_call", "descriptor": _review_select_descriptor()})
+        assert exit_code == 0
+        assert stderr == ""
+        parsed = json.loads(stdout)
+        assert set(parsed) == {"tool", "arguments"}
+        expected_query = (
+            "SELECT " + ", ".join(_REVIEW_LOOKUP_COLUMNS) + " FROM public.approval_reviews "
+            "WHERE approval_id = '33333333-3333-3333-3333-333333333333'::uuid "
+            "ORDER BY decided_at LIMIT 10;"
+        )
+        assert parsed["arguments"]["query"] == expected_query
+
+    def test_atomic_review_rpc_prepare_call(self):
+        exit_code, stdout, stderr = _run({"action": "prepare_call", "descriptor": _review_rpc_descriptor()})
+        assert exit_code == 0
+        assert stderr == ""
+        parsed = json.loads(stdout)
+        expected_query = (
+            "SELECT * FROM public.record_approval_review_and_promote_status("
+            "'55555555-5555-5555-5555-555555555555'::uuid, "
+            "'pending', "
+            "'partially_approved', "
+            "2, "
+            "0, "
+            "'reviewer@example.com', "
+            "'reviewer@example.com', "
+            "'approve', "
+            "'2026-01-01T03:00:00Z'::timestamptz, "
+            "NULL);"
+        )
+        assert parsed["arguments"]["query"] == expected_query
+
+    def test_twenty_four_field_normalize_response_and_zero_row_behavior(self):
+        row = {
+            "id": "55555555-5555-5555-5555-555555555555",
+            "investigation_id": "11111111-1111-1111-1111-111111111111",
+            "action_type": "update_investigation_state",
+            "action_payload": {"status": "closed"},
+            "status": "partially_approved",
+            "requested_by": "analyst@example.com",
+            "requested_at": "2026-01-01 00:00:00+00",
+            "expires_at": None,
+            "approved_by": None,
+            "approved_at": None,
+            "rejected_by": None,
+            "rejected_at": None,
+            "rejection_reason": None,
+            "consumed_by": None,
+            "consumed_at": None,
+            "created_at": "2026-01-01 00:00:00+00",
+            "risk_level": "high",
+            "required_approvals": 2,
+            "review_approval_id": "55555555-5555-5555-5555-555555555555",
+            "reviewer_identity": "reviewer@example.com",
+            "reviewer_identity_normalized": "reviewer@example.com",
+            "review_decision": "approve",
+            "review_decided_at": "2026-01-01 03:00:00+00",
+            "approval_count": 1,
+        }
+        assert len(row) == 24
+
+        success_payload = {
+            "action": "normalize_response",
+            "operation": "apply_multi_review_transition",
+            "tool_response": {"result": _wrap_block(json.dumps([row]))},
+        }
+        exit_code, stdout, stderr = _run(success_payload)
+        assert exit_code == 0
+        assert stderr == ""
+        parsed = json.loads(stdout)
+        assert parsed["kind"] == "rows"
+        assert parsed["rows"][0]["requested_at"] == "2026-01-01T00:00:00Z"
+        assert parsed["rows"][0]["review_decided_at"] == "2026-01-01T03:00:00Z"
+        assert parsed["rows"][0]["approval_count"] == 1
+
+        zero_row_payload = {
+            "action": "normalize_response",
+            "operation": "apply_multi_review_transition",
+            "tool_response": {"result": _wrap_block("[]")},
+        }
+        zero_exit_code, zero_stdout, zero_stderr = _run(zero_row_payload)
+        assert zero_exit_code == 0
+        assert zero_stderr == ""
+        assert json.loads(zero_stdout) == {"kind": "rows", "rows": []}
+
+        # No raw PostgreSQL error and no traceback is ever exposed, even
+        # for a genuine tool-level error on this same operation.
+        error_payload = {
+            "action": "normalize_response",
+            "operation": "apply_multi_review_transition",
+            "tool_response": {"error": {"name": "HttpException", "message": "raw postgres detail"}},
+        }
+        error_exit_code, error_stdout, error_stderr = _run(error_payload)
+        assert error_exit_code == 0
+        assert json.loads(error_stdout) == {"kind": "transport_error"}
+        assert "raw postgres detail" not in error_stdout
+        assert "raw postgres detail" not in error_stderr
+        assert "Traceback" not in error_stdout
+        assert "Traceback" not in error_stderr

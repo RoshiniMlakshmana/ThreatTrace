@@ -54,8 +54,12 @@ from core.approval_persistence import (
     ApprovalResponseError,
     apply_approval_consumption,
     apply_approval_review_transition,
+    apply_multi_review_transition,
     insert_pending_approval,
+    insert_risk_aware_pending_approval,
     load_approval_record,
+    load_approval_reviews,
+    load_risk_aware_approval_record,
 )
 
 
@@ -89,6 +93,10 @@ _SUPPORTED_OPERATIONS = (
     "load_approval_record",
     "apply_approval_review_transition",
     "apply_approval_consumption",
+    "insert_risk_aware_pending_approval",
+    "load_risk_aware_approval_record",
+    "load_approval_reviews",
+    "apply_multi_review_transition",
 )
 _SUPPORTED_OPERATIONS_SET = frozenset(_SUPPORTED_OPERATIONS)
 
@@ -97,6 +105,10 @@ _OPERATION_INPUT_FIELDS: dict[str, tuple[str, ...]] = {
     "load_approval_record": ("approval_id",),
     "apply_approval_review_transition": ("current_record", "transition_plan"),
     "apply_approval_consumption": ("current_record", "transition_plan"),
+    "insert_risk_aware_pending_approval": ("request", "current_investigation", "expires_at"),
+    "load_risk_aware_approval_record": ("approval_id",),
+    "load_approval_reviews": ("approval_id",),
+    "apply_multi_review_transition": ("current_record", "existing_reviews", "transition_plan"),
 }
 
 _EXPECTED_POST_CAPTURE_EXCEPTIONS: dict[str, type[ApprovalPersistenceError]] = {
@@ -104,6 +116,27 @@ _EXPECTED_POST_CAPTURE_EXCEPTIONS: dict[str, type[ApprovalPersistenceError]] = {
     "load_approval_record": ApprovalNotFoundError,
     "apply_approval_review_transition": ApprovalConflictError,
     "apply_approval_consumption": ApprovalConflictError,
+    "insert_risk_aware_pending_approval": ApprovalResponseError,
+    "load_risk_aware_approval_record": ApprovalNotFoundError,
+    "load_approval_reviews": ApprovalResponseError,
+    "apply_multi_review_transition": ApprovalConflictError,
+}
+
+# Every operation's descriptor-capture executor returns an empty list by
+# default -- driving the wrapped persistence function to its own already-
+# known "zero rows" branch (see _DescriptorCaptureExecutor below), exactly
+# as it always has for the four Block 5 operations. load_approval_reviews
+# is the sole exception: an empty list is that operation's own legitimate
+# success (a not-yet-reviewed approval has zero reviews), so an empty-list
+# capture response would let it return successfully instead of raising --
+# defeating the whole capture mechanism, which requires a deterministic
+# exception to confirm exactly one descriptor was built. One deliberately
+# malformed placeholder row (missing every required field) is used
+# instead, which validate_approval_review_record always rejects, still
+# driving that operation to a deterministic ApprovalResponseError without
+# ever performing real I/O or depending on any real database state.
+_CAPTURE_FAKE_RESPONSES: dict[str, list[Any]] = {
+    "load_approval_reviews": [{}],
 }
 
 _ROWS_ENVELOPE_FIELDS = ("kind", "rows")
@@ -127,7 +160,7 @@ def _validate_operation_input(operation: str, operation_input: Any) -> dict[str,
     return dict(operation_input)
 
 
-def _dispatch_persistence(operation: str, executor: Any, normalized_input: Mapping[str, Any]) -> dict[str, Any]:
+def _dispatch_persistence(operation: str, executor: Any, normalized_input: Mapping[str, Any]) -> Any:
     if operation == "insert_pending_approval":
         return insert_pending_approval(
             executor,
@@ -140,8 +173,26 @@ def _dispatch_persistence(operation: str, executor: Any, normalized_input: Mappi
         return apply_approval_review_transition(
             executor, normalized_input["current_record"], normalized_input["transition_plan"]
         )
-    return apply_approval_consumption(
-        executor, normalized_input["current_record"], normalized_input["transition_plan"]
+    if operation == "apply_approval_consumption":
+        return apply_approval_consumption(
+            executor, normalized_input["current_record"], normalized_input["transition_plan"]
+        )
+    if operation == "insert_risk_aware_pending_approval":
+        return insert_risk_aware_pending_approval(
+            executor,
+            normalized_input["request"],
+            normalized_input["current_investigation"],
+            expires_at=normalized_input["expires_at"],
+        )
+    if operation == "load_risk_aware_approval_record":
+        return load_risk_aware_approval_record(executor, normalized_input["approval_id"])
+    if operation == "load_approval_reviews":
+        return load_approval_reviews(executor, normalized_input["approval_id"])
+    return apply_multi_review_transition(
+        executor,
+        normalized_input["current_record"],
+        normalized_input["existing_reviews"],
+        normalized_input["transition_plan"],
     )
 
 
@@ -171,17 +222,20 @@ def _deep_ordered_equal(left: Any, right: Any) -> bool:
 class _DescriptorCaptureExecutor:
     """Prepare-phase executor: captures exactly one operation descriptor
     as an independently-owned deep copy and performs no I/O of any kind,
-    always returning an empty list. An empty list drives every one of the
-    four wrapped persistence functions to their own already-defined,
-    already-tested "zero rows" branch deterministically -- never a
-    guessed or synthetic result."""
+    always returning a fixed, operation-specific fake response (an empty
+    list for every Block 5 operation and for every Block 6 operation
+    except `load_approval_reviews`; see `_CAPTURE_FAKE_RESPONSES`). That
+    fixed response drives the wrapped persistence function to its own
+    already-defined, already-tested deterministic-failure branch -- never
+    a guessed or synthetic success."""
 
-    def __init__(self) -> None:
+    def __init__(self, fake_response: list[Any]) -> None:
         self.captured: list[dict[str, Any]] = []
+        self._fake_response = fake_response
 
     def __call__(self, operation: Mapping[str, Any]) -> list[Any]:
         self.captured.append(copy.deepcopy(dict(operation)))
-        return []
+        return self._fake_response
 
 
 class _VerifyExecutor:
@@ -281,7 +335,7 @@ def prepare_approval_operation(
     _validate_operation_name(operation)
     normalized_input = _validate_operation_input(operation, operation_input)
 
-    capture = _DescriptorCaptureExecutor()
+    capture = _DescriptorCaptureExecutor(_CAPTURE_FAKE_RESPONSES.get(operation, []))
     expected_exception_type = _EXPECTED_POST_CAPTURE_EXCEPTIONS[operation]
 
     caught_exception: Exception | None = None
@@ -350,7 +404,9 @@ def verify_approval_operation(
         }
 
     where `result` is exactly what the wrapped persistence function
-    itself returns, unwrapped and unaltered.
+    itself returns, unwrapped and unaltered -- a dict for every operation
+    except `load_approval_reviews`, which returns a list of review-summary
+    dicts instead.
 
     Raises `ApprovalBridgeError` for an unsupported operation, a
     malformed `operation_input`, a non-mapping or mismatched
@@ -377,8 +433,19 @@ def verify_approval_operation(
 
     result = _dispatch_persistence(operation, verify_executor, normalized_input)
 
+    # Every Block 5 operation, and every Block 6 operation except
+    # load_approval_reviews, returns a dict. load_approval_reviews returns
+    # a list of review-summary dicts instead -- dict(result) would raise
+    # for a list, so the packaging is type-aware, while remaining exactly
+    # copy.deepcopy(dict(result)) for every dict-returning operation,
+    # unchanged from before.
+    if isinstance(result, Mapping):
+        packaged_result: Any = copy.deepcopy(dict(result))
+    else:
+        packaged_result = copy.deepcopy(result)
+
     return {
         "phase": "verify",
         "operation": operation,
-        "result": copy.deepcopy(dict(result)),
+        "result": packaged_result,
     }

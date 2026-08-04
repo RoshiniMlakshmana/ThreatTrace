@@ -25,6 +25,11 @@ from core.approval_mcp_adapter import (
 _RECORD_FIELDS = adapter_module._RECORD_FIELDS
 _RETURNING_TEXT = ", ".join(_RECORD_FIELDS)
 
+_RISK_AWARE_RECORD_FIELDS = adapter_module._RISK_AWARE_RECORD_FIELDS
+_RISK_AWARE_RETURNING_TEXT = ", ".join(_RISK_AWARE_RECORD_FIELDS)
+_REVIEW_LOOKUP_COLUMNS = adapter_module._REVIEW_LOOKUP_COLUMNS
+_REVIEW_LOOKUP_TEXT = ", ".join(_REVIEW_LOOKUP_COLUMNS)
+
 
 # ---------------------------------------------------------------------------
 # Descriptor fixtures
@@ -115,6 +120,68 @@ def _rpc_descriptor() -> dict:
             "expected_action_type": "update_investigation_state",
             "consumed_by": "system",
             "consumed_at": "2026-01-01T03:00:00Z",
+        },
+    }
+
+
+def _risk_aware_insert_descriptor(with_expires_at: bool = False) -> dict:
+    values = {
+        "investigation_id": "11111111-1111-1111-1111-111111111111",
+        "action_type": "update_investigation_state",
+        "action_payload": {"confidence": "high", "status": "escalated"},
+        "requested_by": "analyst@example.com",
+        "requested_at": "2026-01-01T00:00:00Z",
+        "status": "pending",
+        "risk_level": "high",
+        "required_approvals": 2,
+        "requested_by_normalized": "analyst@example.com",
+    }
+    if with_expires_at:
+        values["expires_at"] = "2026-01-02T00:00:00Z"
+    return {
+        "operation": "insert",
+        "table": "approvals",
+        "values": values,
+        "returning": list(_RISK_AWARE_RECORD_FIELDS),
+    }
+
+
+def _risk_aware_select_descriptor() -> dict:
+    return {
+        "operation": "select",
+        "table": "approvals",
+        "columns": list(_RISK_AWARE_RECORD_FIELDS),
+        "filters": {"id": "22222222-2222-2222-2222-222222222222"},
+        "limit": 2,
+    }
+
+
+def _review_select_descriptor() -> dict:
+    return {
+        "operation": "select",
+        "table": "approval_reviews",
+        "columns": list(_REVIEW_LOOKUP_COLUMNS),
+        "filters": {"approval_id": "33333333-3333-3333-3333-333333333333"},
+        "order_by": "decided_at",
+        "limit": 10,
+    }
+
+
+def _review_rpc_descriptor(decision: str = "approve", rejection_reason: str | None = None) -> dict:
+    return {
+        "operation": "rpc",
+        "function": "record_approval_review_and_promote_status",
+        "parameters": {
+            "approval_id": "55555555-5555-5555-5555-555555555555",
+            "expected_from_status": "pending",
+            "expected_to_status": "partially_approved" if decision == "approve" else "rejected",
+            "expected_required_approvals": 2,
+            "expected_approval_count_before": 0,
+            "reviewer_identity": "reviewer@example.com",
+            "reviewer_identity_normalized": "reviewer@example.com",
+            "decision": decision,
+            "decided_at": "2026-01-01T03:00:00Z",
+            "rejection_reason": rejection_reason,
         },
     }
 
@@ -780,3 +847,219 @@ class TestNormalizeNonMutation:
         first = normalize_supabase_mcp_response("load_approval_record", response)
         second = normalize_supabase_mcp_response("load_approval_record", response)
         assert first["rows"][0] is not second["rows"][0]
+
+
+# ---------------------------------------------------------------------------
+# Block 6, Step 4: fixed templates for risk-aware operations
+# ---------------------------------------------------------------------------
+
+
+class TestBlock6RiskAwareTemplates:
+    # 1. Fixed risk-aware approval INSERT SQL (both without and with
+    # expires_at -- one descriptor shape, one test).
+    def test_exact_risk_aware_insert_sql(self):
+        result = prepare_supabase_mcp_call(_risk_aware_insert_descriptor(with_expires_at=False))
+        expected_without_expiry = (
+            "INSERT INTO public.approvals "
+            "(investigation_id, action_type, action_payload, requested_by, requested_at, status, "
+            "risk_level, required_approvals, requested_by_normalized) "
+            "VALUES ("
+            "'11111111-1111-1111-1111-111111111111'::uuid, "
+            "'update_investigation_state', "
+            "'{\"confidence\":\"high\",\"status\":\"escalated\"}'::jsonb, "
+            "'analyst@example.com', "
+            "'2026-01-01T00:00:00Z'::timestamptz, "
+            "'pending', "
+            "'high', "
+            "2, "
+            "'analyst@example.com') "
+            "RETURNING " + _RISK_AWARE_RETURNING_TEXT + ";"
+        )
+        assert result["arguments"]["query"] == expected_without_expiry
+
+        result_with_expiry = prepare_supabase_mcp_call(_risk_aware_insert_descriptor(with_expires_at=True))
+        expected_with_expiry = (
+            "INSERT INTO public.approvals "
+            "(investigation_id, action_type, action_payload, requested_by, requested_at, status, "
+            "risk_level, required_approvals, requested_by_normalized, expires_at) "
+            "VALUES ("
+            "'11111111-1111-1111-1111-111111111111'::uuid, "
+            "'update_investigation_state', "
+            "'{\"confidence\":\"high\",\"status\":\"escalated\"}'::jsonb, "
+            "'analyst@example.com', "
+            "'2026-01-01T00:00:00Z'::timestamptz, "
+            "'pending', "
+            "'high', "
+            "2, "
+            "'analyst@example.com', "
+            "'2026-01-02T00:00:00Z'::timestamptz) "
+            "RETURNING " + _RISK_AWARE_RETURNING_TEXT + ";"
+        )
+        assert result_with_expiry["arguments"]["query"] == expected_with_expiry
+
+    # 2. Fixed risk-aware approval SELECT SQL.
+    def test_exact_risk_aware_select_sql(self):
+        result = prepare_supabase_mcp_call(_risk_aware_select_descriptor())
+        expected = (
+            "SELECT " + _RISK_AWARE_RETURNING_TEXT + " FROM public.approvals "
+            "WHERE id = '22222222-2222-2222-2222-222222222222'::uuid LIMIT 2;"
+        )
+        assert result["arguments"]["query"] == expected
+
+    # 3. Fixed ordered approval-review SELECT SQL.
+    def test_exact_ordered_review_select_sql(self):
+        result = prepare_supabase_mcp_call(_review_select_descriptor())
+        expected = (
+            "SELECT " + _REVIEW_LOOKUP_TEXT + " FROM public.approval_reviews "
+            "WHERE approval_id = '33333333-3333-3333-3333-333333333333'::uuid "
+            "ORDER BY decided_at LIMIT 10;"
+        )
+        assert result["arguments"]["query"] == expected
+
+    # 4. Fixed record_approval_review_and_promote_status RPC SQL (both
+    # the approve and reject shapes -- one descriptor family, one test).
+    def test_exact_review_rpc_sql(self):
+        result = prepare_supabase_mcp_call(_review_rpc_descriptor(decision="approve"))
+        expected_approve = (
+            "SELECT * FROM public.record_approval_review_and_promote_status("
+            "'55555555-5555-5555-5555-555555555555'::uuid, "
+            "'pending', "
+            "'partially_approved', "
+            "2, "
+            "0, "
+            "'reviewer@example.com', "
+            "'reviewer@example.com', "
+            "'approve', "
+            "'2026-01-01T03:00:00Z'::timestamptz, "
+            "NULL);"
+        )
+        assert result["arguments"]["query"] == expected_approve
+
+        reject_descriptor = _review_rpc_descriptor(decision="reject", rejection_reason="insufficient evidence")
+        reject_result = prepare_supabase_mcp_call(reject_descriptor)
+        expected_reject = (
+            "SELECT * FROM public.record_approval_review_and_promote_status("
+            "'55555555-5555-5555-5555-555555555555'::uuid, "
+            "'pending', "
+            "'rejected', "
+            "2, "
+            "0, "
+            "'reviewer@example.com', "
+            "'reviewer@example.com', "
+            "'reject', "
+            "'2026-01-01T03:00:00Z'::timestamptz, "
+            "'insufficient evidence');"
+        )
+        assert reject_result["arguments"]["query"] == expected_reject
+
+    # 5. Exact escaping and canonical timestamp/JSON encoding.
+    def test_exact_escaping_and_canonicalization(self):
+        # Single-quote escaping in a Block 6 rejection_reason value passed
+        # through the new nullable_text encoder.
+        escaped_descriptor = _review_rpc_descriptor(decision="reject", rejection_reason="reviewer's concern")
+        escaped_result = prepare_supabase_mcp_call(escaped_descriptor)
+        assert "'reviewer''s concern'" in escaped_result["arguments"]["query"]
+
+        # NULL literal (not the string "None" or an empty string) for an
+        # absent rejection_reason on an approve descriptor.
+        approve_result = prepare_supabase_mcp_call(_review_rpc_descriptor(decision="approve"))
+        assert approve_result["arguments"]["query"].endswith("NULL);")
+
+        # Canonical timestamp round trip on the risk-aware insert path.
+        insert_result = prepare_supabase_mcp_call(_risk_aware_insert_descriptor())
+        assert "'2026-01-01T00:00:00Z'::timestamptz" in insert_result["arguments"]["query"]
+
+    # 6. Forged or unknown descriptors rejected, across every Block 6
+    # descriptor shape.
+    def test_forged_or_unknown_descriptors_rejected(self):
+        forged_insert = _risk_aware_insert_descriptor()
+        forged_insert["values"].pop("risk_level")
+        with pytest.raises(ApprovalMcpAdapterError):
+            prepare_supabase_mcp_call(forged_insert)
+
+        forged_select = _risk_aware_select_descriptor()
+        forged_select["columns"] = list(_RISK_AWARE_RECORD_FIELDS)[::-1]
+        with pytest.raises(ApprovalMcpAdapterError):
+            prepare_supabase_mcp_call(forged_select)
+
+        forged_review_select = _review_select_descriptor()
+        forged_review_select["table"] = "approvals"
+        with pytest.raises(ApprovalMcpAdapterError):
+            prepare_supabase_mcp_call(forged_review_select)
+
+        unknown_function_rpc = _review_rpc_descriptor()
+        unknown_function_rpc["function"] = "some_other_function"
+        with pytest.raises(ApprovalMcpAdapterError):
+            prepare_supabase_mcp_call(unknown_function_rpc)
+
+        forged_rpc_params = _review_rpc_descriptor()
+        forged_rpc_params["parameters"]["extra"] = 1
+        with pytest.raises(ApprovalMcpAdapterError):
+            prepare_supabase_mcp_call(forged_rpc_params)
+
+
+class TestBlock6ReviewRpcResultNormalization:
+    def _review_rpc_row(self, **overrides) -> dict:
+        row = {
+            "id": "55555555-5555-5555-5555-555555555555",
+            "investigation_id": "11111111-1111-1111-1111-111111111111",
+            "action_type": "update_investigation_state",
+            "action_payload": {"status": "closed"},
+            "status": "partially_approved",
+            "requested_by": "analyst@example.com",
+            "requested_at": "2026-01-01 00:00:00+00",
+            "expires_at": None,
+            "approved_by": None,
+            "approved_at": None,
+            "rejected_by": None,
+            "rejected_at": None,
+            "rejection_reason": None,
+            "consumed_by": None,
+            "consumed_at": None,
+            "created_at": "2026-01-01 00:00:00+00",
+            "risk_level": "high",
+            "required_approvals": 2,
+            "review_approval_id": "55555555-5555-5555-5555-555555555555",
+            "reviewer_identity": "reviewer@example.com",
+            "reviewer_identity_normalized": "reviewer@example.com",
+            "review_decision": "approve",
+            "review_decided_at": "2026-01-01 03:00:00+00",
+            "approval_count": 1,
+        }
+        row.update(overrides)
+        return row
+
+    # 7. Twenty-four-field successful response normalization.
+    def test_twenty_four_field_success_normalization(self):
+        row = self._review_rpc_row()
+        assert len(row) == 24
+        response = {"result": _wrap_block(_BLOCK_UUID, json.dumps([row]))}
+
+        result = normalize_supabase_mcp_response("apply_multi_review_transition", response)
+
+        assert result["kind"] == "rows"
+        normalized_row = result["rows"][0]
+        assert normalized_row["requested_at"] == "2026-01-01T00:00:00Z"
+        assert normalized_row["review_decided_at"] == "2026-01-01T03:00:00Z"
+        assert normalized_row["approval_count"] == 1
+        assert normalized_row["risk_level"] == "high"
+
+    # 8. Zero-row and transport-error normalization, for both the review
+    # RPC and the ordered review lookup.
+    def test_zero_row_and_transport_error_normalization(self):
+        zero_row_response = {"result": _wrap_block(_BLOCK_UUID, "[]")}
+        assert normalize_supabase_mcp_response("apply_multi_review_transition", zero_row_response) == {
+            "kind": "rows", "rows": [],
+        }
+
+        transport_error_response = {"error": {"name": "HttpException", "message": "raw postgres text"}}
+        assert normalize_supabase_mcp_response("apply_multi_review_transition", transport_error_response) == {
+            "kind": "transport_error",
+        }
+
+        assert normalize_supabase_mcp_response("load_approval_reviews", zero_row_response) == {
+            "kind": "rows", "rows": [],
+        }
+        assert normalize_supabase_mcp_response("load_approval_reviews", transport_error_response) == {
+            "kind": "transport_error",
+        }

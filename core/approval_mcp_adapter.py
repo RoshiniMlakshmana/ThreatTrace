@@ -78,8 +78,11 @@ _INVALID_RESPONSE_MESSAGE = "Invalid approval MCP response."
 _MCP_TOOL_NAME = "mcp__supabase__execute_sql"
 
 _APPROVALS_TABLE_SQL = "public.approvals"
+_APPROVAL_REVIEWS_TABLE_SQL = "public.approval_reviews"
 _RPC_FUNCTION_NAME = "consume_approval_and_update_investigation_state"
 _RPC_FUNCTION_SQL = "public." + _RPC_FUNCTION_NAME
+_REVIEW_RPC_FUNCTION_NAME = "record_approval_review_and_promote_status"
+_REVIEW_RPC_FUNCTION_SQL = "public." + _REVIEW_RPC_FUNCTION_NAME
 
 _RECORD_FIELDS = (
     "id",
@@ -100,11 +103,27 @@ _RECORD_FIELDS = (
     "created_at",
 )
 
+_RISK_AWARE_RECORD_FIELDS = _RECORD_FIELDS + ("risk_level", "required_approvals")
+
+_REVIEW_LOOKUP_COLUMNS = (
+    "approval_id",
+    "reviewer_identity",
+    "reviewer_identity_normalized",
+    "decision",
+    "decided_at",
+)
+_REVIEW_LOOKUP_ORDER_BY = "decided_at"
+_REVIEW_LOOKUP_LIMIT = 10
+
 _SUPPORTED_OPERATIONS = (
     "insert_pending_approval",
     "load_approval_record",
     "apply_approval_review_transition",
     "apply_approval_consumption",
+    "insert_risk_aware_pending_approval",
+    "load_risk_aware_approval_record",
+    "load_approval_reviews",
+    "apply_multi_review_transition",
 )
 _SUPPORTED_OPERATIONS_SET = frozenset(_SUPPORTED_OPERATIONS)
 
@@ -119,6 +138,15 @@ _OPERATION_TIMESTAMP_FIELDS: dict[str, tuple[str, ...]] = {
     "apply_approval_consumption": (
         "requested_at", "approved_at", "rejected_at", "expires_at", "consumed_at", "created_at",
         "investigation_updated_at",
+    ),
+    "insert_risk_aware_pending_approval": ("requested_at", "expires_at", "created_at"),
+    "load_risk_aware_approval_record": (
+        "requested_at", "approved_at", "rejected_at", "expires_at", "consumed_at", "created_at",
+    ),
+    "load_approval_reviews": ("decided_at",),
+    "apply_multi_review_transition": (
+        "requested_at", "approved_at", "rejected_at", "expires_at", "consumed_at", "created_at",
+        "review_decided_at",
     ),
 }
 
@@ -166,12 +194,76 @@ _RPC_PARAMETER_TYPES = {
     "consumed_at": "timestamptz",
 }
 
+# ---------------------------------------------------------------------------
+# Block 6 descriptor shape constants (mirroring core.approval_persistence
+# exactly)
+# ---------------------------------------------------------------------------
+
+_RISK_AWARE_INSERT_REQUIRED_VALUE_FIELDS = frozenset({
+    "investigation_id", "action_type", "action_payload", "requested_by", "requested_at", "status",
+    "risk_level", "required_approvals", "requested_by_normalized",
+})
+_RISK_AWARE_INSERT_ALLOWED_VALUE_FIELDS = _RISK_AWARE_INSERT_REQUIRED_VALUE_FIELDS | {"expires_at"}
+_RISK_AWARE_INSERT_COLUMN_ORDER = (
+    "investigation_id", "action_type", "action_payload", "requested_by", "requested_at", "status",
+    "risk_level", "required_approvals", "requested_by_normalized", "expires_at",
+)
+_RISK_AWARE_INSERT_COLUMN_TYPES = {
+    "investigation_id": "uuid",
+    "action_type": "text",
+    "action_payload": "jsonb",
+    "requested_by": "text",
+    "requested_at": "timestamptz",
+    "status": "text",
+    "risk_level": "text",
+    "required_approvals": "smallint",
+    "requested_by_normalized": "text",
+    "expires_at": "timestamptz",
+}
+
+_REVIEW_SELECT_TOP_FIELDS = frozenset({"operation", "table", "columns", "filters", "order_by", "limit"})
+
+_REVIEW_RPC_TOP_FIELDS = frozenset({"operation", "function", "parameters"})
+_REVIEW_RPC_PARAMETER_ORDER = (
+    "approval_id",
+    "expected_from_status",
+    "expected_to_status",
+    "expected_required_approvals",
+    "expected_approval_count_before",
+    "reviewer_identity",
+    "reviewer_identity_normalized",
+    "decision",
+    "decided_at",
+    "rejection_reason",
+)
+_REVIEW_RPC_PARAMETER_TYPES = {
+    "approval_id": "uuid",
+    "expected_from_status": "text",
+    "expected_to_status": "text",
+    "expected_required_approvals": "smallint",
+    "expected_approval_count_before": "integer",
+    "reviewer_identity": "text",
+    "reviewer_identity_normalized": "text",
+    "decision": "text",
+    "decided_at": "timestamptz",
+    "rejection_reason": "nullable_text",
+}
+
+_REVIEW_RPC_RESULT_FIELDS = _RISK_AWARE_RECORD_FIELDS + (
+    "review_approval_id",
+    "reviewer_identity",
+    "reviewer_identity_normalized",
+    "review_decision",
+    "review_decided_at",
+    "approval_count",
+)
+
 
 # ---------------------------------------------------------------------------
 # Narrow value encoders -- the only path from a validated Python value to
 # a SQL literal. No caller-supplied identifier is ever accepted; only
-# these value encoders exist, and only for the exact types the four
-# approval descriptors ever use.
+# these value encoders exist, and only for the exact types the approval
+# descriptors ever use.
 # ---------------------------------------------------------------------------
 
 _UUID_PATTERN = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
@@ -210,6 +302,28 @@ def _encode_jsonb(value: Any) -> str:
     return f"'{escaped}'::jsonb"
 
 
+def _encode_smallint(value: Any) -> str:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ApprovalMcpAdapterError(_INVALID_DESCRIPTOR_MESSAGE)
+    if not (-32768 <= value <= 32767):
+        raise ApprovalMcpAdapterError(_INVALID_DESCRIPTOR_MESSAGE)
+    return str(value)
+
+
+def _encode_integer(value: Any) -> str:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ApprovalMcpAdapterError(_INVALID_DESCRIPTOR_MESSAGE)
+    if not (-2147483648 <= value <= 2147483647):
+        raise ApprovalMcpAdapterError(_INVALID_DESCRIPTOR_MESSAGE)
+    return str(value)
+
+
+def _encode_nullable_text(value: Any) -> str:
+    if value is None:
+        return "NULL"
+    return _encode_text(value)
+
+
 def _encode_value(value: Any, type_name: str) -> str:
     if type_name == "uuid":
         return _encode_uuid(value)
@@ -219,6 +333,12 @@ def _encode_value(value: Any, type_name: str) -> str:
         return _encode_timestamptz(value)
     if type_name == "jsonb":
         return _encode_jsonb(value)
+    if type_name == "smallint":
+        return _encode_smallint(value)
+    if type_name == "integer":
+        return _encode_integer(value)
+    if type_name == "nullable_text":
+        return _encode_nullable_text(value)
     raise ApprovalMcpAdapterError(_INVALID_DESCRIPTOR_MESSAGE)  # pragma: no cover -- unreachable, defense in depth
 
 
@@ -341,21 +461,124 @@ def _build_rpc_sql(descriptor: Mapping[str, Any]) -> str:
     return "SELECT * FROM " + _RPC_FUNCTION_SQL + "(" + ", ".join(encoded_args) + ");"
 
 
+# ---------------------------------------------------------------------------
+# Block 6 fixed SQL-statement builders
+# ---------------------------------------------------------------------------
+
+
+def _build_risk_aware_insert_sql(descriptor: Mapping[str, Any]) -> str:
+    if set(descriptor) != _INSERT_TOP_FIELDS:
+        raise ApprovalMcpAdapterError(_INVALID_DESCRIPTOR_MESSAGE)
+    if descriptor["operation"] != "insert" or descriptor["table"] != "approvals":
+        raise ApprovalMcpAdapterError(_INVALID_DESCRIPTOR_MESSAGE)
+
+    values = descriptor["values"]
+    if not isinstance(values, Mapping):
+        raise ApprovalMcpAdapterError(_INVALID_DESCRIPTOR_MESSAGE)
+    value_fields = set(values)
+    if not (_RISK_AWARE_INSERT_REQUIRED_VALUE_FIELDS <= value_fields <= _RISK_AWARE_INSERT_ALLOWED_VALUE_FIELDS):
+        raise ApprovalMcpAdapterError(_INVALID_DESCRIPTOR_MESSAGE)
+    if values["status"] != "pending":
+        raise ApprovalMcpAdapterError(_INVALID_DESCRIPTOR_MESSAGE)
+
+    if descriptor["returning"] != list(_RISK_AWARE_RECORD_FIELDS):
+        raise ApprovalMcpAdapterError(_INVALID_DESCRIPTOR_MESSAGE)
+
+    columns = [name for name in _RISK_AWARE_INSERT_COLUMN_ORDER if name in values]
+    encoded_values = [_encode_value(values[name], _RISK_AWARE_INSERT_COLUMN_TYPES[name]) for name in columns]
+
+    return (
+        "INSERT INTO " + _APPROVALS_TABLE_SQL + " (" + ", ".join(columns) + ") "
+        "VALUES (" + ", ".join(encoded_values) + ") "
+        "RETURNING " + ", ".join(_RISK_AWARE_RECORD_FIELDS) + ";"
+    )
+
+
+def _build_risk_aware_select_sql(descriptor: Mapping[str, Any]) -> str:
+    if set(descriptor) != _SELECT_TOP_FIELDS:
+        raise ApprovalMcpAdapterError(_INVALID_DESCRIPTOR_MESSAGE)
+    if descriptor["operation"] != "select" or descriptor["table"] != "approvals":
+        raise ApprovalMcpAdapterError(_INVALID_DESCRIPTOR_MESSAGE)
+    if descriptor["columns"] != list(_RISK_AWARE_RECORD_FIELDS):
+        raise ApprovalMcpAdapterError(_INVALID_DESCRIPTOR_MESSAGE)
+    if descriptor["limit"] != 2:
+        raise ApprovalMcpAdapterError(_INVALID_DESCRIPTOR_MESSAGE)
+
+    filters = descriptor["filters"]
+    if not isinstance(filters, Mapping) or set(filters) != {"id"}:
+        raise ApprovalMcpAdapterError(_INVALID_DESCRIPTOR_MESSAGE)
+
+    approval_id_literal = _encode_uuid(filters["id"])
+
+    return (
+        "SELECT " + ", ".join(_RISK_AWARE_RECORD_FIELDS) + " FROM " + _APPROVALS_TABLE_SQL +
+        " WHERE id = " + approval_id_literal + " LIMIT 2;"
+    )
+
+
+def _build_review_select_sql(descriptor: Mapping[str, Any]) -> str:
+    if set(descriptor) != _REVIEW_SELECT_TOP_FIELDS:
+        raise ApprovalMcpAdapterError(_INVALID_DESCRIPTOR_MESSAGE)
+    if descriptor["operation"] != "select" or descriptor["table"] != "approval_reviews":
+        raise ApprovalMcpAdapterError(_INVALID_DESCRIPTOR_MESSAGE)
+    if descriptor["columns"] != list(_REVIEW_LOOKUP_COLUMNS):
+        raise ApprovalMcpAdapterError(_INVALID_DESCRIPTOR_MESSAGE)
+    if descriptor["order_by"] != _REVIEW_LOOKUP_ORDER_BY:
+        raise ApprovalMcpAdapterError(_INVALID_DESCRIPTOR_MESSAGE)
+    if descriptor["limit"] != _REVIEW_LOOKUP_LIMIT:
+        raise ApprovalMcpAdapterError(_INVALID_DESCRIPTOR_MESSAGE)
+
+    filters = descriptor["filters"]
+    if not isinstance(filters, Mapping) or set(filters) != {"approval_id"}:
+        raise ApprovalMcpAdapterError(_INVALID_DESCRIPTOR_MESSAGE)
+
+    approval_id_literal = _encode_uuid(filters["approval_id"])
+
+    return (
+        "SELECT " + ", ".join(_REVIEW_LOOKUP_COLUMNS) + " FROM " + _APPROVAL_REVIEWS_TABLE_SQL +
+        " WHERE approval_id = " + approval_id_literal +
+        " ORDER BY " + _REVIEW_LOOKUP_ORDER_BY + " LIMIT " + str(_REVIEW_LOOKUP_LIMIT) + ";"
+    )
+
+
+def _build_review_rpc_sql(descriptor: Mapping[str, Any]) -> str:
+    if set(descriptor) != _REVIEW_RPC_TOP_FIELDS:
+        raise ApprovalMcpAdapterError(_INVALID_DESCRIPTOR_MESSAGE)
+    if descriptor["operation"] != "rpc" or descriptor["function"] != _REVIEW_RPC_FUNCTION_NAME:
+        raise ApprovalMcpAdapterError(_INVALID_DESCRIPTOR_MESSAGE)
+
+    parameters = descriptor["parameters"]
+    if not isinstance(parameters, Mapping) or set(parameters) != set(_REVIEW_RPC_PARAMETER_ORDER):
+        raise ApprovalMcpAdapterError(_INVALID_DESCRIPTOR_MESSAGE)
+
+    encoded_args = [
+        _encode_value(parameters[name], _REVIEW_RPC_PARAMETER_TYPES[name]) for name in _REVIEW_RPC_PARAMETER_ORDER
+    ]
+
+    return "SELECT * FROM " + _REVIEW_RPC_FUNCTION_SQL + "(" + ", ".join(encoded_args) + ");"
+
+
 def prepare_supabase_mcp_call(descriptor: Mapping[str, Any]) -> dict[str, Any]:
     """Convert one exact, already-verified approval-persistence operation
     descriptor into exactly one `mcp__supabase__execute_sql` tool-call
     request.
 
-    Only the four descriptor shapes already emitted by
+    Only the eight descriptor shapes already emitted by
     `core.approval_persistence` (via `core.approval_bridge`) are
     understood: a pending-approval insert, an approval-by-ID select, an
-    approve/reject conditional update, or the atomic consumption RPC. No
-    other operation name, table, function, column set, filter set, or
+    approve/reject conditional update, the atomic consumption RPC, a
+    risk-aware pending-approval insert, a risk-aware approval-by-ID
+    select, an ordered approval-review select, or the atomic review RPC.
+    No other operation name, table, function, column set, filter set, or
     `returning`/`columns` order is accepted -- every identifier used in
     the generated SQL comes from a fixed constant owned by this module,
     never from the descriptor's own text. JSON-object key order in the
     descriptor is never security-significant; list order (column and
-    `returning` order) is always checked exactly.
+    `returning` order) is always checked exactly. Within the `insert`,
+    `select`, and `rpc` branches, the Block 5 and Block 6 shapes are
+    disambiguated by cheap, explicit discriminators (`table` for select,
+    `returning` shape for insert, `function` name for rpc) before either
+    builder is invoked -- never by a fragile try/except cascade.
 
     Returns exactly:
 
@@ -377,13 +600,24 @@ def prepare_supabase_mcp_call(descriptor: Mapping[str, Any]) -> dict[str, Any]:
 
     try:
         if operation == "insert":
-            sql = _build_insert_sql(descriptor)
+            if descriptor.get("table") == "approvals" and descriptor.get("returning") == list(_RISK_AWARE_RECORD_FIELDS):
+                sql = _build_risk_aware_insert_sql(descriptor)
+            else:
+                sql = _build_insert_sql(descriptor)
         elif operation == "select":
-            sql = _build_select_sql(descriptor)
+            if descriptor.get("table") == "approval_reviews":
+                sql = _build_review_select_sql(descriptor)
+            elif descriptor.get("columns") == list(_RISK_AWARE_RECORD_FIELDS):
+                sql = _build_risk_aware_select_sql(descriptor)
+            else:
+                sql = _build_select_sql(descriptor)
         elif operation == "update":
             sql = _build_update_sql(descriptor)
         elif operation == "rpc":
-            sql = _build_rpc_sql(descriptor)
+            if descriptor.get("function") == _REVIEW_RPC_FUNCTION_NAME:
+                sql = _build_review_rpc_sql(descriptor)
+            else:
+                sql = _build_rpc_sql(descriptor)
         else:
             raise ApprovalMcpAdapterError(_INVALID_DESCRIPTOR_MESSAGE)
     except ApprovalMcpAdapterError:
@@ -503,8 +737,10 @@ def normalize_supabase_mcp_response(operation: str, tool_response: Mapping[str, 
     the bridge's own canonical executor-response envelope.
 
     `operation` must be exactly one of `insert_pending_approval`,
-    `load_approval_record`, `apply_approval_review_transition`, or
-    `apply_approval_consumption` -- used only to select which known
+    `load_approval_record`, `apply_approval_review_transition`,
+    `apply_approval_consumption`, `insert_risk_aware_pending_approval`,
+    `load_risk_aware_approval_record`, `load_approval_reviews`, or
+    `apply_multi_review_transition` -- used only to select which known
     timestamp fields may appear in that operation's returned rows; this
     function never duplicates full approval-record validation, which
     remains entirely `core.approval_bridge`/`core.approval_persistence`'s

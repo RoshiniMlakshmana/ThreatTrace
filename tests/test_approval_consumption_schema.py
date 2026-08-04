@@ -67,6 +67,19 @@ EXISTING_TABLE_NAMES = (
     "approvals",
 )
 
+# Block 6, Step 4: the sole authorized new table.
+AUTHORIZED_NEW_TABLE_NAMES = ("approval_reviews",)
+
+# Block 6, Step 4: the sole authorized new columns on public.approvals.
+AUTHORIZED_NEW_APPROVALS_COLUMN_NAMES = ("risk_level", "required_approvals", "requested_by_normalized")
+
+# Block 6, Step 4: the sole authorized second RPC, alongside the
+# original consumption function (FUNCTION_NAME, defined above).
+AUTHORIZED_RPC_FUNCTION_NAMES = (
+    FUNCTION_NAME,
+    "public.record_approval_review_and_promote_status",
+)
+
 
 # ---------------------------------------------------------------------------
 # Robust, quote-aware SQL parsing helpers (test-only; no third-party parser)
@@ -389,6 +402,28 @@ def _grant_details():
 
 def _arg_type_list(args_text):
     return [_normalize_sql(item).lower() for item in _split_top_level(args_text)]
+
+
+def _all_permission_matches(schema_text, verb):
+    """Return one dict per REVOKE/GRANT EXECUTE ON FUNCTION statement for
+    *any* function name (not scoped to FUNCTION_NAME) matching the given
+    verb ("revoke" or "grant"), each with its own function name and
+    role-list tail -- used by test_174 to verify both authorized RPCs'
+    permission statements precisely, the same way _all_revoke_matches
+    already does for the single consumption RPC alone."""
+    pattern = re.compile(
+        r"(revoke|grant)\s+execute\s+on\s+function\s+([\w.]+)\s*\(",
+        re.IGNORECASE,
+    )
+    results = []
+    for match in pattern.finditer(schema_text):
+        if match.group(1).lower() != verb:
+            continue
+        open_paren_index = match.end() - 1
+        _args_text, after_index = _extract_parenthesized_block(schema_text, open_paren_index)
+        tail = schema_text[after_index:after_index + 80]
+        results.append({"function": match.group(2), "tail": tail})
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -869,12 +904,33 @@ def test_087_malformed_action_error_message_contains_no_payload_values():
 
 
 def test_088_no_status_confidence_vocabulary_list_duplicated():
+    # Block 6 added a risk-aware authorization guard to this same
+    # function's WHERE clause, re-verifying the stored risk_level ->
+    # required_approvals mapping via two small value groups,
+    # risk_level in ('low', 'medium') and risk_level in ('high',
+    # 'critical'). Those groups share individual words with the
+    # confidence vocabulary by incidental English overlap, but neither
+    # group equals or is a superset of either forbidden vocabulary below
+    # (confidence_levels also requires 'unknown', which risk_level never
+    # uses; 'critical' belongs to no investigation vocabulary at all) --
+    # so this remains a distinct, legitimate risk vocabulary, never a
+    # duplicate of an investigation vocabulary. The real security
+    # property this test enforces -- that the full investigation-status
+    # or confidence-level vocabulary is never independently re-listed
+    # inside this function -- is checked directly below, per `in (...)`
+    # clause, rather than by banning individual words that a legitimate,
+    # differently-scoped vocabulary might also happen to use.
     body = _function_body_normalized()
-    for forbidden in (
-        "'open'", "'investigating'", "'awaiting_evidence'", "'escalated'", "'closed'",
-        "'low'", "'medium'", "'high'", "'unknown'",
-    ):
-        assert forbidden not in body
+
+    investigation_statuses = {"open", "investigating", "awaiting_evidence", "escalated", "closed"}
+    confidence_levels = {"low", "medium", "high", "unknown"}
+
+    for value_list_text in re.findall(r"in\s*\(([^)]*)\)", body):
+        values = set(_quoted_values(value_list_text))
+        if not values:
+            continue
+        assert not values >= investigation_statuses, f"investigation status vocabulary duplicated: {values}"
+        assert not values >= confidence_levels, f"confidence vocabulary duplicated: {values}"
 
 
 # ---------------------------------------------------------------------------
@@ -1209,10 +1265,15 @@ def test_140_existing_tables_remain_present():
 
 
 def test_141_no_eighth_table_was_created():
+    # Block 6, Step 4 authorized exactly one new table,
+    # public.approval_reviews. This remains a strict exact-set
+    # assertion -- no table beyond the original seven plus this one
+    # authorized addition may exist.
     schema_text = _read_schema_text()
     matches = re.findall(r"create\s+table\s+if\s+not\s+exists\s+(\w+)", schema_text, re.IGNORECASE)
-    assert len(matches) == len(EXISTING_TABLE_NAMES)
-    assert set(name.lower() for name in matches) == set(EXISTING_TABLE_NAMES)
+    expected_tables = set(EXISTING_TABLE_NAMES) | set(AUTHORIZED_NEW_TABLE_NAMES)
+    assert len(matches) == len(expected_tables)
+    assert set(name.lower() for name in matches) == expected_tables
 
 
 def test_142_existing_approvals_constraints_remain_present():
@@ -1255,19 +1316,36 @@ def test_146_no_new_trigger_is_created():
 
 
 def test_147_no_new_table_is_created():
+    # Recognizes exactly public.approval_reviews as the sole authorized
+    # new table introduced by Block 6 -- an exact-set assertion, never a
+    # subset check, so no additional unexpected table may be accepted.
     schema_text = _read_schema_text()
     matches = re.findall(r"create\s+table\s+if\s+not\s+exists\s+(\w+)", schema_text, re.IGNORECASE)
-    assert len(matches) == 7
+    expected_tables = set(EXISTING_TABLE_NAMES) | set(AUTHORIZED_NEW_TABLE_NAMES)
+    assert len(matches) == 8
+    assert len(matches) == len(expected_tables)
+    assert set(name.lower() for name in matches) == expected_tables
 
 
 def test_148_no_new_column_is_added_to_approvals():
+    # Block 6, Step 4 authorized exactly three new columns on
+    # public.approvals: risk_level, required_approvals, and
+    # requested_by_normalized. This remains a strict exact-set
+    # assertion against the original sixteen (APPROVAL_RETURN_COLUMN_NAMES,
+    # this same file's own existing sixteen-field approval-record
+    # contract) plus exactly this authorized delta -- no unrelated
+    # approval column may be accepted.
     schema_text = _read_schema_text()
     approvals_match = re.search(r"create\s+table\s+if\s+not\s+exists\s+approvals\b", schema_text, re.IGNORECASE)
     open_paren_index = schema_text.find("(", approvals_match.end())
     body, _end = _extract_parenthesized_block(schema_text, open_paren_index)
     items = _split_top_level(_strip_line_comments(body))
     columns = [item for item in items if not _normalize_sql(item).lower().startswith("constraint")]
-    assert len(columns) == 16
+    column_names = {_normalize_sql(item).split()[0] for item in columns}
+    expected_columns = set(APPROVAL_RETURN_COLUMN_NAMES) | set(AUTHORIZED_NEW_APPROVALS_COLUMN_NAMES)
+    assert len(columns) == 16 + len(AUTHORIZED_NEW_APPROVALS_COLUMN_NAMES)
+    assert len(columns) == len(expected_columns)
+    assert column_names == expected_columns
 
 
 def test_149_no_action_hash_column_or_reference_added():
@@ -1276,9 +1354,40 @@ def test_149_no_action_hash_column_or_reference_added():
 
 
 def test_150_no_immutable_history_trigger_added():
+    # The real security property is that no trigger-based immutable-
+    # history mechanism was introduced -- not that the English word
+    # "immutable" never appears in a comment. Block 6's approval_reviews
+    # table comment legitimately uses that word to describe its own
+    # insert-only design ("one immutable row per individual reviewer
+    # decision"), which is documentation, not an executable construct.
+    # This test now inspects executable schema constructs directly.
+    schema_text = _read_schema_text()
+
+    # No new trigger of any kind exists beyond the one pre-authorized
+    # investigations.updated_at trigger -- this alone structurally rules
+    # out any trigger-based history/audit/immutability mechanism,
+    # regardless of what it might have been named.
+    triggers = re.findall(r"create\s+trigger\s+(\w+)", schema_text, re.IGNORECASE)
+    assert triggers == ["trg_investigations_updated_at"]
+
+    # No trigger-support function whose name suggests a history/audit/
+    # immutability mechanism was added.
+    function_names = re.findall(
+        r"create\s+or\s+replace\s+function\s+(?:public\.)?(\w+)", schema_text, re.IGNORECASE
+    )
+    for name in function_names:
+        lowered = name.lower()
+        assert "history" not in lowered
+        assert "immutable" not in lowered
+        assert "audit" not in lowered
+
+    # No trigger-based UPDATE interception targets approval_reviews (or
+    # any table) beyond the one existing, pre-authorized trigger.
+    assert not re.search(r"\bupdate\s+on\s+approval_reviews\b", schema_text, re.IGNORECASE)
+
+    # The function body itself still never references "immutable" as
+    # executable logic.
     body = _function_body_normalized()
-    schema_text = _read_schema_text().lower()
-    assert "immutable" not in schema_text
     assert "immutable" not in body
 
 
@@ -1500,12 +1609,38 @@ def test_173_no_alter_default_privileges_statement_exists():
 
 
 def test_174_no_unrelated_function_permission_statement_changed():
+    # Block 6, Step 4 authorized a second RPC,
+    # record_approval_review_and_promote_status, with its own identical
+    # hardened privilege pattern. This test now requires the exact
+    # expected permission statements for both authorized RPCs -- an
+    # exact function-name set, never a loosened "service_role appears
+    # somewhere" search -- and continues to reject any unrelated
+    # function appearing in any REVOKE/GRANT EXECUTE statement.
     schema_text = _read_schema_text()
     revoke_matches = list(re.finditer(r"revoke\s+execute\s+on\s+function\s+([\w.]+)\s*\(", schema_text, re.IGNORECASE))
     grant_matches = list(re.finditer(r"grant\s+execute\s+on\s+function\s+([\w.]+)\s*\(", schema_text, re.IGNORECASE))
     assert revoke_matches and grant_matches
-    for match in revoke_matches + grant_matches:
-        assert match.group(1) == FUNCTION_NAME
+
+    revoked_function_names = {match.group(1) for match in revoke_matches}
+    granted_function_names = {match.group(1) for match in grant_matches}
+    assert revoked_function_names == set(AUTHORIZED_RPC_FUNCTION_NAMES)
+    assert granted_function_names == set(AUTHORIZED_RPC_FUNCTION_NAMES)
+
+    revokes = _all_permission_matches(schema_text, "revoke")
+    grants = _all_permission_matches(schema_text, "grant")
+
+    for function_name in AUTHORIZED_RPC_FUNCTION_NAMES:
+        function_revoke_tails = [entry["tail"] for entry in revokes if entry["function"] == function_name]
+        assert len(function_revoke_tails) == 2
+        assert any(re.match(r"\s*from\s+public\s*;", tail, re.IGNORECASE) for tail in function_revoke_tails)
+        assert any(
+            re.search(r"\bfrom\s+anon\s*,\s*authenticated\s*;", tail, re.IGNORECASE)
+            for tail in function_revoke_tails
+        )
+
+        function_grant_tails = [entry["tail"] for entry in grants if entry["function"] == function_name]
+        assert len(function_grant_tails) == 1
+        assert re.match(r"\s*to\s+service_role\s*;", function_grant_tails[0], re.IGNORECASE)
 
 
 def test_175_function_body_unchanged_by_permission_hardening():
