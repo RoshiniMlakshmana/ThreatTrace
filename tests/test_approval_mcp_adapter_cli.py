@@ -284,7 +284,7 @@ class TestBlock6RiskAwarePrepareCall:
             "'55555555-5555-5555-5555-555555555555'::uuid, "
             "'pending', "
             "'partially_approved', "
-            "2, "
+            "2::smallint, "
             "0, "
             "'reviewer@example.com', "
             "'reviewer@example.com', "

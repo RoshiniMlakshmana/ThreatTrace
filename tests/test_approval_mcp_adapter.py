@@ -950,7 +950,7 @@ class TestBlock6RiskAwareTemplates:
             "'55555555-5555-5555-5555-555555555555'::uuid, "
             "'pending', "
             "'partially_approved', "
-            "2, "
+            "2::smallint, "
             "0, "
             "'reviewer@example.com', "
             "'reviewer@example.com', "
@@ -967,7 +967,7 @@ class TestBlock6RiskAwareTemplates:
             "'55555555-5555-5555-5555-555555555555'::uuid, "
             "'pending', "
             "'rejected', "
-            "2, "
+            "2::smallint, "
             "0, "
             "'reviewer@example.com', "
             "'reviewer@example.com', "
@@ -1021,6 +1021,73 @@ class TestBlock6RiskAwareTemplates:
         forged_rpc_params["parameters"]["extra"] = 1
         with pytest.raises(ApprovalMcpAdapterError):
             prepare_supabase_mcp_call(forged_rpc_params)
+
+
+# ---------------------------------------------------------------------------
+# Step 18: PostgreSQL smallint binding for the review RPC's
+# expected_required_approvals argument (record_approval_review_and_promote_
+# status requires it typed as smallint; a bare integer literal fails
+# PostgreSQL function-overload resolution with error 42883).
+# ---------------------------------------------------------------------------
+
+
+class TestReviewRpcExpectedRequiredApprovalsSmallintBinding:
+    def test_one_review_smallint_binding(self):
+        descriptor = _review_rpc_descriptor(decision="approve")
+        descriptor["parameters"]["expected_required_approvals"] = 1
+        descriptor["parameters"]["expected_to_status"] = "approved"
+
+        result = prepare_supabase_mcp_call(descriptor)
+        expected = (
+            "SELECT * FROM public.record_approval_review_and_promote_status("
+            "'55555555-5555-5555-5555-555555555555'::uuid, "
+            "'pending', "
+            "'approved', "
+            "1::smallint, "
+            "0, "
+            "'reviewer@example.com', "
+            "'reviewer@example.com', "
+            "'approve', "
+            "'2026-01-01T03:00:00Z'::timestamptz, "
+            "NULL);"
+        )
+        assert result["arguments"]["query"] == expected
+
+    def test_two_review_smallint_binding_and_input_safety(self):
+        descriptor = _review_rpc_descriptor(decision="approve")
+        descriptor["parameters"]["expected_required_approvals"] = 2
+        original = copy.deepcopy(descriptor)
+
+        result = prepare_supabase_mcp_call(descriptor)
+        expected = (
+            "SELECT * FROM public.record_approval_review_and_promote_status("
+            "'55555555-5555-5555-5555-555555555555'::uuid, "
+            "'pending', "
+            "'partially_approved', "
+            "2::smallint, "
+            "0, "
+            "'reviewer@example.com', "
+            "'reviewer@example.com', "
+            "'approve', "
+            "'2026-01-01T03:00:00Z'::timestamptz, "
+            "NULL);"
+        )
+        assert result["arguments"]["query"] == expected
+
+        # The input descriptor is never mutated by preparation.
+        assert descriptor == original
+
+        # A caller-provided cast string is rejected, never trusted as SQL.
+        cast_string_descriptor = _review_rpc_descriptor(decision="approve")
+        cast_string_descriptor["parameters"]["expected_required_approvals"] = "2::smallint"
+        with pytest.raises(ApprovalMcpAdapterError):
+            prepare_supabase_mcp_call(cast_string_descriptor)
+
+        # A caller-provided SQL expression is rejected, never executed as SQL.
+        sql_expression_descriptor = _review_rpc_descriptor(decision="approve")
+        sql_expression_descriptor["parameters"]["expected_required_approvals"] = "2; DROP TABLE public.approvals;"
+        with pytest.raises(ApprovalMcpAdapterError):
+            prepare_supabase_mcp_call(sql_expression_descriptor)
 
 
 # ---------------------------------------------------------------------------

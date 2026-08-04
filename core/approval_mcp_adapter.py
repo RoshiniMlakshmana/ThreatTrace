@@ -248,7 +248,7 @@ _REVIEW_RPC_PARAMETER_TYPES = {
     "approval_id": "uuid",
     "expected_from_status": "text",
     "expected_to_status": "text",
-    "expected_required_approvals": "smallint",
+    "expected_required_approvals": "smallint_rpc_argument",
     "expected_approval_count_before": "integer",
     "reviewer_identity": "text",
     "reviewer_identity_normalized": "text",
@@ -318,6 +318,20 @@ def _encode_smallint(value: Any) -> str:
     return str(value)
 
 
+def _encode_smallint_rpc_argument(value: Any) -> str:
+    """Encode a `smallint`-typed value used as a direct positional RPC
+    argument (never a target-column literal in an `INSERT ... SELECT`
+    list). PostgreSQL's function-overload resolution requires an
+    explicit cast here: a bare integer literal already has a concrete
+    `integer` type, and `integer -> smallint` is only an assignment
+    cast, not one of the implicit casts overload resolution considers,
+    so an uncast literal fails with `42883` against a `smallint`-typed
+    parameter. The same validation as `_encode_smallint` applies; only
+    the literal's trailing cast differs.
+    """
+    return _encode_smallint(value) + "::smallint"
+
+
 def _encode_integer(value: Any) -> str:
     if isinstance(value, bool) or not isinstance(value, int):
         raise ApprovalMcpAdapterError(_INVALID_DESCRIPTOR_MESSAGE)
@@ -343,6 +357,8 @@ def _encode_value(value: Any, type_name: str) -> str:
         return _encode_jsonb(value)
     if type_name == "smallint":
         return _encode_smallint(value)
+    if type_name == "smallint_rpc_argument":
+        return _encode_smallint_rpc_argument(value)
     if type_name == "integer":
         return _encode_integer(value)
     if type_name == "nullable_text":
