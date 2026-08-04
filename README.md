@@ -14,7 +14,11 @@ Investigation-changing actions are now gated by deterministic risk classificatio
 
 **Block 7 — Shadow Execution / Digital Twin MVP is complete.** See [docs/block7-shadow-execution.md](docs/block7-shadow-execution.md) for the full design, the security-control table, and honest live-verification status. `/simulate-case-update` calculates a deterministic before/after preview of an approved case-update action — current state, proposed state, changed and unchanged fields, fixed deterministic warnings, and a rollback-feasibility classification — through a mutation-free command that never touches the database beyond two existing read-only lookups.
 
-3,800+ automated tests pass. A read-only live verification was attempted against the connected Supabase project and was honestly blocked (`LIVE_VERIFICATION_BLOCKED_NO_EXISTING_APPROVAL`) because no approval record currently exists there; no synthetic data was created to force it. **Block 8 — AI Agent Gateway / Runtime Firewall** is the next development block.
+A read-only live verification was attempted against the connected Supabase project and was honestly blocked (`LIVE_VERIFICATION_BLOCKED_NO_EXISTING_APPROVAL`) because no approval record currently exists there; no synthetic data was created to force it.
+
+**Block 8 — AI Agent Gateway / Runtime Firewall MVP is complete.** See [docs/block8-agent-gateway.md](docs/block8-agent-gateway.md) for the full design, the security-control table, and demonstration evidence. `/evaluate-tool-call` runs a proposed AI-agent tool call through an immutable, in-code tool registry and a deterministic policy engine — returning `allow`, `require_approval`, or `deny` with strict argument validation and safe redaction, through a command that never executes the tool it evaluates.
+
+3,900+ automated tests pass, with one intentional Windows-only Hayabusa symlink-permission test skip. A local, non-mutating three-decision demonstration (allow / require_approval / deny) completed successfully with no tool, database, or external process ever executed. **Block 9 — Agent Identity and Least Privilege** is the next development block.
 
 ## Project Structure
 
