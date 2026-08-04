@@ -44,6 +44,7 @@ from core.approval_persistence import (
     insert_risk_aware_pending_approval,
     load_approval_record,
     load_approval_reviews,
+    load_investigation_approval_context,
     load_risk_aware_approval_record,
 )
 from core.approval_request import ApprovalRequestError
@@ -1527,9 +1528,11 @@ def test_250_only_insert_select_update_and_rpc_operations_exist():
 
 
 def test_258_approval_conflict_error_reserved_for_review_transitions():
-    # ApprovalConflictError now exists (Step 8), but only for a
-    # structurally-genuine approve/reject update matched against zero
-    # rows -- covered functionally in the review-transition test section.
+    # ApprovalConflictError now exists (Step 8) for a structurally-genuine
+    # approve/reject update matched against zero rows, and (Step 9) for a
+    # structurally-genuine risk-aware insert whose live-context guard
+    # matches zero rows -- covered functionally in the review-transition
+    # and risk-aware-insertion test sections respectively.
     assert issubclass(approval_persistence.ApprovalConflictError, ApprovalPersistenceError)
 
 
@@ -1920,9 +1923,12 @@ def test_review_no_rpc_or_consume_operation_descriptor_exists():
 
 
 def test_review_no_investigation_table_descriptor_exists_after_expansion():
-    # The module now legitimately builds descriptors against a second
-    # table, approval_reviews (Block 6's load_approval_reviews) -- never
-    # against investigations, which remains the real assertion here.
+    # The module now legitimately builds descriptors against a third
+    # table too: investigations (Block 6 Step 9's own
+    # load_investigation_approval_context, a fixed read-only lookup of
+    # exactly investigation_id/status/confidence -- never a write). The
+    # real assertion here is that this set stays exactly these three
+    # named tables, never an unbounded or unauthorized fourth.
     tree = _module_ast()
     table_values = set()
     for node in ast.walk(tree):
@@ -1934,8 +1940,7 @@ def test_review_no_investigation_table_descriptor_exists_after_expansion():
                     and isinstance(value_node, ast.Constant)
                 ):
                     table_values.add(value_node.value)
-    assert table_values == {"approvals", "approval_reviews"}
-    assert "investigations" not in table_values
+    assert table_values == {"approvals", "approval_reviews", "investigations"}
 
 
 def test_review_forged_approve_plan_fails():
@@ -2334,9 +2339,12 @@ def test_review_no_consume_descriptor_ever_built():
 
 
 def test_review_no_investigation_table_descriptor():
-    # The module now legitimately builds descriptors against a second
-    # table, approval_reviews (Block 6's load_approval_reviews) -- never
-    # against investigations, which remains the real assertion here.
+    # The module now legitimately builds descriptors against a third
+    # table too: investigations (Block 6 Step 9's own
+    # load_investigation_approval_context, a fixed read-only lookup of
+    # exactly investigation_id/status/confidence -- never a write). The
+    # real assertion here is that this set stays exactly these three
+    # named tables, never an unbounded or unauthorized fourth.
     tree = _module_ast()
     table_values = set()
     for node in ast.walk(tree):
@@ -2348,8 +2356,7 @@ def test_review_no_investigation_table_descriptor():
                     and isinstance(value_node, ast.Constant)
                 ):
                     table_values.add(value_node.value)
-    assert table_values == {"approvals", "approval_reviews"}
-    assert "investigations" not in table_values
+    assert table_values == {"approvals", "approval_reviews", "investigations"}
 
 
 def test_review_no_transaction_or_rpc_keyword():
@@ -4760,6 +4767,127 @@ def test_multi_review_inputs_remain_unmodified():
     assert record == record_snapshot
     assert existing_reviews == []
     assert plan == plan_snapshot
+
+
+# ---------------------------------------------------------------------------
+# Block 6, Step 9: trusted investigation-context lookup and live-context-
+# bound risk-aware insertion
+# ---------------------------------------------------------------------------
+
+
+def test_investigation_context_returns_exact_three_fields_and_rejects_bad_rows():
+    row = {"investigation_id": INVESTIGATION_ID, "status": "investigating", "confidence": "medium"}
+    executor = _RecordingExecutor(response=[row])
+
+    result = load_investigation_approval_context(executor, INVESTIGATION_ID)
+
+    assert result == {"investigation_id": INVESTIGATION_ID, "status": "investigating", "confidence": "medium"}
+    assert set(result) == {"investigation_id", "status", "confidence"}
+
+    operation = executor.calls[0]
+    assert operation == {
+        "operation": "select",
+        "table": "investigations",
+        "columns": ["investigation_id", "status", "confidence"],
+        "filters": {"id": INVESTIGATION_ID},
+        "limit": 1,
+    }
+
+    # Zero rows fails closed using the project's canonical lookup/conflict
+    # behavior -- ApprovalNotFoundError, exactly like load_approval_record.
+    zero_row_executor = _RecordingExecutor(response=[])
+    with pytest.raises(ApprovalNotFoundError):
+        load_investigation_approval_context(zero_row_executor, INVESTIGATION_ID)
+
+    # More than one row is a malformed response.
+    multi_row_executor = _RecordingExecutor(response=[row, row])
+    with pytest.raises(ApprovalResponseError):
+        load_investigation_approval_context(multi_row_executor, INVESTIGATION_ID)
+
+    # A malformed row (missing confidence) is rejected.
+    malformed_row = {"investigation_id": INVESTIGATION_ID, "status": "investigating"}
+    malformed_executor = _RecordingExecutor(response=[malformed_row])
+    with pytest.raises(ApprovalResponseError):
+        load_investigation_approval_context(malformed_executor, INVESTIGATION_ID)
+
+    # An invalid status vocabulary value is rejected.
+    invalid_status_row = {"investigation_id": INVESTIGATION_ID, "status": "not-a-real-status", "confidence": "medium"}
+    invalid_status_executor = _RecordingExecutor(response=[invalid_status_row])
+    with pytest.raises(ApprovalResponseError):
+        load_investigation_approval_context(invalid_status_executor, INVESTIGATION_ID)
+
+    # A row whose investigation_id does not match the one requested is
+    # rejected.
+    other_id = "99999999-9999-4999-8999-999999999999"
+    mismatched_row = {"investigation_id": other_id, "status": "investigating", "confidence": "medium"}
+    mismatched_executor = _RecordingExecutor(response=[mismatched_row])
+    with pytest.raises(ApprovalResponseError):
+        load_investigation_approval_context(mismatched_executor, INVESTIGATION_ID)
+
+
+def test_risk_aware_insert_descriptor_carries_expected_context_and_public_result_stays_eighteen_fields():
+    request = {
+        "investigation_id": INVESTIGATION_ID,
+        "action_type": "update_investigation_state",
+        "action_payload": {"status": "closed"},
+        "requested_by": "Roshini Analyst",
+        "requested_at": REQUESTED_AT,
+    }
+    current_investigation = {"status": "investigating", "confidence": "medium"}
+    inserted_row = _risk_aware_pending_row(action_payload={"status": "closed"})
+    executor = _RecordingExecutor(response=[inserted_row])
+
+    result = insert_risk_aware_pending_approval(executor, request, current_investigation)
+
+    operation = executor.calls[0]
+    assert operation["expected_current_status"] == "investigating"
+    assert operation["expected_current_confidence"] == "medium"
+    # Never stored as new approvals columns -- only ever a sibling of
+    # values/returning, never inside values itself.
+    assert "expected_current_status" not in operation["values"]
+    assert "expected_current_confidence" not in operation["values"]
+
+    assert len(result) == 18
+    assert "expected_current_status" not in result
+    assert "expected_current_confidence" not in result
+
+    # A caller can never supply expected_current_status/confidence
+    # directly -- current_investigation must contain exactly status and
+    # confidence, so any other field is rejected before the executor is
+    # ever invoked.
+    forged_investigation = {
+        "status": "investigating", "confidence": "medium", "expected_current_status": "closed",
+    }
+    forged_executor = _RecordingExecutor(response=[])
+    with pytest.raises(ApprovalPersistenceError):
+        insert_risk_aware_pending_approval(forged_executor, request, forged_investigation)
+    assert forged_executor.calls == []
+
+
+def test_risk_aware_insert_zero_row_is_canonical_conflict_and_inputs_unmodified():
+    request = {
+        "investigation_id": INVESTIGATION_ID,
+        "action_type": "update_investigation_state",
+        "action_payload": {"status": "closed"},
+        "requested_by": "Roshini Analyst",
+        "requested_at": REQUESTED_AT,
+    }
+    request_snapshot = copy.deepcopy(request)
+    current_investigation = {"status": "investigating", "confidence": "medium"}
+    current_investigation_snapshot = copy.deepcopy(current_investigation)
+
+    # The live investigation context no longer matches what was
+    # classified (e.g. a concurrent status/confidence change) -- the
+    # INSERT ... SELECT ... WHERE guard matches zero rows.
+    executor = _RecordingExecutor(response=[])
+
+    with pytest.raises(ApprovalConflictError):
+        insert_risk_aware_pending_approval(executor, request, current_investigation)
+
+    assert request == request_snapshot
+    assert current_investigation == current_investigation_snapshot
+    # Exactly one executor call -- never retried.
+    assert len(executor.calls) == 1
 
 
 # ---------------------------------------------------------------------------

@@ -257,6 +257,20 @@ _REVIEW_RPC_RESULT_EXTRA_FIELDS = (
 )
 _REVIEW_RPC_RESULT_FIELDS_SET = _RISK_AWARE_RECORD_FIELDS_SET | frozenset(_REVIEW_RPC_RESULT_EXTRA_FIELDS)
 
+# ---------------------------------------------------------------------------
+# Trusted investigation-context lookup and live-context-bound risk-aware
+# insertion (Block 6, Step 9)
+# ---------------------------------------------------------------------------
+
+_INVALID_INVESTIGATION_ID_MESSAGE = "Invalid investigation identifier."
+_INVESTIGATION_CONTEXT_NOT_FOUND_MESSAGE = "Investigation was not found."
+_INVESTIGATION_CONTEXT_RESPONSE_MESSAGE = "Investigation context lookup response was invalid."
+
+_INVESTIGATION_CONTEXT_COLUMNS = ("investigation_id", "status", "confidence")
+_INVESTIGATION_CONTEXT_COLUMNS_SET = frozenset(_INVESTIGATION_CONTEXT_COLUMNS)
+
+_RISK_AWARE_INSERT_CONFLICT_MESSAGE = "Risk-aware approval insertion conflicted."
+
 
 def _validate_validated_request(validated_request: Any) -> dict[str, Any]:
     if not isinstance(validated_request, Mapping):
@@ -323,6 +337,19 @@ def _validate_approval_id(value: Any) -> str:
         parsed = uuid.UUID(stripped)
     except ValueError:
         raise ApprovalPersistenceError(_INVALID_ID_MESSAGE) from None
+    return str(parsed)
+
+
+def _validate_investigation_id(value: Any) -> str:
+    if not isinstance(value, str):
+        raise ApprovalPersistenceError(_INVALID_INVESTIGATION_ID_MESSAGE)
+    stripped = value.strip()
+    if not stripped:
+        raise ApprovalPersistenceError(_INVALID_INVESTIGATION_ID_MESSAGE)
+    try:
+        parsed = uuid.UUID(stripped)
+    except ValueError:
+        raise ApprovalPersistenceError(_INVALID_INVESTIGATION_ID_MESSAGE) from None
     return str(parsed)
 
 
@@ -1045,23 +1072,41 @@ def insert_risk_aware_pending_approval(
     `consume_approval_and_update_investigation_state`, and this module
     never reproduces Python `casefold()` with PostgreSQL `lower()`.
 
+    The insert descriptor also carries `expected_current_status` and
+    `expected_current_confidence`, derived only by re-canonicalizing
+    (`.strip().lower()`) the same already-validated `current_investigation`
+    mapping this function already fed to risk classification -- never a
+    separate caller-supplied field, and never stored as an `approvals`
+    column. These two values exist purely as an independent live-context
+    guard: the executor is expected to perform the actual insert as a
+    conditional `INSERT ... SELECT ... FROM investigations WHERE id = ...
+    AND status = ... AND confidence = ...`, so the insert can only succeed
+    when the live investigation row still matches the exact context this
+    function classified risk against. A concurrent investigation change
+    between this function's own risk classification and the insert makes
+    the guard fail, yielding zero rows.
+
     Invokes `executor` exactly once with an insert operation descriptor
     for the `approvals` table, whose `returning` list is exactly the
     eighteen risk-aware fields (the existing sixteen plus `risk_level` and
-    `required_approvals`). The executor's response must be a Python list
-    containing exactly one row mapping; that row is normalized and
-    validated through `validate_risk_aware_approval_record` exactly once,
-    then checked to confirm it actually reflects the request that was
-    submitted.
+    `required_approvals`). The executor's response must be a Python list.
+    Zero rows raises `ApprovalConflictError` (never retried) -- the live
+    investigation context no longer matches what was classified, so this
+    is a genuine conflict, never a successful approval creation. Exactly
+    one row is required; that row is normalized and validated through
+    `validate_risk_aware_approval_record` exactly once, then checked to
+    confirm it actually reflects the request that was submitted.
 
     Raises `ApprovalPersistenceError` for invalid `request` or
     `current_investigation` input (before the executor is ever invoked,
     covering every failure `validate_risk_aware_approval_request` itself
-    raises) or invalid `expires_at`, `ApprovalResponseError` for any
-    malformed, mismatched, or invalid executor response, and
-    `ApprovalTransportError` if `executor` itself raises. Never mutates
-    `request` or `current_investigation`, and never returns
-    `requested_by_normalized`, a persistence receipt, row count, or
+    raises) or invalid `expires_at`, `ApprovalConflictError` for a
+    structurally genuine insert matched against zero rows,
+    `ApprovalResponseError` for any other malformed, mismatched, or
+    invalid executor response, and `ApprovalTransportError` if `executor`
+    itself raises. Never mutates `request` or `current_investigation`, and
+    never returns `requested_by_normalized`, `expected_current_status`,
+    `expected_current_confidence`, a persistence receipt, row count, or
     operation descriptor -- only the validated eighteen-field record
     itself.
     """
@@ -1073,6 +1118,15 @@ def insert_risk_aware_pending_approval(
     canonical_expires_at = _validate_expiry(expires_at, validated_request["requested_at"])
 
     requested_by_normalized = validated_request["requested_by"].strip().casefold()
+
+    # current_investigation["status"]/["confidence"] were already proven to
+    # be valid INVESTIGATION_STATUSES/CONFIDENCE_LEVELS members by the
+    # validate_risk_aware_approval_request call above (which fed them to
+    # classify_approval_risk) -- that same canonicalization is simply
+    # reproduced here, from the same already-validated mapping, never from
+    # a separate caller-supplied field.
+    expected_current_status = current_investigation["status"].strip().lower()
+    expected_current_confidence = current_investigation["confidence"].strip().lower()
 
     values: dict[str, Any] = {
         "investigation_id": validated_request["investigation_id"],
@@ -1092,6 +1146,8 @@ def insert_risk_aware_pending_approval(
         "operation": "insert",
         "table": "approvals",
         "values": values,
+        "expected_current_status": expected_current_status,
+        "expected_current_confidence": expected_current_confidence,
         "returning": list(_RISK_AWARE_RECORD_FIELDS),
     }
 
@@ -1099,7 +1155,9 @@ def insert_risk_aware_pending_approval(
 
     if not isinstance(response, list):
         raise ApprovalResponseError(_RISK_AWARE_INSERT_RESPONSE_MESSAGE)
-    if len(response) != 1:
+    if len(response) == 0:
+        raise ApprovalConflictError(_RISK_AWARE_INSERT_CONFLICT_MESSAGE)
+    if len(response) > 1:
         raise ApprovalResponseError(_RISK_AWARE_INSERT_RESPONSE_MESSAGE)
 
     record = _validate_risk_aware_row_shape(response[0], _RISK_AWARE_INSERT_RESPONSE_MESSAGE)
@@ -1177,6 +1235,91 @@ def load_risk_aware_approval_record(
         raise ApprovalResponseError(_RISK_AWARE_LOOKUP_RESPONSE_MESSAGE)
 
     return record
+
+
+def load_investigation_approval_context(
+    executor: ApprovalExecutor,
+    investigation_id: str,
+) -> dict[str, Any]:
+    """Load one investigation's current approval-relevant context (its
+    `status` and `confidence` only) by its canonical `id`, as the sole
+    trusted basis for risk classification and for
+    `insert_risk_aware_pending_approval`'s own independent live-context
+    guard.
+
+    `investigation_id` is canonicalized as a UUID before the executor is
+    ever invoked. Invokes `executor` exactly once with a fixed lookup
+    operation descriptor for the `investigations` table: `columns` is
+    exactly `investigation_id`, `status`, `confidence` -- never `title`,
+    `summary`, `evidence`, a timestamp, owner information, approval
+    information, an identity, or an action payload; `filters` contains
+    only `id`; no other filter is ever added.
+
+    The executor's response must be a Python list containing exactly one
+    row mapping, matching exactly `investigation_id`, `status`,
+    `confidence` -- no extra field. Zero rows raises
+    `ApprovalNotFoundError` (this is a lookup, not a conditional update);
+    more than one row, a non-mapping row, an unrecognized or missing
+    field, a mismatched `investigation_id`, or an invalid `status`/
+    `confidence` vocabulary value raises `ApprovalResponseError`.
+
+    Returns a new, independently-owned mapping containing exactly
+    `investigation_id`, `status`, `confidence`. A caller must never
+    substitute its own claimed current status/confidence for this
+    function's own result -- this is the only trusted source of that
+    context anywhere in this module.
+
+    Raises `ApprovalPersistenceError` for a malformed `investigation_id`
+    (before the executor is ever invoked), `ApprovalNotFoundError` for a
+    structurally valid lookup that finds no row, `ApprovalResponseError`
+    for any other malformed, mismatched, or invalid executor response, and
+    `ApprovalTransportError` if `executor` itself raises. Never mutates
+    `investigation_id`, and never returns anything beyond the validated
+    three-field context.
+    """
+    canonical_id = _validate_investigation_id(investigation_id)
+
+    operation = {
+        "operation": "select",
+        "table": "investigations",
+        "columns": list(_INVESTIGATION_CONTEXT_COLUMNS),
+        "filters": {"id": canonical_id},
+        "limit": 1,
+    }
+
+    response = _invoke_executor(executor, operation)
+
+    if not isinstance(response, list):
+        raise ApprovalResponseError(_INVESTIGATION_CONTEXT_RESPONSE_MESSAGE)
+    if len(response) == 0:
+        raise ApprovalNotFoundError(_INVESTIGATION_CONTEXT_NOT_FOUND_MESSAGE)
+    if len(response) > 1:
+        raise ApprovalResponseError(_INVESTIGATION_CONTEXT_RESPONSE_MESSAGE)
+
+    row = response[0]
+    if not isinstance(row, Mapping):
+        raise ApprovalResponseError(_INVESTIGATION_CONTEXT_RESPONSE_MESSAGE)
+    if set(row) != _INVESTIGATION_CONTEXT_COLUMNS_SET:
+        raise ApprovalResponseError(_INVESTIGATION_CONTEXT_RESPONSE_MESSAGE)
+
+    row_investigation_id = row["investigation_id"]
+    if not isinstance(row_investigation_id, str) or row_investigation_id != canonical_id:
+        raise ApprovalResponseError(_INVESTIGATION_CONTEXT_RESPONSE_MESSAGE)
+
+    try:
+        status = _validate_investigation_status(row["status"])
+    except ApprovalResponseError:
+        raise ApprovalResponseError(_INVESTIGATION_CONTEXT_RESPONSE_MESSAGE) from None
+    try:
+        confidence = _validate_investigation_confidence(row["confidence"])
+    except ApprovalResponseError:
+        raise ApprovalResponseError(_INVESTIGATION_CONTEXT_RESPONSE_MESSAGE) from None
+
+    return {
+        "investigation_id": canonical_id,
+        "status": status,
+        "confidence": confidence,
+    }
 
 
 def load_approval_reviews(

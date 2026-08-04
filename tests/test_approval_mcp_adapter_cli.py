@@ -200,7 +200,19 @@ def _risk_aware_insert_descriptor() -> dict:
             "required_approvals": 2,
             "requested_by_normalized": "analyst@example.com",
         },
+        "expected_current_status": "investigating",
+        "expected_current_confidence": "medium",
         "returning": list(_RISK_AWARE_RECORD_FIELDS),
+    }
+
+
+def _investigation_context_descriptor() -> dict:
+    return {
+        "operation": "select",
+        "table": "investigations",
+        "columns": ["investigation_id", "status", "confidence"],
+        "filters": {"id": "77777777-7777-7777-7777-777777777777"},
+        "limit": 1,
     }
 
 
@@ -349,3 +361,48 @@ class TestBlock6RiskAwarePrepareCall:
         assert "raw postgres detail" not in error_stderr
         assert "Traceback" not in error_stdout
         assert "Traceback" not in error_stderr
+
+
+# ---------------------------------------------------------------------------
+# Block 6, Step 9: trusted investigation-context lookup, through the real
+# MCP adapter CLI boundary
+# ---------------------------------------------------------------------------
+
+
+class TestBlock9InvestigationContextPrepareCall:
+    def test_investigation_context_prepare_call(self):
+        exit_code, stdout, stderr = _run(
+            {"action": "prepare_call", "descriptor": _investigation_context_descriptor()}
+        )
+        assert exit_code == 0
+        assert stderr == ""
+        parsed = json.loads(stdout)
+        assert set(parsed) == {"tool", "arguments"}
+        assert parsed["tool"] == "mcp__supabase__execute_sql"
+        expected_query = (
+            "SELECT id AS investigation_id, status, confidence FROM public.investigations "
+            "WHERE id = '77777777-7777-7777-7777-777777777777'::uuid LIMIT 1;"
+        )
+        assert parsed["arguments"]["query"] == expected_query
+
+        # Deterministic: repeated calls with the same descriptor produce
+        # byte-identical output.
+        exit_code_again, stdout_again, _stderr_again = _run(
+            {"action": "prepare_call", "descriptor": _investigation_context_descriptor()}
+        )
+        assert exit_code_again == 0
+        assert stdout_again == stdout
+
+        # No raw SQL is ever accepted from the input envelope -- injecting
+        # a "query" field into the descriptor is rejected outright (an
+        # unrecognized descriptor field), and its content never reaches
+        # stdout, stderr, or a traceback.
+        forged_descriptor = _investigation_context_descriptor()
+        forged_descriptor["query"] = "DROP TABLE public.investigations;"
+        forged_exit_code, forged_stdout, forged_stderr = _run(
+            {"action": "prepare_call", "descriptor": forged_descriptor}
+        )
+        assert forged_exit_code == 2
+        assert forged_stdout == ""
+        assert "DROP TABLE" not in forged_stderr
+        assert "Traceback" not in forged_stderr

@@ -230,15 +230,17 @@ def test_006_no_supabase_or_mcp_type_is_required():
     assert not any(name == "mcp" or name.startswith("mcp.") for name in imports)
 
 
-def test_007_exactly_eight_supported_operation_names_exist():
-    # Block 6 added four additive operations alongside the original four
-    # Block 5 operations -- none of the original four were renamed or
-    # removed.
+def test_007_exactly_nine_supported_operation_names_exist():
+    # Block 6 Step 4 added four additive operations alongside the original
+    # four Block 5 operations, and Block 6 Step 9 added one more
+    # (load_investigation_approval_context) -- none of the earlier eight
+    # were renamed or removed.
     assert approval_bridge._SUPPORTED_OPERATIONS_SET == {
         "insert_pending_approval", "load_approval_record",
         "apply_approval_review_transition", "apply_approval_consumption",
         "insert_risk_aware_pending_approval", "load_risk_aware_approval_record",
         "load_approval_reviews", "apply_multi_review_transition",
+        "load_investigation_approval_context",
     }
 
 
@@ -1724,6 +1726,66 @@ def test_multi_review_sorted_mappings_and_inputs_remain_unmodified():
     assert result["result"]["updated_record"]["status"] == "partially_approved"
     assert record == record_snapshot
     assert operation_input == operation_input_snapshot
+
+
+# ---------------------------------------------------------------------------
+# Block 6, Step 9: trusted investigation-context lookup bridge operation
+# ---------------------------------------------------------------------------
+
+
+def test_investigation_context_prepare_and_verify_returns_exact_three_fields():
+    operation_input = {"investigation_id": INVESTIGATION_ID}
+    operation_input_snapshot = copy.deepcopy(operation_input)
+
+    prepared = prepare_approval_operation("load_investigation_approval_context", operation_input)
+    assert prepared["phase"] == "prepare"
+    assert prepared["operation"] == "load_investigation_approval_context"
+    assert prepared["descriptor"]["operation"] == "select"
+    assert prepared["descriptor"]["table"] == "investigations"
+    assert prepared["descriptor"]["columns"] == ["investigation_id", "status", "confidence"]
+    assert prepared["descriptor"]["filters"] == {"id": INVESTIGATION_ID}
+
+    row = {"investigation_id": INVESTIGATION_ID, "status": "investigating", "confidence": "medium"}
+    result = verify_approval_operation(
+        "load_investigation_approval_context", operation_input, prepared["descriptor"],
+        {"kind": "rows", "rows": [row]},
+    )
+    assert result["phase"] == "verify"
+    assert result["operation"] == "load_investigation_approval_context"
+    assert result["result"] == {
+        "investigation_id": INVESTIGATION_ID, "status": "investigating", "confidence": "medium",
+    }
+    assert set(result["result"]) == {"investigation_id", "status", "confidence"}
+    assert operation_input == operation_input_snapshot
+
+
+def test_investigation_context_malformed_zero_row_and_unknown_field_behavior():
+    operation_input = {"investigation_id": INVESTIGATION_ID}
+
+    # Zero rows is a genuine "not found" lookup conflict, never a
+    # successful empty context.
+    prepared = prepare_approval_operation("load_investigation_approval_context", operation_input)
+    with pytest.raises(ApprovalNotFoundError):
+        verify_approval_operation(
+            "load_investigation_approval_context", operation_input, prepared["descriptor"],
+            {"kind": "rows", "rows": []},
+        )
+
+    # A malformed row (missing confidence, an extra field) is rejected.
+    malformed_row = {"investigation_id": INVESTIGATION_ID, "status": "investigating"}
+    with pytest.raises(ApprovalResponseError):
+        verify_approval_operation(
+            "load_investigation_approval_context", operation_input, prepared["descriptor"],
+            {"kind": "rows", "rows": [malformed_row]},
+        )
+
+    # An unknown top-level input field is rejected before any executor
+    # call, and the original mapping is never mutated.
+    unknown_field_input = {"investigation_id": INVESTIGATION_ID, "extra_field": "x"}
+    unknown_field_input_snapshot = copy.deepcopy(unknown_field_input)
+    with pytest.raises(ApprovalBridgeError):
+        prepare_approval_operation("load_investigation_approval_context", unknown_field_input)
+    assert unknown_field_input == unknown_field_input_snapshot
 
 
 # ---------------------------------------------------------------------------

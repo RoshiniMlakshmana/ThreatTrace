@@ -59,6 +59,7 @@ from core.approval_persistence import (
     insert_risk_aware_pending_approval,
     load_approval_record,
     load_approval_reviews,
+    load_investigation_approval_context,
     load_risk_aware_approval_record,
 )
 
@@ -97,6 +98,7 @@ _SUPPORTED_OPERATIONS = (
     "load_risk_aware_approval_record",
     "load_approval_reviews",
     "apply_multi_review_transition",
+    "load_investigation_approval_context",
 )
 _SUPPORTED_OPERATIONS_SET = frozenset(_SUPPORTED_OPERATIONS)
 
@@ -109,6 +111,7 @@ _OPERATION_INPUT_FIELDS: dict[str, tuple[str, ...]] = {
     "load_risk_aware_approval_record": ("approval_id",),
     "load_approval_reviews": ("approval_id",),
     "apply_multi_review_transition": ("current_record", "existing_reviews", "transition_plan"),
+    "load_investigation_approval_context": ("investigation_id",),
 }
 
 _EXPECTED_POST_CAPTURE_EXCEPTIONS: dict[str, type[ApprovalPersistenceError]] = {
@@ -116,10 +119,11 @@ _EXPECTED_POST_CAPTURE_EXCEPTIONS: dict[str, type[ApprovalPersistenceError]] = {
     "load_approval_record": ApprovalNotFoundError,
     "apply_approval_review_transition": ApprovalConflictError,
     "apply_approval_consumption": ApprovalConflictError,
-    "insert_risk_aware_pending_approval": ApprovalResponseError,
+    "insert_risk_aware_pending_approval": ApprovalConflictError,
     "load_risk_aware_approval_record": ApprovalNotFoundError,
     "load_approval_reviews": ApprovalResponseError,
     "apply_multi_review_transition": ApprovalConflictError,
+    "load_investigation_approval_context": ApprovalNotFoundError,
 }
 
 # Every operation's descriptor-capture executor returns an empty list by
@@ -188,6 +192,8 @@ def _dispatch_persistence(operation: str, executor: Any, normalized_input: Mappi
         return load_risk_aware_approval_record(executor, normalized_input["approval_id"])
     if operation == "load_approval_reviews":
         return load_approval_reviews(executor, normalized_input["approval_id"])
+    if operation == "load_investigation_approval_context":
+        return load_investigation_approval_context(executor, normalized_input["investigation_id"])
     return apply_multi_review_transition(
         executor,
         normalized_input["current_record"],

@@ -142,7 +142,19 @@ def _risk_aware_insert_descriptor(with_expires_at: bool = False) -> dict:
         "operation": "insert",
         "table": "approvals",
         "values": values,
+        "expected_current_status": "investigating",
+        "expected_current_confidence": "medium",
         "returning": list(_RISK_AWARE_RECORD_FIELDS),
+    }
+
+
+def _investigation_context_descriptor() -> dict:
+    return {
+        "operation": "select",
+        "table": "investigations",
+        "columns": ["investigation_id", "status", "confidence"],
+        "filters": {"id": "77777777-7777-7777-7777-777777777777"},
+        "limit": 1,
     }
 
 
@@ -858,12 +870,17 @@ class TestBlock6RiskAwareTemplates:
     # 1. Fixed risk-aware approval INSERT SQL (both without and with
     # expires_at -- one descriptor shape, one test).
     def test_exact_risk_aware_insert_sql(self):
+        # Step 9: the risk-aware INSERT is now a fixed, live-context-guarded
+        # INSERT ... SELECT ... FROM investigations WHERE ... template, not
+        # an unconditional VALUES insertion -- expected_current_status and
+        # expected_current_confidence appear only in the WHERE guard, never
+        # as inserted columns.
         result = prepare_supabase_mcp_call(_risk_aware_insert_descriptor(with_expires_at=False))
         expected_without_expiry = (
             "INSERT INTO public.approvals "
             "(investigation_id, action_type, action_payload, requested_by, requested_at, status, "
             "risk_level, required_approvals, requested_by_normalized) "
-            "VALUES ("
+            "SELECT "
             "'11111111-1111-1111-1111-111111111111'::uuid, "
             "'update_investigation_state', "
             "'{\"confidence\":\"high\",\"status\":\"escalated\"}'::jsonb, "
@@ -872,7 +889,11 @@ class TestBlock6RiskAwareTemplates:
             "'pending', "
             "'high', "
             "2, "
-            "'analyst@example.com') "
+            "'analyst@example.com' "
+            "FROM public.investigations "
+            "WHERE id = '11111111-1111-1111-1111-111111111111'::uuid "
+            "AND status = 'investigating' "
+            "AND confidence = 'medium' "
             "RETURNING " + _RISK_AWARE_RETURNING_TEXT + ";"
         )
         assert result["arguments"]["query"] == expected_without_expiry
@@ -882,7 +903,7 @@ class TestBlock6RiskAwareTemplates:
             "INSERT INTO public.approvals "
             "(investigation_id, action_type, action_payload, requested_by, requested_at, status, "
             "risk_level, required_approvals, requested_by_normalized, expires_at) "
-            "VALUES ("
+            "SELECT "
             "'11111111-1111-1111-1111-111111111111'::uuid, "
             "'update_investigation_state', "
             "'{\"confidence\":\"high\",\"status\":\"escalated\"}'::jsonb, "
@@ -892,7 +913,11 @@ class TestBlock6RiskAwareTemplates:
             "'high', "
             "2, "
             "'analyst@example.com', "
-            "'2026-01-02T00:00:00Z'::timestamptz) "
+            "'2026-01-02T00:00:00Z'::timestamptz "
+            "FROM public.investigations "
+            "WHERE id = '11111111-1111-1111-1111-111111111111'::uuid "
+            "AND status = 'investigating' "
+            "AND confidence = 'medium' "
             "RETURNING " + _RISK_AWARE_RETURNING_TEXT + ";"
         )
         assert result_with_expiry["arguments"]["query"] == expected_with_expiry
@@ -996,6 +1021,77 @@ class TestBlock6RiskAwareTemplates:
         forged_rpc_params["parameters"]["extra"] = 1
         with pytest.raises(ApprovalMcpAdapterError):
             prepare_supabase_mcp_call(forged_rpc_params)
+
+
+# ---------------------------------------------------------------------------
+# Block 6, Step 9: trusted investigation-context lookup and live-context-
+# guarded risk-aware insertion
+# ---------------------------------------------------------------------------
+
+
+class TestBlock9InvestigationContextAndGuardedInsert:
+    # 1. Fixed investigation-context SELECT SQL with exact return fields
+    # and fixed table/column names.
+    def test_exact_investigation_context_select_sql(self):
+        result = prepare_supabase_mcp_call(_investigation_context_descriptor())
+        expected = (
+            "SELECT id AS investigation_id, status, confidence FROM public.investigations "
+            "WHERE id = '77777777-7777-7777-7777-777777777777'::uuid LIMIT 1;"
+        )
+        assert result["arguments"]["query"] == expected
+
+    # 2. The risk-aware INSERT uses INSERT ... SELECT (never VALUES) and
+    # contains exact guards for investigation ID, expected status, and
+    # expected confidence.
+    def test_risk_aware_insert_uses_select_with_exact_guards(self):
+        descriptor = _risk_aware_insert_descriptor()
+        descriptor["expected_current_status"] = "closed"
+        descriptor["expected_current_confidence"] = "unknown"
+        result = prepare_supabase_mcp_call(descriptor)
+        query = result["arguments"]["query"]
+
+        assert query.startswith("INSERT INTO public.approvals (")
+        assert " SELECT " in query
+        assert " VALUES (" not in query
+        assert "FROM public.investigations" in query
+        assert "WHERE id = '11111111-1111-1111-1111-111111111111'::uuid" in query
+        assert "AND status = 'closed'" in query
+        assert "AND confidence = 'unknown'" in query
+
+    # 3. Caller-forged or malformed context fields are rejected, zero rows
+    # normalize canonically, and the old Block 5 INSERT template remains
+    # unchanged.
+    def test_forged_context_rejected_zero_rows_canonical_block5_unchanged(self):
+        missing_status = _risk_aware_insert_descriptor()
+        del missing_status["expected_current_status"]
+        with pytest.raises(ApprovalMcpAdapterError):
+            prepare_supabase_mcp_call(missing_status)
+
+        wrong_type_confidence = _risk_aware_insert_descriptor()
+        wrong_type_confidence["expected_current_confidence"] = 123
+        with pytest.raises(ApprovalMcpAdapterError):
+            prepare_supabase_mcp_call(wrong_type_confidence)
+
+        unknown_extra_field = _risk_aware_insert_descriptor()
+        unknown_extra_field["expected_current_owner"] = "someone"
+        with pytest.raises(ApprovalMcpAdapterError):
+            prepare_supabase_mcp_call(unknown_extra_field)
+
+        forged_context_select = _investigation_context_descriptor()
+        forged_context_select["table"] = "approvals"
+        with pytest.raises(ApprovalMcpAdapterError):
+            prepare_supabase_mcp_call(forged_context_select)
+
+        # Zero rows normalize canonically for the new operation, exactly
+        # like every other operation.
+        empty_response = {"result": _wrap_block(_BLOCK_UUID, json.dumps([]))}
+        normalized = normalize_supabase_mcp_response("load_investigation_approval_context", empty_response)
+        assert normalized == {"kind": "rows", "rows": []}
+
+        # The old Block 5 unconditional-VALUES INSERT template is untouched.
+        block5_result = prepare_supabase_mcp_call(_insert_descriptor(with_expires_at=False))
+        assert " VALUES (" in block5_result["arguments"]["query"]
+        assert " SELECT " not in block5_result["arguments"]["query"]
 
 
 class TestBlock6ReviewRpcResultNormalization:

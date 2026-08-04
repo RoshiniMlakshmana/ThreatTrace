@@ -861,6 +861,68 @@ def test_multi_review_cli_canonical_conflict_verify():
 
 
 # ---------------------------------------------------------------------------
+# Block 6, Step 9: trusted investigation-context lookup through the real
+# bridge CLI
+# ---------------------------------------------------------------------------
+
+
+def test_investigation_context_cli_prepare_and_verify():
+    operation_input = {"investigation_id": INVESTIGATION_ID}
+
+    prepare_exit, prepare_stdout, prepare_stderr = _run(
+        json.dumps(_prepare_envelope("load_investigation_approval_context", operation_input))
+    )
+    assert prepare_exit == 0
+    assert prepare_stderr == ""
+    prepared = json.loads(prepare_stdout)
+    assert prepared["phase"] == "prepare"
+    assert prepared["operation"] == "load_investigation_approval_context"
+    assert prepared["descriptor"]["table"] == "investigations"
+    # No SQL of any kind is ever constructed inside the bridge -- the
+    # descriptor is a plain data structure, never a query string.
+    assert "query" not in prepared["descriptor"]
+    assert "sql" not in prepared["descriptor"]
+
+    row = {"investigation_id": INVESTIGATION_ID, "status": "investigating", "confidence": "medium"}
+    verify_exit, verify_stdout, verify_stderr = _run(
+        json.dumps(_verify_envelope(
+            "load_investigation_approval_context", operation_input, prepared["descriptor"],
+            {"kind": "rows", "rows": [row]},
+        ))
+    )
+    assert verify_exit == 0
+    assert verify_stderr == ""
+    result = json.loads(verify_stdout)
+    assert result["phase"] == "verify"
+    assert result["operation"] == "load_investigation_approval_context"
+    assert result["result"] == {
+        "investigation_id": INVESTIGATION_ID, "status": "investigating", "confidence": "medium",
+    }
+
+    # Deterministic: the exact same envelope, run again, produces
+    # byte-identical output through the real JSON serialization boundary.
+    prepare_exit_again, prepare_stdout_again, _prepare_stderr_again = _run(
+        json.dumps(_prepare_envelope("load_investigation_approval_context", operation_input))
+    )
+    assert prepare_exit_again == 0
+    assert prepare_stdout_again == prepare_stdout
+
+    # A zero-row lookup fails as a deterministic "not found" conflict,
+    # never a traceback.
+    not_found_exit, not_found_stdout, not_found_stderr = _run(
+        json.dumps(_verify_envelope(
+            "load_investigation_approval_context", operation_input, prepared["descriptor"],
+            {"kind": "rows", "rows": []},
+        ))
+    )
+    assert not_found_exit == 2
+    assert not_found_stdout == ""
+    not_found_error = json.loads(not_found_stderr)
+    assert not_found_error["error"]["code"] == "approval_not_found"
+    assert "Traceback" not in not_found_stderr
+
+
+# ---------------------------------------------------------------------------
 # Test-module source boundary (self-check)
 # ---------------------------------------------------------------------------
 

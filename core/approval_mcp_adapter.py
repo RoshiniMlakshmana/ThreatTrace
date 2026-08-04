@@ -79,6 +79,7 @@ _MCP_TOOL_NAME = "mcp__supabase__execute_sql"
 
 _APPROVALS_TABLE_SQL = "public.approvals"
 _APPROVAL_REVIEWS_TABLE_SQL = "public.approval_reviews"
+_INVESTIGATIONS_TABLE_SQL = "public.investigations"
 _RPC_FUNCTION_NAME = "consume_approval_and_update_investigation_state"
 _RPC_FUNCTION_SQL = "public." + _RPC_FUNCTION_NAME
 _REVIEW_RPC_FUNCTION_NAME = "record_approval_review_and_promote_status"
@@ -124,6 +125,7 @@ _SUPPORTED_OPERATIONS = (
     "load_risk_aware_approval_record",
     "load_approval_reviews",
     "apply_multi_review_transition",
+    "load_investigation_approval_context",
 )
 _SUPPORTED_OPERATIONS_SET = frozenset(_SUPPORTED_OPERATIONS)
 
@@ -148,6 +150,7 @@ _OPERATION_TIMESTAMP_FIELDS: dict[str, tuple[str, ...]] = {
         "requested_at", "approved_at", "rejected_at", "expires_at", "consumed_at", "created_at",
         "review_decided_at",
     ),
+    "load_investigation_approval_context": (),
 }
 
 # ---------------------------------------------------------------------------
@@ -199,6 +202,9 @@ _RPC_PARAMETER_TYPES = {
 # exactly)
 # ---------------------------------------------------------------------------
 
+_RISK_AWARE_INSERT_TOP_FIELDS = frozenset(
+    {"operation", "table", "values", "expected_current_status", "expected_current_confidence", "returning"}
+)
 _RISK_AWARE_INSERT_REQUIRED_VALUE_FIELDS = frozenset({
     "investigation_id", "action_type", "action_payload", "requested_by", "requested_at", "status",
     "risk_level", "required_approvals", "requested_by_normalized",
@@ -222,6 +228,8 @@ _RISK_AWARE_INSERT_COLUMN_TYPES = {
 }
 
 _REVIEW_SELECT_TOP_FIELDS = frozenset({"operation", "table", "columns", "filters", "order_by", "limit"})
+
+_INVESTIGATION_CONTEXT_COLUMNS = ("investigation_id", "status", "confidence")
 
 _REVIEW_RPC_TOP_FIELDS = frozenset({"operation", "function", "parameters"})
 _REVIEW_RPC_PARAMETER_ORDER = (
@@ -467,7 +475,26 @@ def _build_rpc_sql(descriptor: Mapping[str, Any]) -> str:
 
 
 def _build_risk_aware_insert_sql(descriptor: Mapping[str, Any]) -> str:
-    if set(descriptor) != _INSERT_TOP_FIELDS:
+    """Build the fixed, live-context-guarded risk-aware approval INSERT.
+
+    Unlike the unconditional Block 5 `VALUES` insertion, this uses a fixed
+    `INSERT ... SELECT ... FROM investigations WHERE ...` template: the row
+    to insert is a fixed list of literal-encoded constants (never a column
+    read from `investigations`), gated by three independently-evaluated
+    equality guards against the live investigations row --
+    `investigations.id`, `investigations.status`, and
+    `investigations.confidence` must simultaneously match the descriptor's
+    own `investigation_id`, `expected_current_status`, and
+    `expected_current_confidence`. `investigations.id` is a primary key, so
+    at most one row can ever match; when none does, the `SELECT` yields
+    zero rows, the `INSERT` inserts zero rows, and `RETURNING` yields zero
+    rows -- the canonical conflict signal `core.approval_persistence`
+    already treats as `ApprovalConflictError`, never a fallback insert.
+    `expected_current_status`/`expected_current_confidence` are used only
+    inside this `WHERE` clause -- they are never added to the inserted
+    column list, so they can never become new `approvals` columns.
+    """
+    if set(descriptor) != _RISK_AWARE_INSERT_TOP_FIELDS:
         raise ApprovalMcpAdapterError(_INVALID_DESCRIPTOR_MESSAGE)
     if descriptor["operation"] != "insert" or descriptor["table"] != "approvals":
         raise ApprovalMcpAdapterError(_INVALID_DESCRIPTOR_MESSAGE)
@@ -487,9 +514,17 @@ def _build_risk_aware_insert_sql(descriptor: Mapping[str, Any]) -> str:
     columns = [name for name in _RISK_AWARE_INSERT_COLUMN_ORDER if name in values]
     encoded_values = [_encode_value(values[name], _RISK_AWARE_INSERT_COLUMN_TYPES[name]) for name in columns]
 
+    investigation_id_literal = _encode_uuid(values["investigation_id"])
+    expected_status_literal = _encode_text(descriptor["expected_current_status"])
+    expected_confidence_literal = _encode_text(descriptor["expected_current_confidence"])
+
     return (
         "INSERT INTO " + _APPROVALS_TABLE_SQL + " (" + ", ".join(columns) + ") "
-        "VALUES (" + ", ".join(encoded_values) + ") "
+        "SELECT " + ", ".join(encoded_values) + " "
+        "FROM " + _INVESTIGATIONS_TABLE_SQL + " "
+        "WHERE id = " + investigation_id_literal +
+        " AND status = " + expected_status_literal +
+        " AND confidence = " + expected_confidence_literal + " "
         "RETURNING " + ", ".join(_RISK_AWARE_RECORD_FIELDS) + ";"
     )
 
@@ -513,6 +548,28 @@ def _build_risk_aware_select_sql(descriptor: Mapping[str, Any]) -> str:
     return (
         "SELECT " + ", ".join(_RISK_AWARE_RECORD_FIELDS) + " FROM " + _APPROVALS_TABLE_SQL +
         " WHERE id = " + approval_id_literal + " LIMIT 2;"
+    )
+
+
+def _build_investigation_context_select_sql(descriptor: Mapping[str, Any]) -> str:
+    if set(descriptor) != _SELECT_TOP_FIELDS:
+        raise ApprovalMcpAdapterError(_INVALID_DESCRIPTOR_MESSAGE)
+    if descriptor["operation"] != "select" or descriptor["table"] != "investigations":
+        raise ApprovalMcpAdapterError(_INVALID_DESCRIPTOR_MESSAGE)
+    if descriptor["columns"] != list(_INVESTIGATION_CONTEXT_COLUMNS):
+        raise ApprovalMcpAdapterError(_INVALID_DESCRIPTOR_MESSAGE)
+    if descriptor["limit"] != 1:
+        raise ApprovalMcpAdapterError(_INVALID_DESCRIPTOR_MESSAGE)
+
+    filters = descriptor["filters"]
+    if not isinstance(filters, Mapping) or set(filters) != {"id"}:
+        raise ApprovalMcpAdapterError(_INVALID_DESCRIPTOR_MESSAGE)
+
+    investigation_id_literal = _encode_uuid(filters["id"])
+
+    return (
+        "SELECT id AS investigation_id, status, confidence FROM " + _INVESTIGATIONS_TABLE_SQL +
+        " WHERE id = " + investigation_id_literal + " LIMIT 1;"
     )
 
 
@@ -563,13 +620,14 @@ def prepare_supabase_mcp_call(descriptor: Mapping[str, Any]) -> dict[str, Any]:
     descriptor into exactly one `mcp__supabase__execute_sql` tool-call
     request.
 
-    Only the eight descriptor shapes already emitted by
+    Only the nine descriptor shapes already emitted by
     `core.approval_persistence` (via `core.approval_bridge`) are
     understood: a pending-approval insert, an approval-by-ID select, an
     approve/reject conditional update, the atomic consumption RPC, a
-    risk-aware pending-approval insert, a risk-aware approval-by-ID
-    select, an ordered approval-review select, or the atomic review RPC.
-    No other operation name, table, function, column set, filter set, or
+    live-context-guarded risk-aware pending-approval insert, a risk-aware
+    approval-by-ID select, an ordered approval-review select, the atomic
+    review RPC, or a fixed investigation-context select. No other
+    operation name, table, function, column set, filter set, or
     `returning`/`columns` order is accepted -- every identifier used in
     the generated SQL comes from a fixed constant owned by this module,
     never from the descriptor's own text. JSON-object key order in the
@@ -607,6 +665,8 @@ def prepare_supabase_mcp_call(descriptor: Mapping[str, Any]) -> dict[str, Any]:
         elif operation == "select":
             if descriptor.get("table") == "approval_reviews":
                 sql = _build_review_select_sql(descriptor)
+            elif descriptor.get("table") == "investigations":
+                sql = _build_investigation_context_select_sql(descriptor)
             elif descriptor.get("columns") == list(_RISK_AWARE_RECORD_FIELDS):
                 sql = _build_risk_aware_select_sql(descriptor)
             else:
@@ -739,8 +799,9 @@ def normalize_supabase_mcp_response(operation: str, tool_response: Mapping[str, 
     `operation` must be exactly one of `insert_pending_approval`,
     `load_approval_record`, `apply_approval_review_transition`,
     `apply_approval_consumption`, `insert_risk_aware_pending_approval`,
-    `load_risk_aware_approval_record`, `load_approval_reviews`, or
-    `apply_multi_review_transition` -- used only to select which known
+    `load_risk_aware_approval_record`, `load_approval_reviews`,
+    `apply_multi_review_transition`, or `load_investigation_approval_context`
+    -- used only to select which known
     timestamp fields may appear in that operation's returned rows; this
     function never duplicates full approval-record validation, which
     remains entirely `core.approval_bridge`/`core.approval_persistence`'s
