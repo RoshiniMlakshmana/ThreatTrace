@@ -1,7 +1,9 @@
 """Static tests for the Block 5 approval-gated case-update documentation
 and routing updates: README.md, SECURITY.md, docs/architecture.md,
 docs/demo-walkthrough.md, .claude/commands/triage-case.md, and
-.claude/commands/purple-loop.md.
+.claude/commands/purple-loop.md -- plus the Block 6 risk-aware
+multi-review approval documentation: README.md's project-status update
+and docs/block6-risk-aware-approvals.md.
 
 These tests only read repository text files and check their content
 structurally. They never execute a ThreatTrace command, never invoke any
@@ -9,8 +11,8 @@ project CLI, never call Supabase or MCP, never execute SQL or an RPC,
 never access the network, never launch a shell command, and never modify
 any file.
 
-Exactly 64 tests are defined below, each mapped to one required
-confirmation item from the Step 36 specification.
+64 tests are defined for the Block 5 specification, plus 4 additional
+tests for Block 6's closure documentation (68 total).
 """
 
 import ast
@@ -28,6 +30,7 @@ ARCHITECTURE_PATH = REPO_ROOT / "docs" / "architecture.md"
 DEMO_PATH = REPO_ROOT / "docs" / "demo-walkthrough.md"
 TRIAGE_PATH = REPO_ROOT / ".claude" / "commands" / "triage-case.md"
 PURPLE_LOOP_PATH = REPO_ROOT / ".claude" / "commands" / "purple-loop.md"
+BLOCK6_PATH = REPO_ROOT / "docs" / "block6-risk-aware-approvals.md"
 
 ALL_MODIFIED_PATHS = (
     README_PATH, SECURITY_PATH, ARCHITECTURE_PATH, DEMO_PATH, TRIAGE_PATH, PURPLE_LOOP_PATH,
@@ -64,6 +67,11 @@ def triage_text():
 @pytest.fixture(scope="module")
 def purple_loop_text():
     return PURPLE_LOOP_PATH.read_text(encoding="utf-8")
+
+
+@pytest.fixture(scope="module")
+def block6_text():
+    return BLOCK6_PATH.read_text(encoding="utf-8")
 
 
 def _this_module_ast():
@@ -527,3 +535,46 @@ def test_064_purple_loop_contains_no_direct_case_update_path(purple_loop_text):
     route_list = section[route_list_start:route_list_end]
     assert "/update-case" not in route_list
     assert "deprecated static guidance and must never be recommended as a way to change status or confidence" in purple_loop_text
+
+
+# ---------------------------------------------------------------------------
+# 65-68: Block 6 risk-aware multi-review approval closure documentation
+# ---------------------------------------------------------------------------
+
+
+def test_065_readme_marks_block_6_complete_and_links_to_block6_document(readme_text):
+    assert "Block 6" in readme_text
+    assert "is complete" in readme_text
+    assert "[docs/block6-risk-aware-approvals.md](docs/block6-risk-aware-approvals.md)" in readme_text
+
+
+def test_066_block6_document_contains_risk_mapping_and_both_lifecycles(block6_text):
+    assert "| low | 1 |" in block6_text
+    assert "| medium | 1 |" in block6_text
+    assert "| high | 2 |" in block6_text
+    assert "| critical | 2 |" in block6_text
+    assert "pending → approved → consumed" in block6_text
+    assert "pending → partially_approved → approved → consumed" in block6_text
+
+
+def test_067_block6_document_covers_required_security_boundaries(block6_text):
+    assert "trusted" in block6_text.lower()
+    assert "TOCTOU" in block6_text
+    assert "self-review" in block6_text
+    assert "Duplicate reviewer blocked" in block6_text
+    assert "Immutable review history" in block6_text
+    assert "record_approval_review_and_promote_status" in block6_text
+    assert "consume_approval_and_update_investigation_state" in block6_text
+    assert "Partial approval cannot execute" in block6_text
+    assert "Replay protection" in block6_text
+
+
+def test_068_block6_document_contains_live_evidence_limitations_and_roadmap(block6_text):
+    assert "## Live Supabase Verification" in block6_text
+    assert "### One-review scenario" in block6_text
+    assert "### Two-review scenario" in block6_text
+    assert "duplicate" in block6_text.lower() and "blocked before any mutation" in block6_text
+    assert "replay attempt" in block6_text.lower() and "blocked before any mutation" in block6_text
+    assert "restored the database to exactly its pre-test state" in block6_text
+    assert "claimed and deterministically normalized, not yet cryptographically authenticated" in block6_text
+    assert "## Next: Block 7 — Shadow Execution / Digital Twin" in block6_text

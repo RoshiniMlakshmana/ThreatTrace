@@ -6,6 +6,12 @@ ThreatTrace is built for **authorized lab environments only**. It does not run a
 
 For the current architecture, approval boundary, filesystem boundaries, security limitations, and planned improvements, see [docs/architecture.md](docs/architecture.md).
 
+## Project Status
+
+**Block 6 — Risk-Aware Multi-Review Approval Workflow is complete.** See [docs/block6-risk-aware-approvals.md](docs/block6-risk-aware-approvals.md) for the full design, the security-control table, and live Supabase verification evidence.
+
+Investigation-changing actions are now gated by deterministic risk classification, one- or two-person approval depending on that risk, an immutable review history, atomic execution, and replay protection. 3,800+ automated tests pass, and the workflow has been verified live against a real Supabase project. **Block 7 — Shadow Execution / Digital Twin** is the next development block.
+
 ## Project Structure
 
 ```text
@@ -109,6 +115,8 @@ Investigation `status`/`confidence` changes are never applied directly — the o
 - `/update-case` is a deprecated, static compatibility command. It performs no lookup, no validation, and no database operation of any kind — typed confirmation was never authorization, and it is no longer accepted at all. The command only redirects the caller to `/request-case-update`.
 
 `requested_by`, `reviewed_by`, and `consumed_by` are caller-supplied **claimed identities** — none of them is authenticated, verified, cryptographically proven, or derived from Supabase Auth.
+
+Every request is also **classified for risk** the moment it is created: the system, never the caller, decides whether the change needs one reviewer or two, based on the investigation's own trusted, live `status`/`confidence` and the proposed change. See [docs/block6-risk-aware-approvals.md](docs/block6-risk-aware-approvals.md) for the full risk model, review lifecycle, and security controls.
 
 ### Examples
 
