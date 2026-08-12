@@ -93,7 +93,7 @@ Never automatically retry any of these outcomes, and never fall back to displayi
 
 ### Decision Binding CLI success-output validation
 
-Require stdout to be exactly one JSON object containing exactly the fourteen fields `core.decision_binding.create_decision_binding` always returns: `decision_binding_version`, `binding_outcome`, `canonical_agent_id`, `agent_role`, `canonical_tool_name`, `gateway_decision`, `policy_decision`, `argument_digest`, `approval_reference`, `issued_at`, `expires_at`, `binding_digest`, `refusal_reason`, `identity_authenticated`, `execution_performed`.
+Require stdout to be exactly one JSON object containing exactly the fifteen fields `core.decision_binding.create_decision_binding` always returns: `decision_binding_version`, `binding_outcome`, `canonical_agent_id`, `agent_role`, `canonical_tool_name`, `gateway_decision`, `policy_decision`, `argument_digest`, `approval_reference`, `issued_at`, `expires_at`, `binding_digest`, `refusal_reason`, `identity_authenticated`, `execution_performed`.
 
 Require `decision_binding_version` to equal exactly `"1"`, `identity_authenticated` to equal exactly `false`, and `execution_performed` to equal exactly `false`. Require `binding_outcome` to be exactly one of `created` or `refused`:
 
