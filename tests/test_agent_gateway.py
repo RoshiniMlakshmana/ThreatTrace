@@ -379,3 +379,75 @@ def test_020_registry_is_immutable_exact_and_output_is_recursively_safe():
         for forbidden in forbidden_substrings:
             assert forbidden not in rendered
         assert APPROVAL_ID not in rendered
+
+
+# ---------------------------------------------------------------------------
+# 21: Block 15A checkpoint B2 -- run_bug_bounty_assessment registration
+# ---------------------------------------------------------------------------
+
+
+def test_021_bug_bounty_assessment_tool_registered_exactly_once():
+    registry = agent_gateway_module._REGISTRY
+    matches = [name for name in registry if name == "run_bug_bounty_assessment"]
+    assert matches == ["run_bug_bounty_assessment"]
+
+
+def test_022_bug_bounty_assessment_tool_is_external_side_effect():
+    result = evaluate_tool_call(
+        tool_name="run_bug_bounty_assessment",
+        arguments={"target": "https://app.example.test/", "testing_profile": "passive"},
+        evaluated_at=EVALUATED_AT,
+    )
+    assert result["operation_class"] == "external_side_effect"
+
+
+def test_023_bug_bounty_assessment_tool_denied_like_every_other_external_side_effect_tool():
+    result = evaluate_tool_call(
+        tool_name="run_bug_bounty_assessment",
+        arguments={"target": "https://app.example.test/", "testing_profile": "passive"},
+        evaluated_at=EVALUATED_AT,
+    )
+    assert result["decision"] == "deny"
+    assert result["eligible_for_execution"] is False
+    assert result["requires_approval"] is False
+    assert "EXTERNAL_SIDE_EFFECT_DENIED" in _codes(result)
+    assert result["execution_performed"] is False
+
+
+def test_024_bug_bounty_assessment_tool_not_special_cased_to_a_permissive_outcome():
+    result = evaluate_tool_call(
+        tool_name="run_bug_bounty_assessment",
+        arguments={"target": "https://app.example.test/", "testing_profile": "safe_active"},
+        evaluated_at=EVALUATED_AT,
+    )
+    assert result["decision"] != "allow"
+    assert result["decision"] != "require_approval"
+    assert "MUTATION_REQUIRES_APPROVAL" not in _codes(result)
+    assert "READ_ONLY_TOOL_ALLOWED" not in _codes(result)
+
+
+def test_025_bug_bounty_assessment_tool_addition_does_not_change_unrelated_tool_decisions():
+    read_only = evaluate_tool_call(
+        tool_name="load_risk_aware_approval_record", arguments={"approval_id": APPROVAL_ID}, evaluated_at=EVALUATED_AT
+    )
+    mutation = evaluate_tool_call(
+        tool_name="apply_approval_consumption", arguments={"approval_id": APPROVAL_ID}, evaluated_at=EVALUATED_AT
+    )
+    other_external_side_effect = evaluate_tool_call(
+        tool_name="run_evtx_analysis",
+        arguments={
+            "evtx_file": "sample.evtx", "analysis_type": "csv_timeline",
+            "output_name": "result.csv", "authorization_phrase": "RUN AUTHORIZED HAYABUSA ANALYSIS",
+        },
+        evaluated_at=EVALUATED_AT,
+    )
+    assert read_only["decision"] == "allow"
+    assert mutation["decision"] == "require_approval"
+    assert other_external_side_effect["decision"] == "deny"
+
+
+def test_026_bug_bounty_assessment_tool_deterministic_repeated_result():
+    arguments = {"target": "https://app.example.test/", "testing_profile": "passive"}
+    first = evaluate_tool_call(tool_name="run_bug_bounty_assessment", arguments=arguments, evaluated_at=EVALUATED_AT)
+    second = evaluate_tool_call(tool_name="run_bug_bounty_assessment", arguments=arguments, evaluated_at=EVALUATED_AT)
+    assert first == second

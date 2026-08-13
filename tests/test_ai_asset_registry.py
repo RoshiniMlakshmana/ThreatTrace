@@ -14,6 +14,8 @@ adapter boundary around those already-tested pure functions.
 
 import inspect
 
+import pytest
+
 import core.ai_asset_registry as registry_module
 from core.ai_asset_registry import (
     AIAssetRegistryError,
@@ -23,14 +25,14 @@ from core.ai_asset_registry import (
 )
 
 _EXPECTED_COUNTS_BY_TYPE = {
-    "gateway_tool": 7,
-    "identity_agent": 5,
-    "claude_subagent": 2,
-    "claude_command": 20,
+    "gateway_tool": 8,
+    "identity_agent": 6,
+    "claude_subagent": 3,
+    "claude_command": 25,
     "claude_skill": 1,
     "mcp_server": 2,
 }
-_EXPECTED_TOTAL = 37
+_EXPECTED_TOTAL = 45
 
 _REPRESENTATIVE_ASSET_IDS = (
     "gateway_tool:load_risk_aware_approval_record",
@@ -47,7 +49,7 @@ _REPRESENTATIVE_ASSET_IDS = (
 # ---------------------------------------------------------------------------
 
 
-def test_001_total_inventory_count_is_thirty_seven():
+def test_001_total_inventory_count_is_forty_five():
     result = list_ai_assets()
     assert result["count"] == _EXPECTED_TOTAL
     assert len(result["assets"]) == _EXPECTED_TOTAL
@@ -578,3 +580,104 @@ def test_058_mcp_example_json_path_never_reads_real_mcp_json():
     source = inspect.getsource(registry_module)
     assert '".mcp.json"' not in source
     assert ".mcp.example.json" in source
+
+
+# ---------------------------------------------------------------------------
+# Block 15A additions: discoverability and honest provenance
+# ---------------------------------------------------------------------------
+
+
+def test_059_bug_bounty_gateway_tool_discoverable():
+    result = lookup_ai_asset(asset_id="gateway_tool:run_bug_bounty_assessment")
+    assert result["found"] is True
+    assert result["asset_type"] == "gateway_tool"
+    assert result["enabled"] is True
+    assert result["declared_in"] == "core/agent_gateway.py::_REGISTRY"
+
+
+def test_060_bug_bounty_identity_agent_discoverable():
+    result = lookup_ai_asset(asset_id="identity_agent:bug_bounty_agent")
+    assert result["found"] is True
+    assert result["asset_type"] == "identity_agent"
+    assert result["enabled"] is True
+    assert result["declared_in"] == "core/agent_identity_policy.py::_REGISTRY"
+
+
+def test_061_bug_bounty_claude_subagent_discoverable():
+    result = lookup_ai_asset(asset_id="claude_subagent:bug-bounty")
+    assert result["found"] is True
+    assert result["asset_type"] == "claude_subagent"
+    assert result["declared_in"] == ".claude/agents/bug-bounty.md"
+
+
+def test_062_bug_bounty_claude_command_discoverable():
+    result = lookup_ai_asset(asset_id="claude_command:bug-bounty")
+    assert result["found"] is True
+    assert result["asset_type"] == "claude_command"
+    assert result["declared_in"] == ".claude/commands/bug-bounty.md"
+
+
+def test_063_new_assets_provenance_is_repository_declared_not_verified():
+    for asset_id in (
+        "gateway_tool:run_bug_bounty_assessment",
+        "identity_agent:bug_bounty_agent",
+        "claude_subagent:bug-bounty",
+        "claude_command:bug-bounty",
+    ):
+        result = lookup_ai_asset(asset_id=asset_id)
+        assert result["provenance"]["tier"] == "repository_declared"
+        assert "verified" not in result["provenance"]["tier"]
+        assert "authenticated" not in result["provenance"]["tier"]
+
+
+def test_064_existing_assets_unchanged_by_block_15a_additions():
+    for asset_id in _REPRESENTATIVE_ASSET_IDS:
+        result = lookup_ai_asset(asset_id=asset_id)
+        assert result["found"] is True
+
+    unaffected = lookup_ai_asset(asset_id="identity_agent:coordinator_agent")
+    assert unaffected["enabled"] is True
+    assert unaffected["asset_type"] == "identity_agent"
+
+
+# ---------------------------------------------------------------------------
+# B2 registry-consistency fix: previously undeclared, already-existing
+# Claude commands from Blocks 13-15
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("name", [
+    "ai-security-lab", "record-analyst-feedback", "audit-dashboard", "integration-demo", "bug-bounty",
+])
+def test_065_recent_command_assets_individually_discoverable(name):
+    result = lookup_ai_asset(asset_id=f"claude_command:{name}")
+    assert result["found"] is True
+    assert result["asset_type"] == "claude_command"
+    assert result["declared_in"] == f".claude/commands/{name}.md"
+
+
+def test_066_historical_command_additions_provenance_is_repository_declared_not_verified():
+    for name in ("ai-security-lab", "record-analyst-feedback", "audit-dashboard", "integration-demo"):
+        result = lookup_ai_asset(asset_id=f"claude_command:{name}")
+        assert result["provenance"]["tier"] == "repository_declared"
+        assert "verified" not in result["provenance"]["tier"]
+        assert "authenticated" not in result["provenance"]["tier"]
+        assert "signature" not in str(result["provenance"]).lower()
+
+
+def test_067_no_duplicate_asset_ids_in_full_inventory():
+    listing = list_ai_assets()
+    ids = [asset["asset_id"] for asset in listing["assets"]]
+    assert len(ids) == len(set(ids))
+
+
+def test_068_claude_command_registry_matches_actual_command_file_count():
+    result = list_ai_assets(asset_type="claude_command")
+    assert result["count"] == 25
+
+
+def test_069_existing_evaluation_lab_behavior_unchanged_by_registry_additions():
+    result = evaluate_ai_security_case(
+        case_type="emergency_freeze_bypass", asset_id="identity_agent:coordinator_agent",
+    )
+    assert result["evaluation_outcome"] == "pass"

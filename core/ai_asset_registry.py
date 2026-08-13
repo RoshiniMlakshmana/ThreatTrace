@@ -176,6 +176,7 @@ _GATEWAY_TOOL_NAMES: tuple[tuple[str, bool], ...] = (
     ("apply_migration", True),
     ("execute_sql", True),
     ("run_evtx_analysis", True),
+    ("run_bug_bounty_assessment", True),
 )
 
 _IDENTITY_AGENT_NAMES: tuple[tuple[str, bool], ...] = (
@@ -184,9 +185,10 @@ _IDENTITY_AGENT_NAMES: tuple[tuple[str, bool], ...] = (
     ("coordinator_agent", True),
     ("reviewer_agent", True),
     ("disabled_agent", False),
+    ("bug_bounty_agent", True),
 )
 
-_CLAUDE_SUBAGENT_NAMES: tuple[str, ...] = ("purple-team", "atomic-mapper")
+_CLAUDE_SUBAGENT_NAMES: tuple[str, ...] = ("purple-team", "atomic-mapper", "bug-bounty")
 
 _CLAUDE_COMMAND_NAMES: tuple[str, ...] = (
     "red-team",
@@ -209,6 +211,11 @@ _CLAUDE_COMMAND_NAMES: tuple[str, ...] = (
     "evaluate-tool-call",
     "evaluate-agent-tool-call",
     "create-decision-binding",
+    "ai-security-lab",
+    "record-analyst-feedback",
+    "audit-dashboard",
+    "integration-demo",
+    "bug-bounty",
 )
 
 _CLAUDE_SKILL_NAMES: tuple[str, ...] = ("detection-engineering",)

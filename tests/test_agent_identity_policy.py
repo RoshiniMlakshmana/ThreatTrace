@@ -513,9 +513,11 @@ def test_021_registry_and_role_map_are_immutable_and_consistent():
 
     assert set(registry.keys()) == {
         "observer_agent", "analyst_agent", "coordinator_agent", "reviewer_agent", "disabled_agent",
+        "bug_bounty_agent",
     }
     assert set(agent_identity_policy_module.ROLES) == {
-        "observer", "analyst", "investigation_coordinator", "approval_reviewer", "disabled",
+        "observer", "analyst", "investigation_coordinator", "approval_reviewer",
+        "bug_bounty_assessor", "disabled",
     }
 
     expected_field_names = {
@@ -585,3 +587,95 @@ def test_022_output_never_contains_sensitive_or_raw_values():
     for result in (allow_result, require_approval_result, deny_result, sql_deny_result):
         assert not _contains_forbidden_text(result, forbidden)
         assert "allowed_tools" not in json.dumps(result)
+
+
+# ---------------------------------------------------------------------------
+# Block 15A checkpoint B2 -- bug_bounty_agent identity
+# ---------------------------------------------------------------------------
+
+_BUG_BOUNTY_ARGUMENTS = {"target": "https://app.example.test/", "testing_profile": "passive"}
+
+
+def test_022_bug_bounty_agent_registered_exactly_once():
+    registry = agent_identity_policy_module._REGISTRY
+    matches = [name for name in registry if name == "bug_bounty_agent"]
+    assert matches == ["bug_bounty_agent"]
+
+
+def test_023_bug_bounty_agent_allowlist_is_minimal():
+    entry = agent_identity_policy_module._REGISTRY["bug_bounty_agent"]
+    assert entry.allowed_tools == frozenset({"run_bug_bounty_assessment"})
+
+
+def test_024_bug_bounty_agent_rejects_unrelated_tools():
+    for tool_name in ("apply_approval_consumption", "load_risk_aware_approval_record", "execute_sql", "apply_migration"):
+        result = evaluate_agent_tool_call(
+            agent_id="bug_bounty_agent", tool_name=tool_name,
+            arguments={"approval_id": APPROVAL_ID} if "approval" in tool_name or tool_name == "load_risk_aware_approval_record" else {"query": "select 1"},
+            evaluated_at=EVALUATED_AT,
+        )
+        assert result["final_decision"] == "deny"
+
+
+def test_025_bug_bounty_agent_does_not_widen_gateway_deny():
+    result = evaluate_agent_tool_call(
+        agent_id="bug_bounty_agent", tool_name="run_bug_bounty_assessment",
+        arguments=_BUG_BOUNTY_ARGUMENTS, evaluated_at=EVALUATED_AT,
+    )
+    assert result["gateway_decision"] == "deny"
+    assert result["final_decision"] == "deny"
+    assert result["eligible_for_execution"] is False
+    assert result["requires_approval"] is False
+    assert "GATEWAY_DENIED" in _codes(result)
+
+
+def test_026_bug_bounty_agent_identity_authenticated_remains_false():
+    result = evaluate_agent_tool_call(
+        agent_id="bug_bounty_agent", tool_name="run_bug_bounty_assessment",
+        arguments=_BUG_BOUNTY_ARGUMENTS, evaluated_at=EVALUATED_AT,
+    )
+    assert result["identity_authenticated"] is False
+    assert "CLAIMED_IDENTITY_NOT_AUTHENTICATED" in _codes(result)
+
+
+def test_027_bug_bounty_agent_final_decision_stays_deny_when_gateway_denies():
+    # If Block 8's own policy for run_bug_bounty_assessment ever became
+    # non-deny, this test would need updating -- but it must never be
+    # satisfied by loosening Block 9 itself.
+    from core.agent_gateway import evaluate_tool_call as gateway_evaluate
+
+    gateway_result = gateway_evaluate(
+        tool_name="run_bug_bounty_assessment", arguments=_BUG_BOUNTY_ARGUMENTS, evaluated_at=EVALUATED_AT,
+    )
+    identity_result = evaluate_agent_tool_call(
+        agent_id="bug_bounty_agent", tool_name="run_bug_bounty_assessment",
+        arguments=_BUG_BOUNTY_ARGUMENTS, evaluated_at=EVALUATED_AT,
+    )
+    assert gateway_result["decision"] == "deny"
+    assert identity_result["final_decision"] == "deny"
+
+
+def test_028_bug_bounty_agent_has_no_approval_database_or_schema_capability():
+    entry = agent_identity_policy_module._REGISTRY["bug_bounty_agent"]
+    assert entry.mutation_request_allowed is False
+    assert entry.allowed_operation_classes == frozenset()
+    assert "apply_approval_consumption" not in entry.allowed_tools
+    assert "apply_migration" not in entry.allowed_tools
+    assert "execute_sql" not in entry.allowed_tools
+
+
+def test_029_bug_bounty_agent_role_ceiling_excludes_external_side_effect():
+    ceilings = agent_identity_policy_module._ROLE_OPERATION_CLASS_CEILING
+    assert "external_side_effect" not in ceilings["bug_bounty_assessor"]
+
+
+def test_030_bug_bounty_agent_deterministic_repeated_result():
+    first = evaluate_agent_tool_call(
+        agent_id="bug_bounty_agent", tool_name="run_bug_bounty_assessment",
+        arguments=_BUG_BOUNTY_ARGUMENTS, evaluated_at=EVALUATED_AT,
+    )
+    second = evaluate_agent_tool_call(
+        agent_id="bug_bounty_agent", tool_name="run_bug_bounty_assessment",
+        arguments=_BUG_BOUNTY_ARGUMENTS, evaluated_at=EVALUATED_AT,
+    )
+    assert first == second

@@ -315,6 +315,22 @@ _REGISTRY: Mapping[str, _ToolRegistryEntry] = MappingProxyType({
         enabled=True,
         description="External Hayabusa execution side effect. Always denied in the Block 8 MVP.",
     ),
+    "run_bug_bounty_assessment": _entry(
+        canonical_name="run_bug_bounty_assessment",
+        operation_class="external_side_effect",
+        decision_policy="deny",
+        required_argument_fields=("target", "testing_profile"),
+        allowed_argument_fields=("target", "testing_profile"),
+        enabled=True,
+        description=(
+            "Bounded, scope-checked GET/HEAD/OPTIONS web-application security assessment via the "
+            "Block 15A Bug Bounty assessment engine (core.bug_bounty_assessment). This gateway "
+            "entry governs only whether an AI agent may request the tool by name; the actual real "
+            "execution surface is the separate, human-invoked core.bug_bounty_cli boundary. Always "
+            "denied by the gateway's fixed external_side_effect policy in this MVP -- never "
+            "exploitation, never a comprehensive penetration test, never a production mutation."
+        ),
+    ),
 })
 
 

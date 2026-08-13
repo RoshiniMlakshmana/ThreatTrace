@@ -78,6 +78,7 @@ ROLES = (
     "analyst",
     "investigation_coordinator",
     "approval_reviewer",
+    "bug_bounty_assessor",
     "disabled",
 )
 _ROLES_SET = frozenset(ROLES)
@@ -87,6 +88,12 @@ _ROLE_OPERATION_CLASS_CEILING: Mapping[str, frozenset[str]] = MappingProxyType({
     "analyst": frozenset({"read_only", "state_mutation", "approval_mutation"}),
     "investigation_coordinator": frozenset({"read_only", "state_mutation", "approval_mutation"}),
     "approval_reviewer": frozenset({"read_only"}),
+    # Empty by design: no role may ever permit schema_mutation,
+    # external_side_effect, or prohibited (see module docstring), and
+    # run_bug_bounty_assessment (the only tool this role's identity is
+    # ever allowlisted for) is classified external_side_effect by
+    # Block 8. This ceiling has nothing else to grant yet.
+    "bug_bounty_assessor": frozenset(),
     "disabled": frozenset(),
 })
 
@@ -279,6 +286,24 @@ _REGISTRY: Mapping[str, _AgentRegistryEntry] = MappingProxyType({
         allowed_operation_classes=frozenset(),
         mutation_request_allowed=False,
         description="Explicitly deactivated identity, kept only to demonstrate deny-when-disabled.",
+    ),
+    "bug_bounty_agent": _AgentRegistryEntry(
+        canonical_agent_id="bug_bounty_agent",
+        role="bug_bounty_assessor",
+        enabled=True,
+        allowed_tools=frozenset({"run_bug_bounty_assessment"}),
+        allowed_operation_classes=frozenset(),
+        mutation_request_allowed=False,
+        description=(
+            "Bounded web-application security assessment identity for the Block 15A Bug Bounty "
+            "engine. Its one allowlisted tool, run_bug_bounty_assessment, is intentionally "
+            "allowlisted so the role's own empty operation-class ceiling independently denies it "
+            "-- exactly like reviewer_agent's own apply_approval_consumption allowlisting -- and "
+            "Block 8 already denies that tool outright as external_side_effect regardless. This "
+            "identity currently has no path to eligible_for_execution or requires_approval for "
+            "any tool; the real assessment execution surface is the separate, human-invoked "
+            "core.bug_bounty_cli boundary, never this identity acting autonomously."
+        ),
     ),
 })
 
