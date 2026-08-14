@@ -28,11 +28,11 @@ _EXPECTED_COUNTS_BY_TYPE = {
     "gateway_tool": 8,
     "identity_agent": 6,
     "claude_subagent": 4,
-    "claude_command": 29,
+    "claude_command": 30,
     "claude_skill": 1,
     "mcp_server": 2,
 }
-_EXPECTED_TOTAL = 50
+_EXPECTED_TOTAL = 51
 
 _REPRESENTATIVE_ASSET_IDS = (
     "gateway_tool:load_risk_aware_approval_record",
@@ -674,7 +674,7 @@ def test_067_no_duplicate_asset_ids_in_full_inventory():
 
 def test_068_claude_command_registry_matches_actual_command_file_count():
     result = list_ai_assets(asset_type="claude_command")
-    assert result["count"] == 29
+    assert result["count"] == 30
 
 
 def test_069_existing_evaluation_lab_behavior_unchanged_by_registry_additions():
@@ -821,6 +821,55 @@ def test_086_claude_subagent_registry_matches_actual_agent_file_count():
 
 
 def test_087_existing_evaluation_lab_behavior_unchanged_by_block_15c5_15d_addition():
+    result = evaluate_ai_security_case(
+        case_type="emergency_freeze_bypass", asset_id="identity_agent:coordinator_agent",
+    )
+    assert result["evaluation_outcome"] == "pass"
+
+
+# ---------------------------------------------------------------------------
+# Block 15E checkpoint: research-evaluation command asset
+# ---------------------------------------------------------------------------
+
+
+def test_088_research_evaluation_command_discoverable():
+    result = lookup_ai_asset(asset_id="claude_command:research-evaluation")
+    assert result["found"] is True
+    assert result["asset_type"] == "claude_command"
+    assert result["declared_in"] == ".claude/commands/research-evaluation.md"
+
+
+def test_089_research_evaluation_provenance_is_repository_declared_not_verified():
+    result = lookup_ai_asset(asset_id="claude_command:research-evaluation")
+    assert result["provenance"]["tier"] == "repository_declared"
+    assert "verified" not in result["provenance"]["tier"]
+    assert "authenticated" not in result["provenance"]["tier"]
+    assert "signature" not in str(result["provenance"]).lower()
+
+
+def test_090_no_gateway_tool_or_identity_agent_added_for_research_evaluation():
+    assert lookup_ai_asset(asset_id="gateway_tool:research_evaluation")["found"] is False
+    assert lookup_ai_asset(asset_id="gateway_tool:evaluate_research_experiment")["found"] is False
+    assert lookup_ai_asset(asset_id="identity_agent:research_evaluation_agent")["found"] is False
+
+
+def test_091_no_claude_subagent_or_skill_added_for_research_evaluation():
+    assert lookup_ai_asset(asset_id="claude_subagent:research-evaluation")["found"] is False
+    assert lookup_ai_asset(asset_id="claude_skill:research-evaluation")["found"] is False
+
+
+def test_092_no_duplicate_asset_ids_after_block_15e_addition():
+    listing = list_ai_assets()
+    ids = [asset["asset_id"] for asset in listing["assets"]]
+    assert len(ids) == len(set(ids))
+
+
+def test_093_claude_subagent_count_unchanged_by_block_15e():
+    result = list_ai_assets(asset_type="claude_subagent")
+    assert result["count"] == 4
+
+
+def test_094_existing_evaluation_lab_behavior_unchanged_by_block_15e_addition():
     result = evaluate_ai_security_case(
         case_type="emergency_freeze_bypass", asset_id="identity_agent:coordinator_agent",
     )
