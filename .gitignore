@@ -57,3 +57,16 @@ htmlcov/
 output/**
 !output/**/
 !output/**/.gitkeep
+
+# Node/JS tooling artifacts (not currently used, kept defensively)
+node_modules/
+
+# Python packaging build artifacts
+dist/
+build/
+*.egg-info/
+
+# Nuclei templates -- resolved outside the repo by default
+# (~/nuclei-templates or THREATTRACE_NUCLEI_TEMPLATES_DIR); excluded
+# defensively in case a local override ever points inside the repo.
+nuclei-templates/

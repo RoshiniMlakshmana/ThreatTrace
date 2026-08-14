@@ -1,12 +1,22 @@
 # ThreatTrace
 
-ThreatTrace is an AI-powered Purple Team investigation system that traces threats from attack simulation to detection validation. It coordinates authorized Red Team simulations and Blue Team detection validation in a single loop, so that every finding — whether it starts from threat intelligence, an unexplained anomaly, or a completed test — ends with a concrete answer about detection coverage.
+**ThreatTrace is an analyst-governed, AI-assisted security research platform.** It combines an LLM reasoning layer with deterministic, code-enforced security cores to run authorized Bug Bounty-style assessments, correlate the results into evidence-grounded findings, turn Threat Intelligence and Bug Bounty findings into draft detection rules, and validate Purple Team investigations end to end — all inside explicit, human-reviewed boundaries.
 
-ThreatTrace is built for **authorized lab environments only**. It does not run attacks, does not touch production or third-party systems, and never takes an action that changes a system state without a human approving it first.
+ThreatTrace is a **research prototype**, not a production security product. See [Current Maturity](#current-maturity) and [Known Limitations](#known-limitations) before relying on it for anything beyond local, authorized research.
 
-For the current architecture, approval boundary, filesystem boundaries, security limitations, and planned improvements, see [docs/architecture.md](docs/architecture.md).
+## What ThreatTrace Is Not
 
-## Project Status
+To avoid over-claiming, ThreatTrace explicitly is **not**:
+
+- a fully autonomous security platform or fully autonomous pentester,
+- a production SOC replacement,
+- a zero-day prevention system,
+- a system that detects 100% of vulnerabilities,
+- production-ready SIEM automation.
+
+Every workflow below ends in a human-reviewed artifact (a finding, a draft detection rule, an investigation update) — none of them deploys, remediates, or acts on a system without a separate, explicit human decision.
+
+## Project History
 
 **Block 6 — Risk-Aware Multi-Review Approval Workflow is complete.** See [docs/block6-risk-aware-approvals.md](docs/block6-risk-aware-approvals.md) for the full design, the security-control table, and live Supabase verification evidence.
 
@@ -22,92 +32,96 @@ A read-only live verification was attempted against the connected Supabase proje
 
 3,900+ automated tests pass, with one intentional Windows-only Hayabusa symlink-permission test skip. A local, non-mutating five-scenario demonstration (analyst allow, observer allowlist denial, analyst mutation denial, coordinator require_approval, unknown-agent denial) completed successfully with no agent authenticated and no tool, database, or external process ever executed. **Block 10** begins with a separate, read-only architecture audit whose exact scope has not yet been selected.
 
-## Project Structure
+Blocks 10 through 15L-16 — AI asset inventory, AI Security Evaluation Lab, analyst feedback, tamper-evident audit, the Bug Bounty engine, Threat Intelligence ingestion, Detection Engineering, the Security Governor, the live platform backend, and reproducible packaging — are each documented in their own `docs/block*.md` file and summarized in [docs/architecture.md](docs/architecture.md), rather than repeated here as a growing changelog.
 
-```text
-ThreatTrace/
-├── .claude/
-│   ├── agents/          # Purple Team coordinator and Atomic mapper
-│   ├── commands/        # Investigation and Purple Team commands
-│   ├── hooks/           # Post-write validation
-│   └── skills/          # Detection-engineering guidance
-├── docs/                # Architecture and demonstration documentation
-├── evidence/evtx/       # Local raw EVTX evidence; excluded from Git
-├── mcp/                 # Hayabusa MCP server
-├── output/hayabusa/     # Generated analysis results; excluded from Git
-└── supabase/            # Investigation database schema
+## The Problem Being Addressed
+
+Security teams sit on three disconnected streams of work: offensive findings (what's actually exploitable), threat intelligence (what's actually being exploited elsewhere), and detection engineering (what would actually catch it). Each stream is usually its own tool, its own analyst, and its own backlog — so a real finding can go months without a corresponding detection rule, and a piece of threat intel can go unactioned because nobody connects it to what the organization's own telemetry could support. ThreatTrace's Purple Team loop exists to close that gap deterministically: every finding or intel record is evaluated for whether it can be *meaningfully detected* before any rule is drafted, and every drafted rule stays a human-reviewed candidate — never an auto-deployed control.
+
+## Architecture
+
+```
+LLM reasoning layer (Claude agents: propose, interpret, explain — never authorize)
+        |
+Deterministic security cores (core/*.py — validate, enforce, record)
+        |
+Tool Permission Policy  ->  Security Governor  ->  tool adapters (adapters/*.py)
+        |
+Evidence Normalization -> Correlation -> Final Report
+        |
+Threat Intelligence  ->  Detection Engineering  ->  NOT_DEPLOYED rule candidates
+        |
+backend/ (Starlette, 127.0.0.1-only)  ->  in-memory Run Store / Event Bus (SSE)
+        |
+dashboard/live/  (real-time operational dashboard)
 ```
 
-## Investigation Entry Points
+The full component-by-component breakdown — including the explicit distinction between a *functional role*, a *Claude custom agent*, a *policy identity*, and a *deterministic core service* (ThreatTrace does not have "eight autonomous agents"; it has a small number of real Claude agents and a much larger set of deterministic Python modules) — lives in [docs/architecture.md](docs/architecture.md).
 
-ThreatTrace supports three ways into an investigation, each led by a different role:
+## Key Capabilities
 
-1. **Known threat or technique — Red Team led.** Starts from threat intelligence, a known actor's TTPs, an IOC, or a MITRE ATT&CK technique that needs validation. The Red Team workflow proposes a safe, catalog-verified Atomic Red Team test plan.
-2. **Unknown anomaly — Threat Hunter led.** Starts from suspicious behavior that has not triggered any alert. The Threat Hunter forms competing hypotheses and pivots through telemetry before deciding whether the finding warrants escalation.
-3. **Completed simulation — Blue Team led.** Starts from test results, telemetry, or alerts that already exist. The Blue Team workflow validates whether the activity was actually detected and identifies gaps.
+| Area | What it does |
+|---|---|
+| **Bug Bounty engine** | Runs a bounded, scope-checked assessment against an analyst-approved target using an LLM-proposed, deterministically-validated tool plan. |
+| **Threat Intelligence ingestion** | Pulls from CISA KEV, NVD/CVE, EPSS (all real, unauthenticated, bounded) and computes deterministic multi-source corroboration. |
+| **Detection Engineering** | Turns a Bug Bounty finding or a TI record into a telemetry-feasibility-gated, LLM-proposed, deterministically-validated draft detection rule (Sigma/SPL/KQL/YARA). |
+| **Security Governor** | A deterministic policy engine every stage-changing action passes through — role scope, mutation freeze, scope expansion, untrusted-content, and Decision Binding checks. |
+| **Real-time dashboard** | Live SSE-driven operational view of an in-progress run — pipeline stage, tool activity, Governor decisions, findings, rule candidates. |
+| **Purple Team investigation loop** | The original ThreatTrace loop — Threat Hunter, Red Team, Blue Team, SOC triage, Hayabusa EVTX analysis, Atomic Red Team planning-only mapping — all persisted in Supabase. |
+| **Tool Runtime Manager** | Deterministic readiness detection for every tool ThreatTrace can call, with explicit states (`ready`/`missing`/`requires_admin_install`/`container_available`/...) instead of a bare true/false. |
 
-All three entry points converge on the same Purple Team loop: ingest → analyze → map to ATT&CK → propose a simulation → get approval → review telemetry → judge detection → recommend improvements → retest.
+## Bug Bounty Workflow
 
-## Workflows
+```
+Analyst-supplied scope
+  -> LLM Planner proposes a tool plan
+  -> Tool Permission Policy (deterministic: is this tool/target/path actually permitted?)
+  -> Security Governor (deterministic: does this action cross a policy boundary?)
+  -> HTTP / Nmap / Nuclei / ZAP / Burp adapter boundary (only implemented, permitted tools ever run)
+  -> Evidence Normalization -> Correlation (multi-tool corroboration, deduplication)
+  -> Final Bug Bounty Report (status is always requires_human_review)
+```
 
-- **Threat Hunter** — investigates weak signals and unexplained activity that never triggered an alert. Builds both malicious and benign hypotheses side by side, recommends telemetry pivots (narrowing and broadening), and only hands a finding to the Purple Team when evidence actually supports attacker behavior or points to a detection gap. It never claims compromise without evidence.
-- **Red Team** — turns threat intelligence or a supported ATT&CK technique into an authorized adversary-emulation plan, mapped to real, verifiable Atomic Red Team tests. It proposes; it never executes.
-- **Blue Team** — validates whether logs, alerts, and detection rules actually caught an authorized simulation, classifying the result as detected, partially detected, not detected, or insufficient telemetry, and identifying the specific gap.
-- **Purple Team** — the coordinating agent. It routes investigations between the three entry points, keeps Red Team and Blue Team findings connected, and drives the loop through gap analysis, improvement recommendations, and retesting.
+The LLM never executes a tool directly — every tool call is re-validated by deterministic policy and Governor code before `adapters/*.py` is ever reached. See [docs/block15a-bug-bounty-agent.md](docs/block15a-bug-bounty-agent.md), [docs/block15g-intelligent-bug-bounty-planner.md](docs/block15g-intelligent-bug-bounty-planner.md), and [docs/block15g-cd-multitool-correlation.md](docs/block15g-cd-multitool-correlation.md).
 
-## SOC Analyst Triage and Competing Hypotheses
+## Threat Intelligence Workflow
 
-Before an investigation is escalated or closed, ThreatTrace supports an evidence-grounded SOC analyst triage pass (`/triage-case`) that reviews everything stored against an investigation and reasons about it the way a SOC analyst would: what's confirmed, what's assumed, and what's still missing. Throughout the loop — most explicitly in the Threat Hunter workflow — findings are evaluated against **competing hypotheses** (malicious and benign explanations held simultaneously) rather than a single assumed narrative, so that confidence scores reflect what the evidence actually supports.
+Real, bounded, unauthenticated pulls from CISA KEV, NVD/CVE, and EPSS are normalized into one common record contract, then deterministically corroborated (`unconfirmed` / `single_source` / `corroborated` / `authoritative_source` / `conflicting`) — the LLM never assigns a corroboration state itself. TAXII/MISP/OpenCTI/authenticated-Telegram sources are supported as a real code boundary but honestly report `not_configured` without any credential. See [docs/block15hi-threat-intel-detection-engineering.md](docs/block15hi-threat-intel-detection-engineering.md).
 
-## Supabase Case and Evidence Storage
+## Detection Engineering Workflow
 
-Investigation state lives in Supabase. The schema tracks:
+```
+Bug Bounty finding  OR  Threat Intel record
+  -> Detection Trigger (deterministic)
+  -> Telemetry Feasibility (deterministic gate: is there a basis to even attempt a rule?)
+  -> Detection Planner (LLM proposes objective + rule drafts, only in relevant formats)
+  -> deterministic plan validation -> rule construction -> deduplication -> structural syntax validation
+  -> Human Review required
+  -> deployment_state = NOT_DEPLOYED, always
+```
 
-- **investigations** — the root case record: title, entry point, status, and confidence.
-- **evidence** — individual telemetry items or observations, each tagged as supporting, contradicting, or neutral toward the working hypothesis.
-- **attack_mappings** — MITRE ATT&CK techniques tied to an investigation, marked provisional or supported.
-- **handoffs** — every transfer of an investigation between roles (Threat Hunter, Red Team, Blue Team, Purple Team).
-- **detection_results** — Blue Team validation outcomes and identified gaps.
-- **retests** — planned and completed retests of a detection improvement, gated on explicit approval.
+A `TELEMETRY_GAP` trigger structurally forces zero proposed rules — ThreatTrace never fabricates a rule when there is no basis to detect the underlying behavior. Structural syntax validation is bounded and stdlib-only; it is explicitly **not** detection-efficacy testing. See [docs/block15hi-threat-intel-detection-engineering.md](docs/block15hi-threat-intel-detection-engineering.md).
 
-All writes to Supabase (opening a case, adding evidence, updating status) require explicit user confirmation before they happen. Read paths (`/case-summary`, `/purple-loop`) are strictly read-only.
+## Security Governor
 
-## Hayabusa Offline EVTX Analysis
+Every Bug Bounty and Detection Engineering stage transition is evaluated by `core/security_governor.py` against sixteen fixed, closed-vocabulary event fields — role scope, gateway/identity decisions, mutation freeze, scope expansion, source-truth protection, untrusted-remote-content adoption, audit bypass, Decision Binding, and repeated-denial escalation. A Governor decision (`allow`/`warn`/`require_review`/`block`/`freeze`) is an **evaluation outcome over caller-supplied observable state** — never proof of intent, never an authenticated identity claim, and never itself an enforcement action (it recommends; the caller enforces). See [docs/block15c5-security-governor.md](docs/block15c5-security-governor.md).
 
-ThreatTrace integrates [Hayabusa](https://github.com/Yamato-Security/hayabusa) as a local MCP server (`mcp/hayabusa_server.py`) for offline Windows Event Log (EVTX) triage — timeline generation, log metrics, and event-ID metrics. It only ever reads `.evtx` files placed under `evidence/evtx/`, validates every input path against traversal and symlink tricks, and requires an explicit authorization phrase before running. It never reaches outside the local evidence directory and never runs automatically as part of any other workflow.
+## Real-Time Dashboard
 
-### Hayabusa Plan and Execute Boundary
+`backend/` (Starlette + uvicorn, `127.0.0.1:8420` only) orchestrates the same deterministic cores above and publishes a structured, sanitized event stream over SSE. `dashboard/live/index.html` is a self-contained (no build step) operational view — system status, pipeline progression, live event feed, tool activity, Governor decisions, findings, Threat Intelligence context, and detection rule candidates (always shown `NOT_DEPLOYED`). Run history is in-memory only — restarting the backend loses it; this is explicitly **not** an audit store. See [docs/block15jk-live-platform-dashboard.md](docs/block15jk-live-platform-dashboard.md).
 
-- `hayabusa_status`, `list_evtx_files`, and `plan_evtx_analysis` are read-only or planning tools — none of them execute Hayabusa.
-- `run_evtx_analysis` is the only Hayabusa tool that executes a process and writes a CSV result.
-- Execution currently requires the configured authorization phrase.
-- EVTX input paths must remain under `evidence/evtx/`.
-- CSV output paths must remain under `output/hayabusa/`.
-- Analysis types are selected from a fixed allowlist, not arbitrary input.
-- Existing output files cannot be overwritten.
-- The authorization phrase is only an initial safeguard — it is not the final human-approval workflow.
+## Purple Team Investigation Loop
 
-## MITRE ATT&CK Mapping
+ThreatTrace's original investigation loop remains fully in place alongside the newer Bug Bounty/Detection stack:
 
-Every supported finding — from Threat Hunter evidence, Red Team intelligence, or Blue Team telemetry — is mapped to MITRE ATT&CK technique IDs, stored with a rationale, and labeled provisional or supported depending on how strong the evidence is. Mappings are never invented; they are only ever tied to a technique the evidence actually justifies.
+- **Threat Hunter** — investigates weak signals via competing malicious/benign hypotheses; never claims compromise without evidence.
+- **Red Team** — turns threat intelligence or a supported ATT&CK technique into an authorized adversary-emulation plan mapped to real, verifiable [Atomic Red Team](https://github.com/redcanaryco/atomic-red-team) tests. It proposes; it never executes.
+- **Blue Team** — validates whether logs/alerts/detection rules actually caught an authorized simulation.
+- **Purple Team** — the coordinating agent that routes between the three entry points and drives gap analysis, improvement recommendations, and retesting.
+- **[Hayabusa](https://github.com/Yamato-Security/hayabusa)** — offline Windows Event Log (EVTX) triage via a local MCP server; reads only `evidence/evtx/`, requires an authorization phrase to execute, never reaches outside the project.
+- **Supabase** — the persistence layer for investigations, evidence, ATT&CK mappings, handoffs, detection results, and retests. All writes require explicit human confirmation; the read paths (`/case-summary`, `/purple-loop`) are strictly read-only.
 
-## Atomic Red Team Planning Only
-
-The `atomic-mapper` agent matches evidence-supported ATT&CK techniques against a locally available [Atomic Red Team](https://github.com/redcanaryco/atomic-red-team) catalog and reports verified test matches — name, GUID, supported OS, prerequisites, expected telemetry, and cleanup requirements — pulled only from files it actually read, never fabricated. **It never executes a test.** Execution always requires a separate, explicit, human-approved step outside of ThreatTrace's automated flow.
-
-## Human Approval and Safety Controls
-
-- Operates only in an explicitly authorized lab environment; never targets public or third-party systems; never performs destructive actions.
-- **Read-only investigation and planning** (evidence review, hypothesis-forming, ATT&CK mapping, Hayabusa/Atomic planning tools) may proceed without changing any system.
-- **Supabase database writes** (opening a case, adding evidence, updating status) require explicit human confirmation before they happen.
-- **Red Team or Atomic test execution** requires explicit human approval and is never triggered automatically.
-- **Detection rules** must not be modified or deployed automatically, under any circumstance.
-- **Other system-changing operations** (e.g. Hayabusa execution) require explicit human confirmation, not just a planning step.
-- Approval does not automatically mean execution — each remains a distinct, separately confirmed step.
-- Never exposes credentials, API keys, or other sensitive information.
-- Clearly separates confirmed evidence from assumptions throughout every workflow.
-
-The following controls are **planned but not yet implemented**: verified approval IDs, evidence hashes, action hashes, approval expiry, reviewer identity validation, and tamper-evident audit history. Today's authorization phrase (see Hayabusa Plan and Execute Boundary, above) is an initial safeguard, not a substitute for these.
+See [docs/demo-walkthrough.md](docs/demo-walkthrough.md) for the fictional **PurpleShadow** training scenario that exercises this loop end to end, and [docs/demo-runbook.md](docs/demo-runbook.md) for the current Bug Bounty/Detection/backend operator runbook.
 
 ## Approval-Gated Case Updates
 
@@ -150,6 +164,8 @@ Atomically apply the approved request:
 
 ## Available Slash Commands
 
+Investigation-loop commands (the platform's newer Bug Bounty/Detection/live-platform commands are listed in [Quickstart](#quickstart) and [docs/demo-runbook.md](docs/demo-runbook.md) instead of duplicated here):
+
 | Command | Purpose |
 |---|---|
 | `/red-team` | Convert threat intelligence into an authorized adversary-emulation plan |
@@ -167,31 +183,23 @@ Atomically apply the approved request:
 | `/ingest-ti` | Read-only, structured preview of ingested threat intelligence |
 | `/purple-loop` | Read-only router that recommends exactly one safe next command |
 
-## PurpleShadow: Fictional Training Demonstration
+## Supported Tools
 
-ThreatTrace ships a walkthrough built around **PurpleShadow**, an entirely fictional training scenario used to demonstrate the full investigation loop end to end without touching real intelligence or real systems. See [`docs/demo-walkthrough.md`](docs/demo-walkthrough.md) for the full narrative, including how it moves from evidence collection through Red Team routing to a planning-only Atomic Red Team mapping — with no test ever executed.
+| Tool | Purpose | Readiness states this checkpoint can report |
+|---|---|---|
+| `http_assessor` | Passive/safe-active HTTP assessment (pure Python) | always `ready` |
+| `nmap` | Network reconnaissance | `ready` / `requires_admin_install` (Windows) / `missing` |
+| `nuclei` | Template-based web vulnerability scanning | `ready` / `missing` |
+| `zap` | Active/passive DAST via a local Docker container | `ready` / `container_available` / `runtime_unavailable` |
+| `burp_dast` | DAST via an analyst-configured external Burp runtime | `ready` / `not_configured` |
+| `authenticated_testing` | Declared, not implemented | `not_implemented` |
+| `controlled_validation` | Declared, not implemented | `not_implemented` |
 
-## Current Limitations
+Run `python -m runtime.bootstrap check` for a live readiness report — see [Quickstart](#quickstart).
 
-- Investigation state, evidence, and confidence scoring depend entirely on what is manually ingested or queried — there is no live telemetry collection.
-- Hayabusa analysis is local and offline only; it does not integrate with a SIEM or EDR platform directly.
-- Atomic Red Team mapping is limited to whatever catalog content is locally available under `references/`.
-- There is no automated response, containment, or detection-rule deployment by design — every risky step is a human decision.
-- Confidence and severity scoring are qualitative (low/medium/high), not statistically derived.
-- **Detection Engineering** is currently guidance provided through the `detection-engineering` skill, not a complete, dedicated workflow command.
-- **Dedicated validation and retest orchestration** is not yet implemented as its own command.
+## Installation
 
-## Future Enterprise Improvements
-
-- Direct SIEM/EDR API integration for live telemetry pulls instead of manual evidence entry.
-- Automated (but still approval-gated) detection-rule staging and version control.
-- Multi-analyst collaboration and audit trail on Supabase-stored investigations.
-- Expanded Atomic Red Team catalog sync and richer OS/prerequisite filtering.
-- Role-based access control aligned to Red Team / Blue Team / SOC analyst boundaries.
-
-## Local Setup
-
-ThreatTrace requires Python 3.10 or later.
+ThreatTrace requires **Python 3.10+**. Developed and validated on **Windows**; see [Cross-Platform Status](#cross-platform-status).
 
 ### Windows PowerShell
 
@@ -205,17 +213,108 @@ py -m pip install -r requirements.txt
 python3 -m pip install -r requirements.txt
 ```
 
-`requirements.txt` contains exactly one dependency, `mcp>=1.28,<2`, which is required by `mcp/hayabusa_server.py`. That file's other imports — `os`, `subprocess`, `datetime`, and `pathlib` — are Python standard library and need no installation. `requirements.txt` does not install Hayabusa itself; the Hayabusa binary must still be placed manually (see below).
+`requirements.txt` declares `mcp>=1.28,<2` (used by `mcp/hayabusa_server.py` and by the `backend/` package's transitively-included `starlette`/`uvicorn`). No proprietary tool (Nmap, Nuclei, Burp) is installed by this step — see [Supported Tools](#supported-tools) and `python -m runtime.bootstrap check`.
 
-**Portability note:** Windows commonly uses the `py` launcher, while macOS and Linux commonly use `python3`. `.mcp.example.json`'s Hayabusa entry (`"command": "python"`) may need to be adjusted to whichever command actually resolves on your system — `py`, `python3`, or `python` — after you copy it to `.mcp.json`.
+Optional, tool-specific setup:
 
-1. Clone the repository and install the Python dependencies listed in `requirements.txt` (used by the Hayabusa MCP server, `mcp/hayabusa_server.py`).
-2. Place the Hayabusa binary and rule files under `tools/hayabusa/` (not committed — see `.gitignore`).
-3. Copy `.mcp.example.json` to `.mcp.json` and fill in your own Supabase project reference and access token. **Never commit `.mcp.json`.**
-4. Apply `supabase/schema.sql` to your own Supabase project manually (via the Supabase CLI or dashboard) — it is not applied automatically.
-5. Place any EVTX evidence under `evidence/evtx/` (git-ignored except for a placeholder).
-6. Start Claude Code in the project directory; the configured MCP servers and slash commands become available automatically.
+1. Place the Hayabusa binary and rule files under `tools/hayabusa/` (not committed — see `.gitignore`).
+2. Copy `.mcp.example.json` to `.mcp.json` and fill in your own Supabase project reference and access token, if you intend to use the Purple Team investigation loop. **Never commit `.mcp.json`.**
+3. Copy `.env.example` to `.env` and fill in real values only for the optional variables you actually need (e.g. a configured Burp runtime). **Never commit `.env`.**
+4. Apply `supabase/schema.sql` to your own Supabase project manually, if using the investigation loop.
+
+## Quickstart
+
+1. Clone the repository.
+2. Create a Python 3.10+ environment and `pip install -r requirements.txt`.
+3. Run the readiness check: `python -m runtime.bootstrap check`.
+4. Start demo dependencies: `python -m runtime.bootstrap start-demo --with-zap` (or `docker compose --profile zap up -d`).
+5. Start the backend: `python -m backend.app` (binds `127.0.0.1:8420` only).
+6. Open the live dashboard: `http://127.0.0.1:8420/`.
+7. Run the local Juice Shop demo from the dashboard, or `curl -X POST http://127.0.0.1:8420/api/runs/bug-bounty -d '{"target":"http://localhost:3000/"}'`.
+8. Inspect the live event feed, canonical findings, and (for a Detection run) the rule candidates — always `NOT_DEPLOYED`.
+9. Stop demo dependencies: `python -m runtime.bootstrap stop-demo`.
+
+Full step-by-step detail, including how to exercise the Governor and Detection Engineering paths explicitly, is in [docs/demo-runbook.md](docs/demo-runbook.md).
+
+## Juice Shop Demo
+
+ThreatTrace's live Bug Bounty/Detection validation runs against a local [OWASP Juice Shop](https://owasp.org/www-project-juice-shop/) container, bound to `127.0.0.1:3000` only — never a public target. This is the same fixed research target the [supported-category benchmark](#research-framing) below is measured against.
+
+## Research Framing
+
+ThreatTrace includes a bounded, reproducible benchmark against the local Juice Shop target — see `core/benchmark_evaluation.py`, `core/juice_shop_ground_truth.py`, and [docs/block15f-juice-shop-dashboard.md](docs/block15f-juice-shop-dashboard.md) for the reproduction path. Results are reported strictly as **"on this fixed, supported-category Juice Shop benchmark, precision/recall/F1 were X"** — never as "ThreatTrace is N% accurate," and never generalized beyond the vulnerability categories the benchmark actually covers.
+
+## Security Boundaries
+
+- Operates only in explicitly authorized lab environments — see [docs/authorized-use.md](docs/authorized-use.md).
+- No automatic attack execution, containment, or detection-rule deployment anywhere in the system.
+- Every risky action requires a separate, explicit human decision outside ThreatTrace's automated flow.
+- The `backend/` local platform binds `127.0.0.1` only, implements no authentication, and is explicitly not production-hardened.
+- Full detail: [SECURITY.md](SECURITY.md).
+
+## Known Limitations
+
+- Local research prototype — not a production security product.
+- No production authentication anywhere in the system.
+- `backend/` run/event history is in-memory only — lost on restart, never a tamper-evident audit trail.
+- Burp DAST requires an analyst-configured external runtime; ThreatTrace never bundles or auto-installs Burp.
+- `authenticated_testing` and `controlled_validation` are declared but not implemented.
+- No automatic SIEM deployment — every drafted detection rule is `NOT_DEPLOYED`.
+- The Detection/Bug Bounty LLM planner steps require either an interactive Claude Code session or a backend caller that already obtained a structured LLM proposal externally — `backend/` itself never calls a model.
+- Not every finding or TI record yields a useful detection rule — a `TELEMETRY_GAP` honestly proposes zero rules.
+- Structural rule-syntax validation is not detection-efficacy validation.
+- Live validation has been performed primarily on **Windows**, against the local Juice Shop container — see [Cross-Platform Status](#cross-platform-status).
+
+## Repository Structure
+
+```text
+ThreatTrace/
+├── .claude/
+│   ├── agents/          # Purple Team coordinator + Bug Bounty/Detection planner Claude agents
+│   ├── commands/        # Investigation, Bug Bounty, Detection, and platform-startup commands
+│   └── skills/          # Detection-engineering guidance skill
+├── adapters/             # Real I/O boundaries (HTTP/Nmap/Nuclei/ZAP/Burp/TI sources)
+├── backend/              # Local-only Starlette backend, Run Store, Event Bus, orchestrator
+├── core/                 # Pure, deterministic security/policy/report logic
+├── dashboard/
+│   ├── threattrace-dashboard.html   # Static presentation/research snapshot
+│   └── live/                        # Real-time operational dashboard
+├── docs/                 # Architecture, security, per-block design docs, runbooks
+├── evidence/evtx/         # Local raw EVTX evidence; excluded from Git
+├── mcp/                   # Hayabusa MCP server
+├── output/hayabusa/       # Generated analysis results; excluded from Git
+├── runtime/               # Tool Runtime Manager + bootstrap CLI
+├── supabase/               # Investigation database schema
+├── tests/                  # Focused + regression test suites
+├── docker-compose.yml       # Local demo dependencies (Juice Shop, optional ZAP)
+└── .env.example              # Placeholder-only environment configuration
+```
+
+## Testing
+
+ThreatTrace distinguishes three test scopes:
+
+```powershell
+# Focused: one new module's own suite
+py -m pytest tests/test_runtime_tool_runtime.py -q
+
+# Bounded regression: everything touched by a specific block
+py -m pytest tests/test_backend_*.py tests/test_runtime_*.py -q
+
+# Full regression: the entire suite
+py -m pytest tests/ -q
+```
+
+At the Block 15L-16 checkpoint, the full regression passed 7,391 tests with 1 intentional Windows-only skip (Hayabusa symlink permissions) — a **checkpoint result, not a current guarantee**. Always re-run the suite locally rather than trusting this or any other historical count.
+
+(macOS/Linux: replace `py` with `python3`.)
+
+Historical pass counts reported in per-block docs (e.g. *"at the Block 15J-K checkpoint, 7,300 tests passed"*) are **checkpoint results, not current guarantees** — always re-run the suite locally rather than trusting an old count.
+
+## Current Maturity
+
+**Research prototype / pre-release** (see [`VERSION`](VERSION) — `0.1.0-dev`; this does not yet follow strict release discipline and should not be treated as a stable API contract). ThreatTrace has been developed and live-validated on Windows against local, authorized targets (a local Juice Shop container, a local ZAP container). It has not undergone external security review, has no production authentication, and is not intended for deployment outside a local research/lab environment. See [docs/architecture.md](docs/architecture.md) for the full block-by-block build history and [SECURITY.md](SECURITY.md) for the current security model.
 
 ## Responsible-Use Notice
 
-ThreatTrace is intended strictly for authorized security testing, defensive research, and training in environments you own or are explicitly authorized to test. Do not point any part of this system — Red Team planning, Atomic Red Team mapping, or Hayabusa analysis — at systems you do not have explicit, documented authorization to test. All attack-simulation execution and detection-rule changes require a human decision outside of this system's automated flow.
+ThreatTrace is intended strictly for authorized security testing, defensive research, and training in environments you own or are explicitly authorized to test. See [docs/authorized-use.md](docs/authorized-use.md) for the full policy. Do not point any part of this system at a target you do not have explicit, documented authorization to test.

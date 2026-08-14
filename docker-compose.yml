@@ -1,0 +1,50 @@
+# ThreatTrace local demo dependencies (Block 15L-16).
+#
+# This file exists only to make the authorized local Bug Bounty demo
+# target reproducible. It deliberately does NOT containerize:
+#
+#   - the ThreatTrace backend (`python -m backend.app`) -- it is a
+#     plain local Python process with no complex runtime dependency;
+#     containerizing it would add operational complexity for no real
+#     reproducibility benefit ("do not containerize merely for
+#     appearance");
+#   - Nmap -- on Windows this project targets, Nmap/Npcap require a
+#     host-level, administrator-performed install regardless, so a
+#     container would not remove that requirement;
+#   - Nuclei -- kept a simple user-local binary; containerizing it would
+#     complicate the already-validated `adapters.bug_bounty_nuclei`
+#     process-execution boundary for no real gain.
+#
+# Every published port below binds to 127.0.0.1 ONLY. This is
+# deliberate and load-bearing -- see runtime/bootstrap.py's own
+# docstring for why a bare "host:container" port mapping (which Docker
+# would bind to every host interface) is never used anywhere in this
+# project's tooling.
+#
+# Usage:
+#   docker compose up -d                      # Juice Shop only (default)
+#   docker compose --profile zap up -d        # Juice Shop + ZAP
+#   docker compose down                       # stop and remove both
+#
+# `python -m runtime.bootstrap start-demo [--with-zap]` performs the
+# equivalent of the above via individual `docker run`/`docker start`
+# calls (so it works even without Compose installed) -- this file is an
+# alternative, not a replacement, for that CLI.
+
+services:
+  juice-shop:
+    image: bkimminich/juice-shop:latest
+    container_name: threattrace-juice-shop
+    ports:
+      - "127.0.0.1:3000:3000"
+    restart: unless-stopped
+
+  zap:
+    image: zaproxy/zap-stable:latest
+    container_name: threattrace-zap
+    command: ["zap.sh", "-daemon", "-host", "0.0.0.0", "-port", "8080", "-config", "api.disablekey=true"]
+    ports:
+      - "127.0.0.1:8080:8080"
+    restart: unless-stopped
+    profiles:
+      - zap
