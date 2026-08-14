@@ -27,12 +27,12 @@ from core.ai_asset_registry import (
 _EXPECTED_COUNTS_BY_TYPE = {
     "gateway_tool": 8,
     "identity_agent": 6,
-    "claude_subagent": 5,
-    "claude_command": 33,
+    "claude_subagent": 6,
+    "claude_command": 34,
     "claude_skill": 1,
     "mcp_server": 2,
 }
-_EXPECTED_TOTAL = 55
+_EXPECTED_TOTAL = 57
 
 _REPRESENTATIVE_ASSET_IDS = (
     "gateway_tool:load_risk_aware_approval_record",
@@ -674,7 +674,7 @@ def test_067_no_duplicate_asset_ids_in_full_inventory():
 
 def test_068_claude_command_registry_matches_actual_command_file_count():
     result = list_ai_assets(asset_type="claude_command")
-    assert result["count"] == 33
+    assert result["count"] == 34
 
 
 def test_069_existing_evaluation_lab_behavior_unchanged_by_registry_additions():
@@ -817,7 +817,7 @@ def test_085_no_duplicate_asset_ids_after_block_15c5_15d_addition():
 
 def test_086_claude_subagent_registry_matches_actual_agent_file_count():
     result = list_ai_assets(asset_type="claude_subagent")
-    assert result["count"] == 5
+    assert result["count"] == 6
 
 
 def test_087_existing_evaluation_lab_behavior_unchanged_by_block_15c5_15d_addition():
@@ -866,7 +866,7 @@ def test_092_no_duplicate_asset_ids_after_block_15e_addition():
 
 def test_093_claude_subagent_count_unchanged_by_block_15e():
     result = list_ai_assets(asset_type="claude_subagent")
-    assert result["count"] == 5
+    assert result["count"] == 6
 
 
 def test_094_existing_evaluation_lab_behavior_unchanged_by_block_15e_addition():
@@ -915,7 +915,7 @@ def test_099_no_duplicate_asset_ids_after_block_15f_b_addition():
 
 def test_100_claude_subagent_count_unchanged_by_block_15f_b():
     result = list_ai_assets(asset_type="claude_subagent")
-    assert result["count"] == 5
+    assert result["count"] == 6
 
 
 def test_101_existing_evaluation_lab_behavior_unchanged_by_block_15f_b_addition():
@@ -973,7 +973,7 @@ def test_107_no_duplicate_asset_ids_after_block_15g_addition():
 
 def test_108_claude_subagent_registry_matches_actual_agent_file_count():
     result = list_ai_assets(asset_type="claude_subagent")
-    assert result["count"] == 5
+    assert result["count"] == 6
 
 
 def test_109_existing_evaluation_lab_behavior_unchanged_by_block_15g_addition():
@@ -1019,7 +1019,7 @@ def test_113_no_gateway_tool_identity_agent_or_skill_added_for_block_15g_cd():
 
 def test_114_claude_subagent_count_unchanged_by_block_15g_cd():
     result = list_ai_assets(asset_type="claude_subagent")
-    assert result["count"] == 5
+    assert result["count"] == 6
 
 
 def test_115_no_duplicate_asset_ids_after_block_15g_cd_addition():
@@ -1029,6 +1029,83 @@ def test_115_no_duplicate_asset_ids_after_block_15g_cd_addition():
 
 
 def test_116_existing_evaluation_lab_behavior_unchanged_by_block_15g_cd():
+    result = evaluate_ai_security_case(
+        case_type="emergency_freeze_bypass", asset_id="identity_agent:coordinator_agent",
+    )
+    assert result["evaluation_outcome"] == "pass"
+
+
+# ---------------------------------------------------------------------------
+# Block 15H-I: detection-engineering-planner claude_subagent + detection-rule-factory
+# claude_command. Exactly one new agent, one new command -- functional
+# roles (threat_intelligence, blue_team) are not automatically Claude
+# agents, so nothing else is registered.
+# ---------------------------------------------------------------------------
+
+
+def test_117_detection_engineering_planner_claude_subagent_discoverable():
+    result = lookup_ai_asset(asset_id="claude_subagent:detection-engineering-planner")
+    assert result["found"] is True
+    assert result["asset_type"] == "claude_subagent"
+    assert result["declared_in"] == ".claude/agents/detection-engineering-planner.md"
+
+
+def test_118_detection_rule_factory_claude_command_discoverable():
+    result = lookup_ai_asset(asset_id="claude_command:detection-rule-factory")
+    assert result["found"] is True
+    assert result["asset_type"] == "claude_command"
+    assert result["declared_in"] == ".claude/commands/detection-rule-factory.md"
+
+
+def test_119_new_block_15h_i_assets_provenance_is_repository_declared_not_verified():
+    for asset_id in ("claude_subagent:detection-engineering-planner", "claude_command:detection-rule-factory"):
+        result = lookup_ai_asset(asset_id=asset_id)
+        assert result["provenance"]["tier"] == "repository_declared"
+        assert "verified" not in result["provenance"]["tier"]
+        assert "authenticated" not in result["provenance"]["tier"]
+
+
+def test_120_no_gateway_tool_identity_agent_or_extra_skill_added_for_block_15h_i():
+    # Functional roles (threat_intelligence, blue_team) never
+    # automatically become Claude agents -- confirming none were
+    # accidentally registered for this checkpoint's new TI/detection
+    # deterministic core modules.
+    assert lookup_ai_asset(asset_id="gateway_tool:validate_threat_intelligence_record")["found"] is False
+    assert lookup_ai_asset(asset_id="gateway_tool:compute_corroboration")["found"] is False
+    assert lookup_ai_asset(asset_id="gateway_tool:build_detection_rule")["found"] is False
+    assert lookup_ai_asset(asset_id="identity_agent:threat_intelligence_agent")["found"] is False
+    assert lookup_ai_asset(asset_id="identity_agent:detection_engineering_agent")["found"] is False
+    assert lookup_ai_asset(asset_id="claude_skill:detection-rule-factory")["found"] is False
+
+
+def test_121_does_not_collide_with_preexisting_detection_engineering_skill():
+    # A pre-existing claude_skill:detection-engineering already occupies
+    # that exact name -- Block 15H-I's new command is deliberately named
+    # detection-rule-factory instead, never detection-engineering.
+    skill = lookup_ai_asset(asset_id="claude_skill:detection-engineering")
+    command = lookup_ai_asset(asset_id="claude_command:detection-rule-factory")
+    assert skill["found"] is True
+    assert command["found"] is True
+    assert lookup_ai_asset(asset_id="claude_command:detection-engineering")["found"] is False
+
+
+def test_122_claude_subagent_count_is_six_after_block_15h_i():
+    result = list_ai_assets(asset_type="claude_subagent")
+    assert result["count"] == 6
+
+
+def test_123_claude_command_count_is_thirty_four_after_block_15h_i():
+    result = list_ai_assets(asset_type="claude_command")
+    assert result["count"] == 34
+
+
+def test_124_no_duplicate_asset_ids_after_block_15h_i_addition():
+    listing = list_ai_assets()
+    ids = [asset["asset_id"] for asset in listing["assets"]]
+    assert len(ids) == len(set(ids))
+
+
+def test_125_existing_evaluation_lab_behavior_unchanged_by_block_15h_i():
     result = evaluate_ai_security_case(
         case_type="emergency_freeze_bypass", asset_id="identity_agent:coordinator_agent",
     )
