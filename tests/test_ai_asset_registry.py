@@ -27,12 +27,12 @@ from core.ai_asset_registry import (
 _EXPECTED_COUNTS_BY_TYPE = {
     "gateway_tool": 8,
     "identity_agent": 6,
-    "claude_subagent": 4,
-    "claude_command": 31,
+    "claude_subagent": 5,
+    "claude_command": 32,
     "claude_skill": 1,
     "mcp_server": 2,
 }
-_EXPECTED_TOTAL = 52
+_EXPECTED_TOTAL = 54
 
 _REPRESENTATIVE_ASSET_IDS = (
     "gateway_tool:load_risk_aware_approval_record",
@@ -674,7 +674,7 @@ def test_067_no_duplicate_asset_ids_in_full_inventory():
 
 def test_068_claude_command_registry_matches_actual_command_file_count():
     result = list_ai_assets(asset_type="claude_command")
-    assert result["count"] == 31
+    assert result["count"] == 32
 
 
 def test_069_existing_evaluation_lab_behavior_unchanged_by_registry_additions():
@@ -817,7 +817,7 @@ def test_085_no_duplicate_asset_ids_after_block_15c5_15d_addition():
 
 def test_086_claude_subagent_registry_matches_actual_agent_file_count():
     result = list_ai_assets(asset_type="claude_subagent")
-    assert result["count"] == 4
+    assert result["count"] == 5
 
 
 def test_087_existing_evaluation_lab_behavior_unchanged_by_block_15c5_15d_addition():
@@ -866,7 +866,7 @@ def test_092_no_duplicate_asset_ids_after_block_15e_addition():
 
 def test_093_claude_subagent_count_unchanged_by_block_15e():
     result = list_ai_assets(asset_type="claude_subagent")
-    assert result["count"] == 4
+    assert result["count"] == 5
 
 
 def test_094_existing_evaluation_lab_behavior_unchanged_by_block_15e_addition():
@@ -915,10 +915,68 @@ def test_099_no_duplicate_asset_ids_after_block_15f_b_addition():
 
 def test_100_claude_subagent_count_unchanged_by_block_15f_b():
     result = list_ai_assets(asset_type="claude_subagent")
-    assert result["count"] == 4
+    assert result["count"] == 5
 
 
 def test_101_existing_evaluation_lab_behavior_unchanged_by_block_15f_b_addition():
+    result = evaluate_ai_security_case(
+        case_type="emergency_freeze_bypass", asset_id="identity_agent:coordinator_agent",
+    )
+    assert result["evaluation_outcome"] == "pass"
+
+
+# ---------------------------------------------------------------------------
+# Block 15G-A checkpoint: bug-bounty-planner subagent/command
+# ---------------------------------------------------------------------------
+
+
+def test_102_bug_bounty_planner_subagent_discoverable():
+    result = lookup_ai_asset(asset_id="claude_subagent:bug-bounty-planner")
+    assert result["found"] is True
+    assert result["asset_type"] == "claude_subagent"
+    assert result["declared_in"] == ".claude/agents/bug-bounty-planner.md"
+
+
+def test_103_bug_bounty_plan_command_discoverable():
+    result = lookup_ai_asset(asset_id="claude_command:bug-bounty-plan")
+    assert result["found"] is True
+    assert result["asset_type"] == "claude_command"
+    assert result["declared_in"] == ".claude/commands/bug-bounty-plan.md"
+
+
+def test_104_new_block_15g_assets_provenance_is_repository_declared_not_verified():
+    for asset_id in ("claude_subagent:bug-bounty-planner", "claude_command:bug-bounty-plan"):
+        result = lookup_ai_asset(asset_id=asset_id)
+        assert result["provenance"]["tier"] == "repository_declared"
+        assert "verified" not in result["provenance"]["tier"]
+        assert "authenticated" not in result["provenance"]["tier"]
+        assert "signature" not in str(result["provenance"]).lower()
+
+
+def test_105_no_gateway_tool_or_identity_agent_added_for_block_15g():
+    assert lookup_ai_asset(asset_id="gateway_tool:bug_bounty_planner")["found"] is False
+    assert lookup_ai_asset(asset_id="gateway_tool:validate_bug_bounty_plan")["found"] is False
+    assert lookup_ai_asset(asset_id="gateway_tool:evaluate_tool_permission")["found"] is False
+    assert lookup_ai_asset(asset_id="identity_agent:bug_bounty_planner_agent")["found"] is False
+
+
+def test_106_no_claude_skill_added_for_block_15g():
+    assert lookup_ai_asset(asset_id="claude_skill:bug-bounty-planner")["found"] is False
+    assert lookup_ai_asset(asset_id="claude_skill:bug-bounty-plan")["found"] is False
+
+
+def test_107_no_duplicate_asset_ids_after_block_15g_addition():
+    listing = list_ai_assets()
+    ids = [asset["asset_id"] for asset in listing["assets"]]
+    assert len(ids) == len(set(ids))
+
+
+def test_108_claude_subagent_registry_matches_actual_agent_file_count():
+    result = list_ai_assets(asset_type="claude_subagent")
+    assert result["count"] == 5
+
+
+def test_109_existing_evaluation_lab_behavior_unchanged_by_block_15g_addition():
     result = evaluate_ai_security_case(
         case_type="emergency_freeze_bypass", asset_id="identity_agent:coordinator_agent",
     )
