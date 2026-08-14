@@ -1,0 +1,244 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ThreatTrace — Block 15F-A / 15F-A.1 Controlled Benchmark</title>
+<style>
+:root {
+  --bg: #0b0f14;
+  --bg-panel: #11161d;
+  --bg-card: #161d27;
+  --border: #26313f;
+  --text: #e8eef4;
+  --text-dim: #9fb0c0;
+  --accent: #4dd6c0;
+  --good: #4fbf7a;
+  --bad: #e0665a;
+  --warn: #e0b04d;
+  --font: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+}
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; }
+body {
+  margin: 0; background: var(--bg); color: var(--text); font-family: var(--font);
+  line-height: 1.5;
+}
+header.hero {
+  padding: 2.5rem 1.5rem 1.5rem; border-bottom: 1px solid var(--border); background: var(--bg-panel);
+}
+.hero-inner { max-width: 1100px; margin: 0 auto; }
+.hero h1 { margin: 0; font-size: 2.25rem; letter-spacing: 0.02em; }
+.hero .subtitle { color: var(--accent); font-size: 1.1rem; margin: 0.25rem 0 0; font-weight: 600; }
+.hero .tagline { color: var(--text-dim); margin: 0.75rem 0 0; max-width: 70ch; }
+.hero .meta { margin-top: 1rem; color: var(--text-dim); font-size: 0.95rem; }
+.hero .meta strong { color: var(--text); }
+nav.dashboard-nav {
+  position: sticky; top: 0; z-index: 5; background: var(--bg-panel); border-bottom: 1px solid var(--border);
+  padding: 0.75rem 1.5rem;
+}
+nav.dashboard-nav .nav-inner { max-width: 1100px; margin: 0 auto; display: flex; gap: 1.5rem; flex-wrap: wrap; }
+nav.dashboard-nav a { color: var(--text-dim); text-decoration: none; font-weight: 600; font-size: 0.95rem; }
+nav.dashboard-nav a:hover, nav.dashboard-nav a:focus { color: var(--accent); }
+main { max-width: 1100px; margin: 0 auto; padding: 2rem 1.5rem 4rem; }
+section { margin-bottom: 3rem; }
+section h2 { font-size: 1.5rem; border-bottom: 1px solid var(--border); padding-bottom: 0.5rem; }
+section h3 { font-size: 1.15rem; color: var(--accent); margin-top: 2rem; }
+.kpi-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 1rem; margin: 1.5rem 0; }
+.kpi-card {
+  background: var(--bg-card); border: 1px solid var(--border); border-radius: 12px; padding: 1.25rem;
+}
+.kpi-label { margin: 0; color: var(--text-dim); font-size: 0.85rem; text-transform: uppercase; letter-spacing: 0.05em; }
+.kpi-value { margin: 0.35rem 0 0; font-size: 1.9rem; font-weight: 700; color: var(--text); }
+.kpi-detail { margin: 0.35rem 0 0; color: var(--text-dim); font-size: 0.85rem; }
+.callout {
+  background: var(--bg-card); border: 1px solid var(--accent); border-radius: 12px; padding: 1.5rem; margin: 1.5rem 0;
+}
+.callout h3 { margin-top: 0; }
+.callout .callout-quote { font-size: 1.05rem; }
+.callout .callout-footnote { color: var(--text-dim); font-size: 0.85rem; margin-top: 1rem; }
+.ba-metric { margin-bottom: 1.25rem; }
+.ba-label { font-weight: 600; margin-bottom: 0.4rem; }
+.ba-row { display: flex; align-items: center; gap: 0.75rem; margin-bottom: 0.35rem; }
+.ba-tag { width: 70px; color: var(--text-dim); font-size: 0.85rem; }
+.ba-track { flex: 1; background: var(--bg-panel); border: 1px solid var(--border); border-radius: 6px; height: 18px; overflow: hidden; }
+.ba-fill { height: 100%; }
+.ba-fill-baseline { background: var(--warn); }
+.ba-fill-refined { background: var(--good); }
+.ba-value { width: 60px; text-align: right; font-variant-numeric: tabular-nums; }
+.fp-callout { display: flex; align-items: center; gap: 1rem; margin: 1rem 0; }
+.fp-badge { font-size: 2rem; font-weight: 700; padding: 0.5rem 1rem; border-radius: 8px; border: 1px solid var(--border); }
+.fp-badge.baseline { color: var(--bad); }
+.fp-badge.refined { color: var(--good); }
+.fp-arrow { color: var(--text-dim); font-size: 1.5rem; }
+table.data-table { width: 100%; border-collapse: collapse; margin: 1rem 0; }
+table.data-table caption { text-align: left; color: var(--text-dim); margin-bottom: 0.5rem; }
+table.data-table th, table.data-table td {
+  border: 1px solid var(--border); padding: 0.5rem 0.75rem; text-align: left;
+}
+table.data-table thead th { background: var(--bg-panel); }
+.discovery-flow { display: flex; flex-direction: column; gap: 0.5rem; margin: 1.5rem 0; }
+.discovery-step { background: var(--bg-card); border: 1px solid var(--border); border-radius: 8px; padding: 1rem; }
+.discovery-step .step-title { font-weight: 700; color: var(--accent); margin: 0 0 0.25rem; }
+.discovery-arrow { text-align: center; color: var(--text-dim); }
+.workflow-flow { display: flex; flex-wrap: wrap; gap: 0.75rem; align-items: stretch; margin: 1.5rem 0; }
+.stage-box {
+  background: var(--bg-card); border: 1px solid var(--border); border-radius: 10px; padding: 1rem; flex: 1 1 150px;
+  min-width: 150px;
+}
+.stage-name { font-weight: 600; margin: 0 0 0.5rem; }
+.stage-badge { display: inline-block; padding: 0.15rem 0.6rem; border-radius: 999px; font-size: 0.8rem; font-weight: 700; }
+.stage-badge.stage-executed { background: rgba(79,191,122,0.18); color: var(--good); border: 1px solid var(--good); }
+.stage-badge.stage-not-evaluated { background: rgba(224,176,77,0.15); color: var(--warn); border: 1px solid var(--warn); }
+.stage-note { color: var(--text-dim); font-size: 0.85rem; margin: 0.5rem 0 0; }
+.workflow-disclaimer { color: var(--warn); font-weight: 600; margin-top: 1rem; }
+.role-terms { color: var(--text-dim); }
+.capability-columns { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 1.5rem; }
+.capability-columns h4 { margin-bottom: 0.5rem; }
+.capability-columns ul { margin: 0; padding-left: 1.25rem; }
+.unsupported-note { color: var(--warn); font-weight: 600; margin-top: 1rem; }
+.limitations-list { padding-left: 1.25rem; }
+.limitations-list li { margin-bottom: 0.4rem; }
+.research-unavailable p { color: var(--warn); font-weight: 600; }
+.research-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 1rem; margin: 1.5rem 0; }
+.research-item { background: var(--bg-card); border: 1px solid var(--border); border-radius: 10px; padding: 1rem; }
+.research-item h4 { margin: 0 0 0.5rem; color: var(--accent); font-size: 1rem; }
+.research-item p { margin: 0.25rem 0; color: var(--text-dim); font-size: 0.9rem; }
+footer.site-footer {
+  border-top: 1px solid var(--border); padding: 2rem 1.5rem; color: var(--text-dim); font-size: 0.85rem;
+}
+footer.site-footer .footer-inner { max-width: 1100px; margin: 0 auto; }
+@media (max-width: 640px) {
+  .hero h1 { font-size: 1.6rem; }
+  .ba-tag { width: 56px; }
+}
+</style>
+</head>
+<body>
+<header class="hero">
+  <div class="hero-inner">
+    <h1>ThreatTrace</h1>
+    <p class="subtitle">Evidence-Preserving Security Validation</p>
+    <p class="tagline">Human-governed, evidence-preserving security validation platform connecting bounded
+      vulnerability discovery, organization-aware prioritization, governed security handoff, policy supervision,
+      validated security experience reuse, and deterministic research evaluation.</p>
+    <p class="meta">Controlled Evaluation — Target: <strong>OWASP Juice Shop</strong>
+      (http://localhost:3000) · Image digest: <strong>sha256:73c53fbf442e8337b3ea3d98c7e8550308854701ebdfce4cc39768f36b75430e</strong>
+      · Run: <strong>Block 15F-A / 15F-A.1 Controlled Benchmark</strong></p>
+  </div>
+</header>
+<nav class="dashboard-nav" aria-label="Dashboard sections">
+  <div class="nav-inner">
+    <a href="#executive">Executive</a>
+    <a href="#research">Research</a>
+    <a href="#architecture">Architecture</a>
+    <a href="#limitations">Limitations</a>
+  </div>
+</nav>
+<main>
+
+<section id="executive" aria-labelledby="executive-heading">
+  <h2 id="executive-heading">Executive View</h2>
+
+  <div class="kpi-grid"><div class="kpi-card"><p class="kpi-label">Baseline Precision</p><p class="kpi-value">83.3%</p></div><div class="kpi-card"><p class="kpi-label">Refined Precision</p><p class="kpi-value">100%</p></div><div class="kpi-card"><p class="kpi-label">Recall</p><p class="kpi-value">100%</p><p class="kpi-detail">Unchanged from baseline to refined</p></div><div class="kpi-card"><p class="kpi-label">Baseline F1</p><p class="kpi-value">90.9%</p></div><div class="kpi-card"><p class="kpi-label">Refined F1</p><p class="kpi-value">100%</p></div><div class="kpi-card"><p class="kpi-label">False Positives</p><p class="kpi-value">1 → 0</p><p class="kpi-detail">Delta: -1</p></div><div class="kpi-card"><p class="kpi-label">Supported Benchmark Cases</p><p class="kpi-value">9</p></div></div>
+
+  <div class="callout">
+    <h3>Controlled Result</h3>
+    <p class="callout-quote">On this fixed supported OWASP Juice Shop benchmark, a metadata evidence-quality
+      refinement reduced false positives from 1 to
+      0 while supported-case recall remained
+      100%.</p>
+    <p>Baseline precision: <strong>83.3%</strong> ·
+      Refined precision: <strong>100%</strong></p>
+    <p class="callout-footnote">This is not an overall vulnerability-detection accuracy claim.</p>
+  </div>
+
+  <h3>Baseline → Refined</h3>
+  <p>Measured on the same fixed supported OWASP Juice Shop benchmark and same container image.</p>
+  <div class="ba-metric"><p class="ba-label">Precision</p><div class="ba-row"><span class="ba-tag">Baseline</span><div class="ba-track" role="img" aria-label="Precision baseline 83.3%"><div class="ba-fill ba-fill-baseline" style="width:83.33%"></div></div><span class="ba-value">83.3%</span></div><div class="ba-row"><span class="ba-tag">Refined</span><div class="ba-track" role="img" aria-label="Precision refined 100%"><div class="ba-fill ba-fill-refined" style="width:100.00%"></div></div><span class="ba-value">100%</span></div></div><div class="ba-metric"><p class="ba-label">Recall</p><div class="ba-row"><span class="ba-tag">Baseline</span><div class="ba-track" role="img" aria-label="Recall baseline 100%"><div class="ba-fill ba-fill-baseline" style="width:100.00%"></div></div><span class="ba-value">100%</span></div><div class="ba-row"><span class="ba-tag">Refined</span><div class="ba-track" role="img" aria-label="Recall refined 100%"><div class="ba-fill ba-fill-refined" style="width:100.00%"></div></div><span class="ba-value">100%</span></div></div><div class="ba-metric"><p class="ba-label">F1</p><div class="ba-row"><span class="ba-tag">Baseline</span><div class="ba-track" role="img" aria-label="F1 baseline 90.9%"><div class="ba-fill ba-fill-baseline" style="width:90.91%"></div></div><span class="ba-value">90.9%</span></div><div class="ba-row"><span class="ba-tag">Refined</span><div class="ba-track" role="img" aria-label="F1 refined 100%"><div class="ba-fill ba-fill-refined" style="width:100.00%"></div></div><span class="ba-value">100%</span></div></div>
+  <div class="fp-callout" role="img" aria-label="False positives reduced from 1 to 0">
+    <span class="fp-badge baseline">1 FP</span>
+    <span class="fp-arrow" aria-hidden="true">→</span>
+    <span class="fp-badge refined">0 FP</span>
+  </div>
+
+  <h3>Supported Benchmark Detection Result</h3>
+  <table class="data-table"><caption>Supported Benchmark Detection Result (never described as overall application accuracy)</caption><thead><tr><th scope="col">Run</th><th scope="col">TP</th><th scope="col">FP</th><th scope="col">FN</th><th scope="col">TN</th><th scope="col">Supported cases</th></tr></thead><tbody><tr><th scope="row">Baseline</th><td>5</td><td>1</td><td>0</td><td>3</td><td>9</td></tr><tr><th scope="row">Refined</th><td>5</td><td>0</td><td>0</td><td>4</td><td>9</td></tr></tbody></table>
+
+  <h3>Defect Discovery Story</h3>
+  <div class="discovery-flow">
+    <div class="discovery-step"><p class="step-title">Baseline observation</p><p>/sitemap.xml — HTTP 200</p></div>
+    <div class="discovery-arrow" aria-hidden="true">↓</div>
+    <div class="discovery-step"><p class="step-title">Independent validation</p>
+      <p>Content-Type: text/html — generic Angular SPA fallback</p></div>
+    <div class="discovery-arrow" aria-hidden="true">↓</div>
+    <div class="discovery-step"><p class="step-title">Detector weakness</p><p>Status-only metadata qualification</p></div>
+    <div class="discovery-arrow" aria-hidden="true">↓</div>
+    <div class="discovery-step"><p class="step-title">Refinement</p><p>Resource-aware metadata evidence qualification</p></div>
+    <div class="discovery-arrow" aria-hidden="true">↓</div>
+    <div class="discovery-step"><p class="step-title">Re-evaluation</p>
+      <p>FP 1 → 0 · Recall unchanged</p></div>
+  </div>
+</section>
+
+<section id="research" aria-labelledby="research-heading">
+  <h2 id="research-heading">Research View</h2>
+
+  <h3>A. Benchmark Before / After</h3>
+  <table class="data-table"><caption>Supported Benchmark Detection Result (never described as overall application accuracy)</caption><thead><tr><th scope="col">Run</th><th scope="col">TP</th><th scope="col">FP</th><th scope="col">FN</th><th scope="col">TN</th><th scope="col">Supported cases</th></tr></thead><tbody><tr><th scope="row">Baseline</th><td>5</td><td>1</td><td>0</td><td>3</td><td>9</td></tr><tr><th scope="row">Refined</th><td>5</td><td>0</td><td>0</td><td>4</td><td>9</td></tr></tbody></table>
+
+  <h3>B. Supported Ground-Truth Coverage</h3>
+  <p>Baseline supported cases: 9 ·
+     Refined supported cases: 9</p>
+
+  <h3>C. Precision / Recall / F1</h3>
+  <div class="ba-metric"><p class="ba-label">Precision</p><div class="ba-row"><span class="ba-tag">Baseline</span><div class="ba-track" role="img" aria-label="Precision baseline 83.3%"><div class="ba-fill ba-fill-baseline" style="width:83.33%"></div></div><span class="ba-value">83.3%</span></div><div class="ba-row"><span class="ba-tag">Refined</span><div class="ba-track" role="img" aria-label="Precision refined 100%"><div class="ba-fill ba-fill-refined" style="width:100.00%"></div></div><span class="ba-value">100%</span></div></div><div class="ba-metric"><p class="ba-label">Recall</p><div class="ba-row"><span class="ba-tag">Baseline</span><div class="ba-track" role="img" aria-label="Recall baseline 100%"><div class="ba-fill ba-fill-baseline" style="width:100.00%"></div></div><span class="ba-value">100%</span></div><div class="ba-row"><span class="ba-tag">Refined</span><div class="ba-track" role="img" aria-label="Recall refined 100%"><div class="ba-fill ba-fill-refined" style="width:100.00%"></div></div><span class="ba-value">100%</span></div></div><div class="ba-metric"><p class="ba-label">F1</p><div class="ba-row"><span class="ba-tag">Baseline</span><div class="ba-track" role="img" aria-label="F1 baseline 90.9%"><div class="ba-fill ba-fill-baseline" style="width:90.91%"></div></div><span class="ba-value">90.9%</span></div><div class="ba-row"><span class="ba-tag">Refined</span><div class="ba-track" role="img" aria-label="F1 refined 100%"><div class="ba-fill ba-fill-refined" style="width:100.00%"></div></div><span class="ba-value">100%</span></div></div>
+
+  <h3>D. Evidence-Quality Refinement</h3>
+  <p>A resource-aware metadata evidence-quality check (Content-Type plus a bounded, recognized body signature)
+    replaced a status-code-only qualification for the three fixed metadata paths. No new HTTP request, path,
+    or vulnerability class was introduced.</p>
+
+  <h3>E. Research Evaluation Metrics</h3>
+  <div class="research-unavailable"><p>Not evaluated in this Juice Shop benchmark run.</p><p>Governor metrics were not exercised in this benchmark run.</p><p>Validated Security Experience Memory was not evaluated in this benchmark run.</p><p>MTVD unavailable — no qualifying caller-supplied duration.</p></div>
+
+  <h3>F. Limitations</h3>
+  <p>See the <a href="#limitations">Limitations</a> section below.</p>
+</section>
+
+<section id="architecture" aria-labelledby="architecture-heading">
+  <h2 id="architecture-heading">Architecture</h2>
+  <p class="role-terms">ThreatTrace is composed of functional security roles, deterministic core services,
+    Claude custom agents, and policy identities — never described as eight autonomous agents.</p>
+  <div class="workflow-flow"><div class="stage-box" aria-label="Bug Bounty: Executed"><p class="stage-name">Bug Bounty</p><span class="stage-badge stage-executed">Executed</span><p class="stage-note">Real bounded GET/HEAD/OPTIONS assessment against the local Juice Shop container (safe_active profile).</p></div><div class="stage-box" aria-label="Context Prioritization: Not evaluated"><p class="stage-name">Context Prioritization</p><span class="stage-badge stage-not-evaluated">Not evaluated</span><p class="stage-note">No organization context was supplied for this benchmark run.</p></div><div class="stage-box" aria-label="Security Handoff: Not evaluated"><p class="stage-name">Security Handoff</p><span class="stage-badge stage-not-evaluated">Not evaluated</span><p class="stage-note">No security handoff case was created for this benchmark run.</p></div><div class="stage-box" aria-label="Security Governor: Not evaluated"><p class="stage-name">Security Governor</p><span class="stage-badge stage-not-evaluated">Not evaluated</span><p class="stage-note">No Governor event was evaluated for this benchmark run.</p></div><div class="stage-box" aria-label="Validated Security Experience Memory: Not evaluated"><p class="stage-name">Validated Security Experience Memory</p><span class="stage-badge stage-not-evaluated">Not evaluated</span><p class="stage-note">No memory entry was created for this benchmark run.</p></div><div class="stage-box" aria-label="Research Evaluation: Not evaluated"><p class="stage-name">Research Evaluation</p><span class="stage-badge stage-not-evaluated">Not evaluated</span><p class="stage-note">No Block 15E research-evaluation experiment was run for this benchmark.</p></div></div>
+  <p class="workflow-disclaimer">Platform workflow — not all stages were exercised in this benchmark.</p>
+
+  <h3>Supported in This Benchmark</h3>
+  <div class="capability-columns">
+    <div>
+      <h4>Supported</h4>
+      <ul><li>Security-header presence</li><li>Fixed metadata resource observation</li><li>CORS observation</li><li>Advertised HTTP methods</li><li>Inert input reflection</li></ul>
+    </div>
+    <div>
+      <h4>Not Evaluated</h4>
+      <ul><li>SQL injection</li><li>Executable XSS</li><li>IDOR / access control</li><li>SSRF</li><li>Command injection</li><li>Authentication weaknesses</li><li>Business-logic challenges</li></ul>
+    </div>
+  </div>
+  <p class="unsupported-note">Not-evaluated categories are excluded from recall — they are never counted as
+    false negatives.</p>
+</section>
+
+<section id="limitations" aria-labelledby="limitations-heading">
+  <h2 id="limitations-heading">Research Limitations</h2>
+  <ul class="limitations-list"><li>Supported-capability benchmark only -- scored against ThreatTrace&#x27;s implemented detector capability, not the full Juice Shop challenge set.</li><li>One local application: OWASP Juice Shop, evaluated only at http://localhost:3000/.</li><li>One fixed Juice Shop image digest -- results are specific to this exact image and are not claimed to generalize to other versions or targets.</li><li>Unsupported Juice Shop vulnerability categories are excluded from recall, never counted as false negatives.</li><li>No SQL injection testing was performed.</li><li>No executable XSS testing was performed.</li><li>No IDOR / access-control testing was performed.</li><li>No authenticated testing was performed.</li><li>No statistical-significance claim is made -- this is a single controlled before/after observation, not a significance test.</li><li>No generalization claim is made beyond this fixed, controlled comparison.</li><li>Evidence references establish content correlation only -- never authenticity proof.</li></ul>
+</section>
+
+</main>
+<footer class="site-footer">
+  <div class="footer-inner">
+    <p>ThreatTrace — Human-Governed Security Validation Platform. Sanitized benchmark facts only;
+      no cookies, credentials, tokens, or raw response bodies are included in this document.</p>
+  </div>
+</footer>
+</body>
+</html>
