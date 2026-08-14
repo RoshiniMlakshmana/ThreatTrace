@@ -188,7 +188,7 @@ _IDENTITY_AGENT_NAMES: tuple[tuple[str, bool], ...] = (
     ("bug_bounty_agent", True),
 )
 
-_CLAUDE_SUBAGENT_NAMES: tuple[str, ...] = ("purple-team", "atomic-mapper", "bug-bounty")
+_CLAUDE_SUBAGENT_NAMES: tuple[str, ...] = ("purple-team", "atomic-mapper", "bug-bounty", "security-governor")
 
 _CLAUDE_COMMAND_NAMES: tuple[str, ...] = (
     "red-team",
@@ -218,6 +218,8 @@ _CLAUDE_COMMAND_NAMES: tuple[str, ...] = (
     "bug-bounty",
     "prioritize-finding",
     "security-handoff",
+    "security-governor",
+    "security-memory",
 )
 
 _CLAUDE_SKILL_NAMES: tuple[str, ...] = ("detection-engineering",)
