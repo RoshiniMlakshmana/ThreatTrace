@@ -144,15 +144,15 @@ def test_004_lookup_key_order_independence():
 # ---------------------------------------------------------------------------
 
 
-def test_005_list_all_assets_count_forty_six():
+def test_005_list_all_assets_count_forty_seven():
     exit_code, stdout, stderr = _run(json.dumps(_list_envelope()))
 
     assert exit_code == 0
     assert stderr == ""
     result = json.loads(stdout)
     assert set(result) == _LIST_RESULT_FIELDS
-    assert result["count"] == 46
-    assert len(result["assets"]) == 46
+    assert result["count"] == 47
+    assert len(result["assets"]) == 47
 
 
 def test_006_list_filter_each_asset_type():
@@ -160,7 +160,7 @@ def test_006_list_filter_each_asset_type():
         "gateway_tool": 8,
         "identity_agent": 6,
         "claude_subagent": 3,
-        "claude_command": 26,
+        "claude_command": 27,
         "claude_skill": 1,
         "mcp_server": 2,
     }
@@ -176,7 +176,7 @@ def test_007_list_asset_type_null_returns_everything():
     exit_code, stdout, _ = _run(json.dumps(_list_envelope(asset_type=None)))
     assert exit_code == 0
     result = json.loads(stdout)
-    assert result["count"] == 46
+    assert result["count"] == 47
     assert result["asset_type"] is None
 
 

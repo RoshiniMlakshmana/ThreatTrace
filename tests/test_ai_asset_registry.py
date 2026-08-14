@@ -28,11 +28,11 @@ _EXPECTED_COUNTS_BY_TYPE = {
     "gateway_tool": 8,
     "identity_agent": 6,
     "claude_subagent": 3,
-    "claude_command": 26,
+    "claude_command": 27,
     "claude_skill": 1,
     "mcp_server": 2,
 }
-_EXPECTED_TOTAL = 46
+_EXPECTED_TOTAL = 47
 
 _REPRESENTATIVE_ASSET_IDS = (
     "gateway_tool:load_risk_aware_approval_record",
@@ -49,7 +49,7 @@ _REPRESENTATIVE_ASSET_IDS = (
 # ---------------------------------------------------------------------------
 
 
-def test_001_total_inventory_count_is_forty_six():
+def test_001_total_inventory_count_is_forty_seven():
     result = list_ai_assets()
     assert result["count"] == _EXPECTED_TOTAL
     assert len(result["assets"]) == _EXPECTED_TOTAL
@@ -674,7 +674,7 @@ def test_067_no_duplicate_asset_ids_in_full_inventory():
 
 def test_068_claude_command_registry_matches_actual_command_file_count():
     result = list_ai_assets(asset_type="claude_command")
-    assert result["count"] == 26
+    assert result["count"] == 27
 
 
 def test_069_existing_evaluation_lab_behavior_unchanged_by_registry_additions():
@@ -715,3 +715,44 @@ def test_073_no_duplicate_asset_ids_after_block_15b_addition():
     listing = list_ai_assets()
     ids = [asset["asset_id"] for asset in listing["assets"]]
     assert len(ids) == len(set(ids))
+
+
+# ---------------------------------------------------------------------------
+# Block 15C checkpoint B: security-handoff command asset
+# ---------------------------------------------------------------------------
+
+
+def test_074_security_handoff_command_discoverable():
+    result = lookup_ai_asset(asset_id="claude_command:security-handoff")
+    assert result["found"] is True
+    assert result["asset_type"] == "claude_command"
+    assert result["declared_in"] == ".claude/commands/security-handoff.md"
+
+
+def test_075_security_handoff_provenance_is_repository_declared_not_verified():
+    result = lookup_ai_asset(asset_id="claude_command:security-handoff")
+    assert result["provenance"]["tier"] == "repository_declared"
+    assert "verified" not in result["provenance"]["tier"]
+    assert "authenticated" not in result["provenance"]["tier"]
+    assert "signature" not in str(result["provenance"]).lower()
+
+
+def test_076_no_gateway_tool_or_identity_agent_added_for_security_handoff():
+    assert lookup_ai_asset(asset_id="gateway_tool:security_handoff")["found"] is False
+    assert lookup_ai_asset(asset_id="gateway_tool:create_security_handoff_case")["found"] is False
+    assert lookup_ai_asset(asset_id="identity_agent:security_handoff_agent")["found"] is False
+    assert lookup_ai_asset(asset_id="claude_subagent:security-handoff")["found"] is False
+    assert lookup_ai_asset(asset_id="claude_skill:security-handoff")["found"] is False
+
+
+def test_077_no_duplicate_asset_ids_after_block_15c_addition():
+    listing = list_ai_assets()
+    ids = [asset["asset_id"] for asset in listing["assets"]]
+    assert len(ids) == len(set(ids))
+
+
+def test_078_existing_evaluation_lab_behavior_unchanged_by_block_15c_addition():
+    result = evaluate_ai_security_case(
+        case_type="emergency_freeze_bypass", asset_id="identity_agent:coordinator_agent",
+    )
+    assert result["evaluation_outcome"] == "pass"
