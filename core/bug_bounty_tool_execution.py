@@ -1,4 +1,4 @@
-"""Bug Bounty tool execution boundary (Block 15G-B).
+"""Bug Bounty tool execution boundary (Block 15G-B, extended in Block 15G-CD).
 
 This is the **only** place in the entire ThreatTrace codebase where a
 Bug Bounty tool_request can ever result in a real external process being
@@ -47,15 +47,24 @@ result's `execution_allowed` is `True` and its `decision` is not one of
 
 ## Closed adapter registry -- never a caller-supplied binary name
 
-`_ADAPTER_REGISTRY` is a hardcoded, two-entry mapping from `tool_id` to
+`_ADAPTER_REGISTRY` is a hardcoded, four-entry mapping from `tool_id` to
 one specific adapter callable (`adapters.bug_bounty_nmap.run_nmap_scan`,
-`adapters.bug_bounty_nuclei.run_nuclei_scan`). There is no code path by
-which a `tool_id` string chooses an arbitrary binary -- the mapping is a
-fixed Python literal, never constructed from caller input.
-`http_assessor` is deliberately not registered here: its own existing
-orchestration path (`core.bug_bounty_assessment` +
-`adapters.bug_bounty_http`) is untouched by this checkpoint, and nothing
-about it requires re-routing through this newer execution boundary.
+`adapters.bug_bounty_nuclei.run_nuclei_scan`,
+`adapters.bug_bounty_zap.run_zap_scan`,
+`adapters.bug_bounty_burp.run_burp_scan` -- Block 15G-CD added the last
+two). There is no code path by which a `tool_id` string chooses an
+arbitrary binary -- the mapping is a fixed Python literal, never
+constructed from caller input. `http_assessor` is deliberately not
+registered here: its own existing orchestration path
+(`core.bug_bounty_assessment` + `adapters.bug_bounty_http`) is untouched
+by this checkpoint, and nothing about it requires re-routing through
+this newer execution boundary. `adapters.bug_bounty_burp.
+import_burp_result` (the sanitized-ingestion path for an already-
+produced external Burp result) is also deliberately not registered here
+-- it takes a `raw_result` parameter with no analogue in the
+`tool_request` contract, so it is never reachable through
+`execute_bug_bounty_tool`; a caller with an externally-produced Burp
+report calls it directly.
 
 ## No raw command surface, anywhere in this module
 
@@ -86,8 +95,10 @@ from collections.abc import Mapping
 from types import MappingProxyType
 from typing import Any
 
+from adapters.bug_bounty_burp import BugBountyBurpAdapterError, run_burp_scan
 from adapters.bug_bounty_nmap import BugBountyNmapAdapterError, run_nmap_scan
 from adapters.bug_bounty_nuclei import BugBountyNucleiAdapterError, run_nuclei_scan
+from adapters.bug_bounty_zap import BugBountyZapAdapterError, run_zap_scan
 from core.bug_bounty_tool_policy import BugBountyToolPolicyError, evaluate_tool_permission
 
 TOOL_EXECUTION_VERSION = "1"
@@ -181,12 +192,32 @@ def _run_nuclei_adapter(*, tool_request: Mapping[str, Any], execution_config: Ma
     )
 
 
+def _run_zap_adapter(*, tool_request: Mapping[str, Any], execution_config: Mapping[str, Any]) -> dict[str, Any]:
+    return run_zap_scan(
+        target=tool_request["target"],
+        request_id=tool_request["request_id"],
+        execution_config=execution_config,
+    )
+
+
+def _run_burp_adapter(*, tool_request: Mapping[str, Any], execution_config: Mapping[str, Any]) -> dict[str, Any]:
+    return run_burp_scan(
+        target=tool_request["target"],
+        request_id=tool_request["request_id"],
+        execution_config=execution_config,
+    )
+
+
 _ADAPTER_REGISTRY: Mapping[str, Any] = MappingProxyType({
     "nmap": _run_nmap_adapter,
     "nuclei": _run_nuclei_adapter,
+    "zap": _run_zap_adapter,
+    "burp_dast": _run_burp_adapter,
 })
 
-_ADAPTER_ERRORS = (BugBountyNmapAdapterError, BugBountyNucleiAdapterError)
+_ADAPTER_ERRORS = (
+    BugBountyNmapAdapterError, BugBountyNucleiAdapterError, BugBountyZapAdapterError, BugBountyBurpAdapterError,
+)
 
 
 def _blocked_result(

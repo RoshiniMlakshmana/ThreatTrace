@@ -215,13 +215,18 @@ class TestPolicyReEvaluation:
         assert spy["called"] is False
 
     def test_012_adapter_unavailable_tool_blocks_and_no_subprocess(self, monkeypatch):
+        # authenticated_testing has no adapter yet (Block 15G-CD
+        # implemented nmap/nuclei/zap/burp_dast only).
         import core.bug_bounty_tool_execution as execution_module
         spy = {"called": False}
         monkeypatch.setattr(execution_module, "run_nmap_scan", lambda **kw: spy.update(called=True))
         monkeypatch.setattr(execution_module, "run_nuclei_scan", lambda **kw: spy.update(called=True))
 
-        permissions = _permissions(testing_profile="safe_dast", allowed_tools=["http_assessor", "zap"])
-        request = _tool_request(tool_id="zap", testing_mode="safe_dast", ports=[])
+        permissions = _permissions(
+            testing_profile="authenticated", allowed_tools=["http_assessor", "authenticated_testing"],
+            authenticated_testing_allowed=True,
+        )
+        request = _tool_request(tool_id="authenticated_testing", testing_mode="authenticated", ports=[])
         result = execute_bug_bounty_tool(
             permissions=permissions, tool_request=request, governor_result=_governor_result(),
             execution_config=_execution_config(),
@@ -294,9 +299,9 @@ class TestGovernorGate:
 
 
 class TestClosedAdapterRegistry:
-    def test_017_registry_contains_only_nmap_and_nuclei(self):
+    def test_017_registry_contains_only_nmap_nuclei_zap_burp_dast(self):
         import core.bug_bounty_tool_execution as execution_module
-        assert set(execution_module._ADAPTER_REGISTRY.keys()) == {"nmap", "nuclei"}
+        assert set(execution_module._ADAPTER_REGISTRY.keys()) == {"nmap", "nuclei", "zap", "burp_dast"}
 
     def test_018_http_assessor_not_registered_reports_no_adapter_registered(self, monkeypatch):
         import core.bug_bounty_tool_execution as execution_module
@@ -495,6 +500,86 @@ class TestRealGovernorIntegration:
 
         result = execute_bug_bounty_tool(
             permissions=_permissions(), tool_request=_tool_request(), governor_result=real_governor_result,
+            execution_config=_execution_config(),
+        )
+        assert result["execution_permitted"] is False
+        assert result["execution_blocked_reason"] == "GOVERNOR_DENIED"
+        assert spy["called"] is False
+
+
+# ---------------------------------------------------------------------------
+# Block 15G-CD: zap/burp_dast registry entries.
+# ---------------------------------------------------------------------------
+
+
+def _fake_zap_result(**overrides):
+    result = {
+        "tool_result_version": "1", "tool_id": "zap", "request_id": "REQ-1", "target": "http://localhost:3000/",
+        "status": "completed", "capability": "passive_only", "runtime_version": "2.17.0", "mode": "safe",
+        "urls_visited": ["http://localhost:3000/"], "requests_performed": 1, "runtime_duration_seconds": 0.5,
+        "observations": [], "evidence_references": [], "output_truncated": False, "error_detail": None,
+        "execution_performed": True,
+    }
+    result.update(overrides)
+    return result
+
+
+def _fake_burp_result(**overrides):
+    result = {
+        "tool_result_version": "1", "tool_id": "burp_dast", "request_id": "REQ-1", "target": "http://localhost:3000/",
+        "adapter_status": "implemented", "runtime_status": "configured_external_runtime_required",
+        "status": "not_evaluated", "source": None, "observations": [], "evidence_references": [],
+        "network_requests_performed": None, "output_truncated": False, "error_detail": None,
+        "execution_performed": False,
+    }
+    result.update(overrides)
+    return result
+
+
+class TestZapAndBurpRegistryEntries:
+    def test_030_zap_permitted_execution_calls_zap_adapter(self, monkeypatch):
+        import core.bug_bounty_tool_execution as execution_module
+        monkeypatch.setattr(execution_module, "run_zap_scan", lambda **kw: _fake_zap_result())
+
+        permissions = _permissions(testing_profile="safe_dast", allowed_tools=["http_assessor", "zap"])
+        request = _tool_request(tool_id="zap", testing_mode="safe_dast", target="http://localhost:3000/", ports=[3000])
+        result = execute_bug_bounty_tool(
+            permissions=permissions, tool_request=request, governor_result=_governor_result(),
+            execution_config=_execution_config(),
+        )
+        assert result["execution_permitted"] is True
+        assert result["tool_result"]["tool_id"] == "zap"
+
+    def test_031_burp_permitted_execution_calls_burp_adapter_honestly(self, monkeypatch):
+        # burp_dast is policy-permitted (adapter implemented), but the
+        # adapter itself honestly reports no runtime configured -- the
+        # execution boundary must not paper over that.
+        import core.bug_bounty_tool_execution as execution_module
+        monkeypatch.setattr(execution_module, "run_burp_scan", lambda **kw: _fake_burp_result())
+
+        permissions = _permissions(testing_profile="safe_dast", allowed_tools=["http_assessor", "burp_dast"])
+        request = _tool_request(
+            tool_id="burp_dast", testing_mode="safe_dast", target="http://localhost:3000/", ports=[3000],
+        )
+        result = execute_bug_bounty_tool(
+            permissions=permissions, tool_request=request, governor_result=_governor_result(),
+            execution_config=_execution_config(),
+        )
+        assert result["execution_permitted"] is True
+        assert result["tool_result"]["runtime_status"] == "configured_external_runtime_required"
+        assert result["tool_result"]["execution_performed"] is False
+        assert result["execution_performed"] is False  # honestly propagated, never overridden to True
+
+    def test_032_zap_governor_denied_never_calls_adapter(self, monkeypatch):
+        import core.bug_bounty_tool_execution as execution_module
+        spy = {"called": False}
+        monkeypatch.setattr(execution_module, "run_zap_scan", lambda **kw: spy.update(called=True))
+
+        permissions = _permissions(testing_profile="safe_dast", allowed_tools=["http_assessor", "zap"])
+        request = _tool_request(tool_id="zap", testing_mode="safe_dast", target="http://localhost:3000/", ports=[3000])
+        governor_result = _governor_result(decision="block", execution_allowed=False)
+        result = execute_bug_bounty_tool(
+            permissions=permissions, tool_request=request, governor_result=governor_result,
             execution_config=_execution_config(),
         )
         assert result["execution_permitted"] is False

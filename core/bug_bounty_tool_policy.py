@@ -107,9 +107,14 @@ REASON_CODES = (
 # Fixed, hardcoded tool catalog. `implemented` is the single honest
 # source of truth for "can this actually run today" -- it is never
 # inferred from `risk_level`/`category`, and never overridden by a
-# caller. `http_assessor`, `nmap`, and `nuclei` are `True` as of Block
-# 15G-B (see `adapters.bug_bounty_nmap`/`adapters.bug_bounty_nuclei`);
-# every other tool_id remains a declared, not-yet-built capability.
+# caller. `http_assessor`, `nmap`, and `nuclei` became `True` in Block
+# 15G-B; `zap` and `burp_dast` became `True` in Block 15G-CD (see
+# `adapters.bug_bounty_zap`/`adapters.bug_bounty_burp` -- for `burp_dast`,
+# `implemented: True` reflects that a real, deterministic adapter
+# boundary exists, independent of whether a compatible Burp runtime is
+# actually configured in any given environment; see that module's own
+# `runtime_status`/`adapter_status` distinction). `authenticated_testing`
+# and `controlled_validation` remain declared, not-yet-built capabilities.
 # ---------------------------------------------------------------------------
 
 _TOOL_CATALOG_ENTRIES: tuple[dict[str, Any], ...] = (
@@ -130,12 +135,12 @@ _TOOL_CATALOG_ENTRIES: tuple[dict[str, Any], ...] = (
     },
     {
         "tool_id": "zap", "category": "web_dast", "risk_level": "medium",
-        "implemented": False, "requires_human_approval": False,
+        "implemented": True, "requires_human_approval": False,
         "supports_authentication": True, "state_changing_capability": False,
     },
     {
         "tool_id": "burp_dast", "category": "web_dast", "risk_level": "medium",
-        "implemented": False, "requires_human_approval": False,
+        "implemented": True, "requires_human_approval": False,
         "supports_authentication": True, "state_changing_capability": False,
     },
     {

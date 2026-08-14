@@ -28,11 +28,11 @@ _EXPECTED_COUNTS_BY_TYPE = {
     "gateway_tool": 8,
     "identity_agent": 6,
     "claude_subagent": 5,
-    "claude_command": 32,
+    "claude_command": 33,
     "claude_skill": 1,
     "mcp_server": 2,
 }
-_EXPECTED_TOTAL = 54
+_EXPECTED_TOTAL = 55
 
 _REPRESENTATIVE_ASSET_IDS = (
     "gateway_tool:load_risk_aware_approval_record",
@@ -674,7 +674,7 @@ def test_067_no_duplicate_asset_ids_in_full_inventory():
 
 def test_068_claude_command_registry_matches_actual_command_file_count():
     result = list_ai_assets(asset_type="claude_command")
-    assert result["count"] == 32
+    assert result["count"] == 33
 
 
 def test_069_existing_evaluation_lab_behavior_unchanged_by_registry_additions():
@@ -977,6 +977,58 @@ def test_108_claude_subagent_registry_matches_actual_agent_file_count():
 
 
 def test_109_existing_evaluation_lab_behavior_unchanged_by_block_15g_addition():
+    result = evaluate_ai_security_case(
+        case_type="emergency_freeze_bypass", asset_id="identity_agent:coordinator_agent",
+    )
+    assert result["evaluation_outcome"] == "pass"
+
+
+# ---------------------------------------------------------------------------
+# Block 15G-CD: bug-bounty-report claude_command asset. No new subagent --
+# this checkpoint reuses the existing bug-bounty-planner agent, per its own
+# explicit instruction not to create another one unless genuinely needed.
+# ---------------------------------------------------------------------------
+
+
+def test_110_bug_bounty_report_claude_command_discoverable():
+    result = lookup_ai_asset(asset_id="claude_command:bug-bounty-report")
+    assert result["found"] is True
+    assert result["asset_type"] == "claude_command"
+    assert result["declared_in"] == ".claude/commands/bug-bounty-report.md"
+
+
+def test_111_bug_bounty_report_provenance_repository_declared_not_verified():
+    result = lookup_ai_asset(asset_id="claude_command:bug-bounty-report")
+    assert result["provenance"]["tier"] == "repository_declared"
+    assert "verified" not in result["provenance"]["tier"]
+    assert "authenticated" not in result["provenance"]["tier"]
+
+
+def test_112_no_new_subagent_added_for_block_15g_cd():
+    assert lookup_ai_asset(asset_id="claude_subagent:bug-bounty-report")["found"] is False
+    assert lookup_ai_asset(asset_id="claude_subagent:bug-bounty-correlation")["found"] is False
+
+
+def test_113_no_gateway_tool_identity_agent_or_skill_added_for_block_15g_cd():
+    assert lookup_ai_asset(asset_id="gateway_tool:normalize_bug_bounty_evidence")["found"] is False
+    assert lookup_ai_asset(asset_id="gateway_tool:correlate_bug_bounty_evidence")["found"] is False
+    assert lookup_ai_asset(asset_id="gateway_tool:build_final_bug_bounty_report")["found"] is False
+    assert lookup_ai_asset(asset_id="identity_agent:bug_bounty_report_agent")["found"] is False
+    assert lookup_ai_asset(asset_id="claude_skill:bug-bounty-report")["found"] is False
+
+
+def test_114_claude_subagent_count_unchanged_by_block_15g_cd():
+    result = list_ai_assets(asset_type="claude_subagent")
+    assert result["count"] == 5
+
+
+def test_115_no_duplicate_asset_ids_after_block_15g_cd_addition():
+    listing = list_ai_assets()
+    ids = [asset["asset_id"] for asset in listing["assets"]]
+    assert len(ids) == len(set(ids))
+
+
+def test_116_existing_evaluation_lab_behavior_unchanged_by_block_15g_cd():
     result = evaluate_ai_security_case(
         case_type="emergency_freeze_bypass", asset_id="identity_agent:coordinator_agent",
     )
