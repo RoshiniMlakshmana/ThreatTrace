@@ -844,3 +844,230 @@ class TestStructuralHonesty:
         transport = _baseline_ok_transport()
         run_bug_bounty_assessment(scope=_scope(), transport=transport)
         assert len(calls) >= 1
+
+
+# ---------------------------------------------------------------------------
+# Metadata evidence-quality refinement (Block 15F-A.1). Distinguishes a
+# genuine robots.txt/security.txt/sitemap.xml resource from a generic
+# fallback document (e.g. a single-page application's catch-all HTML
+# route) using only the Content-Type header and bounded body excerpt
+# already fetched for that same request -- no new request, no new path,
+# no new vulnerability class.
+# ---------------------------------------------------------------------------
+
+
+def _metadata_transport(*, path, status_code=200, content_type=None, body=None):
+    """A fake transport whose baseline `/` response is a plain, minimal
+    200, and whose exactly one targeted metadata `path` returns the
+    caller-supplied canned response. Every other fixed metadata path
+    returns 404, so only the path under test can ever produce a
+    finding.
+    """
+    headers = {"Content-Type": content_type} if content_type else {}
+
+    def handler(*, url, method):
+        if url == "https://app.example.test/" and method == "GET":
+            return _response(status_code=200, headers={"Content-Type": "text/html"}, body_excerpt="<html></html>", url=url)
+        if url == f"https://app.example.test{path}" and method == "GET":
+            return _response(status_code=status_code, headers=headers, body_excerpt=body, url=url)
+        return _response(status_code=404, headers={}, url=url)
+
+    return FakeTransport(handler=handler)
+
+
+def _metadata_findings(result, path):
+    return [f for f in result["findings"] if f["vulnerability_class"] == "exposed_metadata" and f["affected_path"] == path]
+
+
+class TestMetadataEvidenceQuality:
+    # -- A/B/C: sitemap.xml -------------------------------------------------
+
+    def test_085_sitemap_generic_html_spa_fallback_no_finding(self):
+        transport = _metadata_transport(
+            path="/sitemap.xml", content_type="text/html; charset=UTF-8", body="<html><body>App shell</body></html>",
+        )
+        result = run_bug_bounty_assessment(scope=_scope(), transport=transport)
+        assert _metadata_findings(result, "/sitemap.xml") == []
+
+    def test_086_sitemap_valid_xml_media_type_and_marker_produces_finding(self):
+        transport = _metadata_transport(
+            path="/sitemap.xml", content_type="application/xml",
+            body='<?xml version="1.0"?><urlset xmlns="x"></urlset>',
+        )
+        result = run_bug_bounty_assessment(scope=_scope(), transport=transport)
+        assert len(_metadata_findings(result, "/sitemap.xml")) == 1
+
+    def test_087_sitemap_text_plain_with_urlset_marker_still_accepted(self):
+        # A conservative, body-signature-based fallback: a real sitemap
+        # mislabeled as text/plain is still honestly recognized via its
+        # own structural marker, never rejected on Content-Type alone.
+        transport = _metadata_transport(
+            path="/sitemap.xml", content_type="text/plain", body="<urlset><url><loc>x</loc></url></urlset>",
+        )
+        result = run_bug_bounty_assessment(scope=_scope(), transport=transport)
+        assert len(_metadata_findings(result, "/sitemap.xml")) == 1
+
+    def test_088_sitemap_xml_media_type_alone_without_marker_still_accepted(self):
+        transport = _metadata_transport(path="/sitemap.xml", content_type="text/xml", body="")
+        result = run_bug_bounty_assessment(scope=_scope(), transport=transport)
+        assert len(_metadata_findings(result, "/sitemap.xml")) == 1
+
+    def test_089_sitemap_html_media_type_with_no_marker_body_none_no_finding(self):
+        transport = _metadata_transport(path="/sitemap.xml", content_type="text/html", body=None)
+        result = run_bug_bounty_assessment(scope=_scope(), transport=transport)
+        assert _metadata_findings(result, "/sitemap.xml") == []
+
+    def test_090_sitemap_sitemapindex_marker_accepted(self):
+        transport = _metadata_transport(
+            path="/sitemap.xml", content_type="text/html", body="<sitemapindex><sitemap></sitemap></sitemapindex>",
+        )
+        result = run_bug_bounty_assessment(scope=_scope(), transport=transport)
+        assert len(_metadata_findings(result, "/sitemap.xml")) == 1
+
+    # -- D/E: robots.txt ------------------------------------------------
+
+    def test_091_robots_text_plain_with_directives_produces_finding(self):
+        transport = _metadata_transport(
+            path="/robots.txt", content_type="text/plain", body="User-agent: *\nDisallow: /admin\n",
+        )
+        result = run_bug_bounty_assessment(scope=_scope(), transport=transport)
+        assert len(_metadata_findings(result, "/robots.txt")) == 1
+
+    def test_092_robots_generic_html_spa_fallback_no_finding(self):
+        transport = _metadata_transport(
+            path="/robots.txt", content_type="text/html; charset=UTF-8", body="<html><body>App shell</body></html>",
+        )
+        result = run_bug_bounty_assessment(scope=_scope(), transport=transport)
+        assert _metadata_findings(result, "/robots.txt") == []
+
+    def test_093_robots_text_plain_media_type_alone_accepted(self):
+        transport = _metadata_transport(path="/robots.txt", content_type="text/plain", body="")
+        result = run_bug_bounty_assessment(scope=_scope(), transport=transport)
+        assert len(_metadata_findings(result, "/robots.txt")) == 1
+
+    def test_094_robots_html_media_type_but_body_has_directive_still_accepted(self):
+        transport = _metadata_transport(
+            path="/robots.txt", content_type="text/html", body="Sitemap: https://app.example.test/sitemap.xml",
+        )
+        result = run_bug_bounty_assessment(scope=_scope(), transport=transport)
+        assert len(_metadata_findings(result, "/robots.txt")) == 1
+
+    # -- F/G: security.txt ------------------------------------------------
+
+    def test_095_security_txt_text_plain_with_contact_produces_finding(self):
+        transport = _metadata_transport(
+            path="/.well-known/security.txt", content_type="text/plain", body="Contact: mailto:security@example.test\n",
+        )
+        result = run_bug_bounty_assessment(scope=_scope(), transport=transport)
+        assert len(_metadata_findings(result, "/.well-known/security.txt")) == 1
+
+    def test_096_security_txt_generic_html_fallback_no_finding(self):
+        transport = _metadata_transport(
+            path="/.well-known/security.txt", content_type="text/html", body="<html><body>App shell</body></html>",
+        )
+        result = run_bug_bounty_assessment(scope=_scope(), transport=transport)
+        assert _metadata_findings(result, "/.well-known/security.txt") == []
+
+    def test_097_security_txt_recognizes_each_listed_field(self):
+        for field in ("Contact:", "Expires:", "Policy:", "Encryption:", "Acknowledgments:", "Canonical:"):
+            transport = _metadata_transport(
+                path="/.well-known/security.txt", content_type="text/html", body=f"{field} value",
+            )
+            result = run_bug_bounty_assessment(scope=_scope(), transport=transport)
+            assert len(_metadata_findings(result, "/.well-known/security.txt")) == 1, field
+
+    # -- H: existing 404 behavior unchanged ------------------------------
+
+    def test_098_404_still_produces_no_finding(self):
+        transport = _metadata_transport(path="/sitemap.xml", status_code=404, content_type="text/html", body="not found")
+        result = run_bug_bounty_assessment(scope=_scope(), transport=transport)
+        assert _metadata_findings(result, "/sitemap.xml") == []
+
+    # -- I/J: request count / no extra HTTP calls ------------------------
+
+    def test_099_passive_profile_request_count_unchanged(self):
+        transport = _baseline_ok_transport()
+        result = run_bug_bounty_assessment(scope=_scope(), transport=transport)
+        assert result["network_requests_performed"] == 4  # baseline + 3 metadata paths
+        assert len(transport.calls) == 4
+
+    def test_100_safe_active_profile_request_count_unchanged(self):
+        transport = _baseline_ok_transport()
+        result = run_bug_bounty_assessment(scope=_scope(testing_profile="safe_active"), transport=transport)
+        assert result["network_requests_performed"] == 6  # + OPTIONS + reflection probe
+        assert len(transport.calls) == 6
+
+    def test_101_rejected_metadata_causes_no_extra_request(self):
+        transport = _metadata_transport(path="/sitemap.xml", content_type="text/html", body="<html></html>")
+        run_bug_bounty_assessment(scope=_scope(), transport=transport)
+        # Exactly one request per fixed path -- the evidence-quality check
+        # is a local decision over the response already fetched.
+        sitemap_calls = [c for c in transport.calls if c[0].endswith("/sitemap.xml")]
+        assert len(sitemap_calls) == 1
+
+    # -- K: findings schema unchanged ------------------------------------
+
+    def test_102_accepted_metadata_finding_schema_unchanged(self):
+        transport = _metadata_transport(
+            path="/robots.txt", content_type="text/plain", body="User-agent: *\nDisallow: /admin\n",
+        )
+        result = run_bug_bounty_assessment(scope=_scope(), transport=transport)
+        finding = _metadata_findings(result, "/robots.txt")[0]
+        assert finding["finding_status"] == "observation"
+        assert finding["vulnerability_class"] == "exposed_metadata"
+        assert finding["technical_severity"] == "low"
+        assert finding["confidence"] == "high"
+        assert finding["execution_performed"] is False
+
+    # -- L: existing safety contract unchanged ---------------------------
+
+    def test_103_no_new_method_ever_sent_for_metadata_paths(self):
+        transport = _metadata_transport(path="/sitemap.xml", content_type="text/plain", body="<urlset></urlset>")
+        run_bug_bounty_assessment(scope=_scope(testing_profile="safe_active"), transport=transport)
+        methods_used = {method for _, method in transport.calls}
+        assert methods_used <= {"GET", "OPTIONS"}
+
+    # -- M: deterministic behavior ----------------------------------------
+
+    def test_104_deterministic_across_repeated_runs(self):
+        def _run():
+            transport = _metadata_transport(path="/sitemap.xml", content_type="text/html", body="<html></html>")
+            return run_bug_bounty_assessment(scope=_scope(), transport=transport)
+
+        first = _run()
+        second = _run()
+        assert first == second
+
+    # -- N: caller input immutability --------------------------------------
+
+    def test_105_response_headers_and_body_never_mutated(self):
+        headers = {"Content-Type": "text/html"}
+        body = "<html></html>"
+
+        def handler(*, url, method):
+            if url == "https://app.example.test/sitemap.xml" and method == "GET":
+                return _response(status_code=200, headers=headers, body_excerpt=body, url=url)
+            return _response(status_code=404, headers={}, url=url)
+
+        transport = FakeTransport(handler=handler)
+        run_bug_bounty_assessment(scope=_scope(), transport=transport)
+        assert headers == {"Content-Type": "text/html"}
+        assert body == "<html></html>"
+
+    # -- Honesty: never overclaims content authenticity / SPA detection ---
+
+    def test_106_module_never_claims_authenticity_or_spa_detection(self):
+        # Deliberately affirmative-only phrasings that would only appear
+        # if a false claim were mistakenly introduced -- distinct from
+        # this module's own honest negation prose ("never...authenticity
+        # proof", "never cryptographic validation", etc.), so this check
+        # does not mistake negation for an affirmative claim.
+        source = inspect.getsource(bug_bounty_assessment)
+        forbidden = (
+            "proves authenticity", "cryptographically validates", "fully validates the sitemap",
+            "fully validates robots", "is a spa detection engine", "acts as a crawler",
+            "validates the vulnerability", "is production ready", "is production-ready",
+        )
+        lowered = source.lower()
+        for phrase in forbidden:
+            assert phrase not in lowered

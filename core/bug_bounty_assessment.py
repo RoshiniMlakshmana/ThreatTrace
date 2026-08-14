@@ -205,6 +205,74 @@ def _looks_like_version_disclosure(value: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Metadata evidence-quality validation (Block 15F-A.1). This never adds a
+# request, a new path, or a new vulnerability class -- it only decides,
+# from the response already fetched for one of the three fixed
+# `_METADATA_PATHS`, whether that response's own Content-Type and bounded
+# body excerpt are consistent with a genuine resource of that kind, or
+# merely a generic fallback document (e.g. a single-page application's
+# catch-all HTML route answering every unmatched path with HTTP 200).
+# This is evidence-quality qualification only -- never content
+# authenticity proof, never cryptographic validation, never full
+# RFC-compliant parsing of robots.txt/security.txt/sitemap.xml, and
+# never a general SPA-detection engine: each rule below applies only to
+# the one fixed path it is defined for.
+# ---------------------------------------------------------------------------
+
+_METADATA_TEXT_MEDIA_TYPE = "text/plain"
+_METADATA_XML_MEDIA_TYPES = frozenset({"application/xml", "text/xml"})
+
+_ROBOTS_TXT_BODY_MARKERS = ("user-agent:", "disallow:", "allow:", "sitemap:")
+_SECURITY_TXT_BODY_MARKERS = (
+    "contact:", "expires:", "policy:", "encryption:", "acknowledgments:", "canonical:",
+)
+_SITEMAP_XML_BODY_MARKERS = ("<?xml", "<urlset", "<sitemapindex")
+
+
+def _response_media_type(headers_lower: Mapping[str, str]) -> str | None:
+    content_type = headers_lower.get("content-type")
+    if not isinstance(content_type, str) or not content_type.strip():
+        return None
+    return content_type.split(";", 1)[0].strip().lower()
+
+
+def _body_contains_any_marker(body_excerpt: Any, markers: tuple[str, ...]) -> bool:
+    if not isinstance(body_excerpt, str) or not body_excerpt:
+        return False
+    lowered = body_excerpt.lower()
+    return any(marker in lowered for marker in markers)
+
+
+def _is_genuine_metadata_resource(*, path: str, headers_lower: Mapping[str, str], body_excerpt: Any) -> bool:
+    """Deterministically decide whether an HTTP 200 response for one of
+    the three fixed metadata paths is consistent with a genuine resource
+    of that kind, using only the Content-Type header and bounded body
+    excerpt this assessment already fetched for that same request --
+    never an additional request, never external lookup, never ML/fuzzy
+    similarity. Either signal (an appropriate media type, or a
+    recognized body marker) is independently sufficient, so a real file
+    served with an unexpected media type is still honestly recognized --
+    this function never relies on Content-Type alone. A path outside the
+    three recognized metadata paths is always conservatively rejected.
+    """
+    media_type = _response_media_type(headers_lower)
+
+    if path == "/sitemap.xml":
+        return media_type in _METADATA_XML_MEDIA_TYPES or _body_contains_any_marker(
+            body_excerpt, _SITEMAP_XML_BODY_MARKERS,
+        )
+    if path == "/robots.txt":
+        return media_type == _METADATA_TEXT_MEDIA_TYPE or _body_contains_any_marker(
+            body_excerpt, _ROBOTS_TXT_BODY_MARKERS,
+        )
+    if path == "/.well-known/security.txt":
+        return media_type == _METADATA_TEXT_MEDIA_TYPE or _body_contains_any_marker(
+            body_excerpt, _SECURITY_TXT_BODY_MARKERS,
+        )
+    return False
+
+
+# ---------------------------------------------------------------------------
 # Request execution -- every call passes through scope evaluation first;
 # the transport is only ever invoked for a request scope reported
 # "allow", and only while the fixed per-assessment request cap has not
@@ -456,6 +524,12 @@ def _evaluate_metadata_observation(
     bucket: list[dict[str, Any]], finding_keys_seen: set[tuple[str, str, str, str]],
 ) -> None:
     if response.get("status_code") != 200:
+        return
+
+    headers_lower = _lower_headers(response.get("headers"))
+    if not _is_genuine_metadata_resource(
+        path=path, headers_lower=headers_lower, body_excerpt=response.get("body_excerpt"),
+    ):
         return
 
     check_id = f"metadata_present:{path}"
