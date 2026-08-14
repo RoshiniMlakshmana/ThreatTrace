@@ -1,0 +1,191 @@
+"""Focused tests for backend.models -- the pure, deterministic Run +
+Event contract layer (Block 15J-K).
+"""
+
+from __future__ import annotations
+
+import pytest
+
+from backend.models import (
+    RUN_STATUSES,
+    TERMINAL_STATUSES,
+    EventModelError,
+    RunModelError,
+    apply_run_transition,
+    build_event,
+    build_run,
+    validate_local_only_target,
+)
+
+
+class TestBuildRun:
+    def test_001_creates_run_with_defaults(self):
+        run = build_run(run_id="RUN-abc", run_type="bug_bounty", created_at="t0")
+        assert run["status"] == "created"
+        assert run["current_stage"] == "created"
+        assert run["started_at"] is None
+        assert run["completed_at"] is None
+        assert run["finding_count"] == 0
+        assert run["governor_decisions"] == []
+        assert run["human_review_required"] is False
+        assert run["cancellation_requested"] is False
+        assert run["report"] is None
+
+    def test_002_rejects_invalid_run_type(self):
+        with pytest.raises(RunModelError, match="INVALID_RUN_TYPE"):
+            build_run(run_id="RUN-abc", run_type="not_a_type", created_at="t0")
+
+    def test_003_rejects_blank_run_id(self):
+        with pytest.raises(RunModelError, match="INVALID_RUN_ID"):
+            build_run(run_id="", run_type="bug_bounty", created_at="t0")
+
+    def test_004_rejects_blank_created_at(self):
+        with pytest.raises(RunModelError, match="INVALID_TIMESTAMP"):
+            build_run(run_id="RUN-abc", run_type="bug_bounty", created_at="")
+
+
+class TestApplyRunTransition:
+    def test_005_transitions_and_does_not_mutate_original(self):
+        run = build_run(run_id="RUN-abc", run_type="bug_bounty", created_at="t0")
+        updated = apply_run_transition(run=run, new_status="planning", current_stage="planning")
+        assert updated["status"] == "planning"
+        assert run["status"] == "created"
+
+    def test_006_rejects_reentering_created_from_a_different_status(self):
+        run = build_run(run_id="RUN-abc", run_type="bug_bounty", created_at="t0")
+        planning = apply_run_transition(run=run, new_status="planning")
+        with pytest.raises(RunModelError, match="REENTER_CREATED"):
+            apply_run_transition(run=planning, new_status="created")
+
+    def test_006b_allows_field_update_noop_while_still_created(self):
+        run = build_run(run_id="RUN-abc", run_type="bug_bounty", created_at="t0")
+        updated = apply_run_transition(run=run, new_status="created", cancellation_requested=True)
+        assert updated["status"] == "created"
+        assert updated["cancellation_requested"] is True
+
+    def test_007_rejects_transition_from_terminal(self):
+        run = build_run(run_id="RUN-abc", run_type="bug_bounty", created_at="t0")
+        terminal = apply_run_transition(run=run, new_status="completed", completed_at="t1")
+        with pytest.raises(RunModelError, match="TERMINAL_RUN"):
+            apply_run_transition(run=terminal, new_status="running")
+
+    def test_008_rejects_unrecognized_status(self):
+        run = build_run(run_id="RUN-abc", run_type="bug_bounty", created_at="t0")
+        with pytest.raises(RunModelError, match="INVALID_STATUS"):
+            apply_run_transition(run=run, new_status="not_a_status")
+
+    def test_009_rejects_immutable_field_update(self):
+        run = build_run(run_id="RUN-abc", run_type="bug_bounty", created_at="t0")
+        with pytest.raises(RunModelError, match="INVALID_FIELD"):
+            apply_run_transition(run=run, new_status="planning", run_id="RUN-hacked")
+
+    def test_010_every_status_is_reachable_target(self):
+        run = build_run(run_id="RUN-abc", run_type="detection", created_at="t0")
+        for status in RUN_STATUSES - {"created"}:
+            apply_run_transition(run=run, new_status=status)
+
+    def test_011_terminal_statuses_subset_of_run_statuses(self):
+        assert TERMINAL_STATUSES.issubset(RUN_STATUSES)
+
+
+class TestBuildEvent:
+    def test_012_builds_valid_event(self):
+        event = build_event(
+            run_id="RUN-abc", event_type="run_started", sequence=1, timestamp="t0",
+            stage="intake", source_component="orchestrator", summary="started",
+        )
+        assert event["event_id"] == "EVT-RUN-abc-1"
+        assert event["sanitized_payload"] == {}
+
+    def test_013_rejects_unrecognized_event_type(self):
+        with pytest.raises(EventModelError, match="INVALID_EVENT_TYPE"):
+            build_event(
+                run_id="RUN-abc", event_type="not_a_type", sequence=1, timestamp="t0",
+                stage="intake", source_component="orchestrator", summary="x",
+            )
+
+    def test_014_rejects_non_positive_sequence(self):
+        with pytest.raises(EventModelError, match="INVALID_SEQUENCE"):
+            build_event(
+                run_id="RUN-abc", event_type="run_started", sequence=0, timestamp="t0",
+                stage="intake", source_component="orchestrator", summary="x",
+            )
+
+    def test_015_truncates_oversized_summary(self):
+        event = build_event(
+            run_id="RUN-abc", event_type="run_started", sequence=1, timestamp="t0",
+            stage="intake", source_component="orchestrator", summary="x" * 500,
+        )
+        assert len(event["summary"]) <= 300
+        assert event["summary"].endswith("...")
+
+    def test_016_rejects_oversized_payload(self):
+        with pytest.raises(EventModelError, match="PAYLOAD_TOO_LARGE"):
+            build_event(
+                run_id="RUN-abc", event_type="run_started", sequence=1, timestamp="t0",
+                stage="intake", source_component="orchestrator", summary="x",
+                sanitized_payload={"blob": "x" * 20000},
+            )
+
+    @pytest.mark.parametrize("key", ["cookie", "auth_token", "Authorization", "api_key", "password", "SECRET"])
+    def test_017_rejects_forbidden_payload_keys(self, key):
+        with pytest.raises(EventModelError, match="PAYLOAD_FORBIDDEN_KEY"):
+            build_event(
+                run_id="RUN-abc", event_type="run_started", sequence=1, timestamp="t0",
+                stage="intake", source_component="orchestrator", summary="x",
+                sanitized_payload={key: "x"},
+            )
+
+    def test_018_rejects_forbidden_key_nested(self):
+        with pytest.raises(EventModelError, match="PAYLOAD_FORBIDDEN_KEY"):
+            build_event(
+                run_id="RUN-abc", event_type="run_started", sequence=1, timestamp="t0",
+                stage="intake", source_component="orchestrator", summary="x",
+                sanitized_payload={"details": {"nested": {"cookie": "x"}}},
+            )
+
+    def test_019_rejects_non_serializable_payload(self):
+        with pytest.raises(EventModelError, match="INVALID_PAYLOAD"):
+            build_event(
+                run_id="RUN-abc", event_type="run_started", sequence=1, timestamp="t0",
+                stage="intake", source_component="orchestrator", summary="x",
+                sanitized_payload={"obj": object()},
+            )
+
+    def test_020_rejects_unrecognized_stage(self):
+        with pytest.raises(EventModelError, match="INVALID_STAGE"):
+            build_event(
+                run_id="RUN-abc", event_type="run_started", sequence=1, timestamp="t0",
+                stage="not_a_stage", source_component="orchestrator", summary="x",
+            )
+
+    def test_021_rejects_unrecognized_source_component(self):
+        with pytest.raises(EventModelError, match="INVALID_SOURCE_COMPONENT"):
+            build_event(
+                run_id="RUN-abc", event_type="run_started", sequence=1, timestamp="t0",
+                stage="intake", source_component="not_a_component", summary="x",
+            )
+
+
+class TestValidateLocalOnlyTarget:
+    def test_022_accepts_localhost(self):
+        assert validate_local_only_target("http://localhost:3000/") == "http://localhost:3000/"
+
+    @pytest.mark.parametrize("target", [
+        "http://127.0.0.1:3000/",
+        "https://localhost:3000/",
+        "http://example.com/",
+        "http://192.168.1.5/",
+        "http://10.0.0.5/",
+        "file:///etc/passwd",
+        "ftp://localhost/",
+        "javascript:alert(1)",
+        "http://user:pass@localhost:3000/",
+        "http://localhost:3000/#frag",
+        "",
+        None,
+        123,
+    ])
+    def test_023_rejects_everything_else(self, target):
+        with pytest.raises(RunModelError, match="INVALID_TARGET"):
+            validate_local_only_target(target)

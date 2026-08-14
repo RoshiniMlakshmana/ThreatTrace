@@ -28,11 +28,11 @@ _EXPECTED_COUNTS_BY_TYPE = {
     "gateway_tool": 8,
     "identity_agent": 6,
     "claude_subagent": 6,
-    "claude_command": 34,
+    "claude_command": 35,
     "claude_skill": 1,
     "mcp_server": 2,
 }
-_EXPECTED_TOTAL = 57
+_EXPECTED_TOTAL = 58
 
 _REPRESENTATIVE_ASSET_IDS = (
     "gateway_tool:load_risk_aware_approval_record",
@@ -674,7 +674,7 @@ def test_067_no_duplicate_asset_ids_in_full_inventory():
 
 def test_068_claude_command_registry_matches_actual_command_file_count():
     result = list_ai_assets(asset_type="claude_command")
-    assert result["count"] == 34
+    assert result["count"] == 35
 
 
 def test_069_existing_evaluation_lab_behavior_unchanged_by_registry_additions():
@@ -1095,8 +1095,10 @@ def test_122_claude_subagent_count_is_six_after_block_15h_i():
 
 
 def test_123_claude_command_count_is_thirty_four_after_block_15h_i():
+    # Name retained from Block 15H-I; the count itself reflects the
+    # current repository state (35, after Block 15J-K's addition below).
     result = list_ai_assets(asset_type="claude_command")
-    assert result["count"] == 34
+    assert result["count"] == 35
 
 
 def test_124_no_duplicate_asset_ids_after_block_15h_i_addition():
@@ -1106,6 +1108,60 @@ def test_124_no_duplicate_asset_ids_after_block_15h_i_addition():
 
 
 def test_125_existing_evaluation_lab_behavior_unchanged_by_block_15h_i():
+    result = evaluate_ai_security_case(
+        case_type="emergency_freeze_bypass", asset_id="identity_agent:coordinator_agent",
+    )
+    assert result["evaluation_outcome"] == "pass"
+
+
+# ---------------------------------------------------------------------------
+# Block 15J-K -- Live Platform Backend + Real-Time Dashboard. Exactly one
+# new asset qualifies: the `/threattrace-live` startup command. No new
+# Claude subagent was added -- `backend.orchestrator` calls existing
+# deterministic core modules directly; it is not itself an LLM-invoked
+# agent, and per this checkpoint's own explicit instruction, no new
+# subagent was created for it.
+# ---------------------------------------------------------------------------
+
+
+def test_126_threattrace_live_command_discoverable():
+    result = lookup_ai_asset(asset_id="claude_command:threattrace-live")
+    assert result["found"] is True
+
+
+def test_127_threattrace_live_provenance_is_repository_declared_not_verified():
+    result = lookup_ai_asset(asset_id="claude_command:threattrace-live")
+    assert result["provenance"]["tier"] == "repository_declared"
+    assert "verified" not in result["provenance"]["tier"]
+    assert "authenticated" not in result["provenance"]["tier"]
+
+
+def test_128_no_new_subagent_gateway_tool_identity_agent_or_skill_added_for_block_15jk():
+    assert lookup_ai_asset(asset_id="claude_subagent:backend-orchestrator")["found"] is False
+    assert lookup_ai_asset(asset_id="claude_subagent:live-platform-agent")["found"] is False
+    assert lookup_ai_asset(asset_id="gateway_tool:run_bug_bounty_workflow")["found"] is False
+    assert lookup_ai_asset(asset_id="gateway_tool:run_detection_workflow")["found"] is False
+    assert lookup_ai_asset(asset_id="identity_agent:live_platform_agent")["found"] is False
+    assert lookup_ai_asset(asset_id="claude_skill:threattrace-live")["found"] is False
+
+
+def test_129_claude_subagent_count_unchanged_at_six_after_block_15jk():
+    result = list_ai_assets(asset_type="claude_subagent")
+    assert result["count"] == 6
+
+
+def test_130_claude_command_count_is_thirty_five_after_block_15jk():
+    result = list_ai_assets(asset_type="claude_command")
+    assert result["count"] == 35
+
+
+def test_131_no_duplicate_asset_ids_after_block_15jk_addition():
+    listing = list_ai_assets()
+    ids = [asset["asset_id"] for asset in listing["assets"]]
+    assert len(ids) == len(set(ids))
+
+
+def test_132_existing_evaluation_lab_behavior_unchanged_by_block_15jk():
     result = evaluate_ai_security_case(
         case_type="emergency_freeze_bypass", asset_id="identity_agent:coordinator_agent",
     )

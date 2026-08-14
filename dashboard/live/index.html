@@ -1,0 +1,491 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>ThreatTrace Live Platform</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root {
+    --bg: #0b0f14; --panel: #121822; --panel-2: #17202c; --border: #223042;
+    --text: #d7e0ea; --muted: #7c8ba1; --accent: #4fb3ff; --good: #35d68a;
+    --warn: #f5b942; --bad: #ff5c6c; --pending: #3a4759;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font-family: -apple-system, "Segoe UI", Roboto, sans-serif; font-size: 14px;
+  }
+  header {
+    display: flex; align-items: center; gap: 12px; padding: 14px 20px;
+    background: var(--panel); border-bottom: 1px solid var(--border);
+    position: sticky; top: 0; z-index: 5; flex-wrap: wrap;
+  }
+  header h1 { font-size: 17px; margin: 0; font-weight: 600; }
+  .badge {
+    font-size: 11px; padding: 3px 9px; border-radius: 999px; border: 1px solid var(--border);
+    color: var(--muted); white-space: nowrap;
+  }
+  .badge.ok { color: var(--good); border-color: var(--good); }
+  .badge.local { color: var(--accent); border-color: var(--accent); }
+  .spacer { flex: 1; }
+  .controls { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; padding: 12px 20px; background: var(--panel-2); border-bottom: 1px solid var(--border); }
+  select, input, textarea, button {
+    background: var(--bg); color: var(--text); border: 1px solid var(--border); border-radius: 6px;
+    padding: 6px 9px; font-size: 13px; font-family: inherit;
+  }
+  button { cursor: pointer; color: var(--accent); border-color: var(--accent); }
+  button:hover { background: #10202f; }
+  button:disabled { opacity: 0.4; cursor: not-allowed; }
+  input[type=text] { min-width: 220px; }
+  main { padding: 16px 20px 60px; display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 14px; }
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; min-width: 0; }
+  .card h2 { font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); margin: 0 0 10px; }
+  .card.wide { grid-column: 1 / -1; }
+  .empty { color: var(--muted); font-style: italic; }
+  .row { display: flex; justify-content: space-between; gap: 10px; padding: 4px 0; border-bottom: 1px dashed var(--border); font-size: 13px; }
+  .row:last-child { border-bottom: none; }
+  .row .k { color: var(--muted); }
+  .pill { font-size: 11px; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--border); }
+  .pill.done { color: var(--good); border-color: var(--good); }
+  .pill.active { color: var(--warn); border-color: var(--warn); animation: pulse 1.6s infinite; }
+  .pill.pending { color: var(--pending); border-color: var(--pending); }
+  .pill.blocked, .pill.failed, .pill.rejected { color: var(--bad); border-color: var(--bad); }
+  .pill.na { color: var(--muted); border-color: var(--border); }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.5; } }
+  .pipeline { display: flex; flex-wrap: wrap; gap: 6px; }
+  .pipeline .node { display: flex; flex-direction: column; align-items: center; gap: 4px; min-width: 84px; }
+  .pipeline .node .label { font-size: 11px; color: var(--muted); text-align: center; }
+  .feed { max-height: 360px; overflow-y: auto; font-family: ui-monospace, Consolas, monospace; font-size: 12px; }
+  .feed .ev { padding: 5px 0; border-bottom: 1px solid var(--border); display: grid; grid-template-columns: 92px 130px 1fr; gap: 8px; }
+  .feed .ev .ts { color: var(--muted); }
+  .feed .ev .comp { color: var(--accent); }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 5px 6px; border-bottom: 1px solid var(--border); }
+  th { color: var(--muted); font-weight: 500; font-size: 11px; text-transform: uppercase; }
+  .sev-critical { color: var(--bad); } .sev-high { color: #ff8a5c; } .sev-medium { color: var(--warn); } .sev-low { color: var(--muted); }
+  .safety { font-size: 12.5px; line-height: 1.5; color: var(--muted); }
+  .safety strong { color: var(--text); }
+  code.small { font-size: 11.5px; background: var(--panel-2); padding: 1px 5px; border-radius: 4px; }
+  details summary { cursor: pointer; color: var(--accent); font-size: 12.5px; margin-top: 6px; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>ThreatTrace Live Platform</h1>
+  <span id="health-badge" class="badge">checking backend…</span>
+  <span class="badge local">local-only · 127.0.0.1</span>
+  <span class="badge" id="disclaimer-badge">local development/research interface -- not a production-authenticated control plane</span>
+</header>
+
+<div class="controls">
+  <label>Run: <select id="run-select"><option value="">No runs yet</option></select></label>
+  <input id="bb-target" type="text" value="http://localhost:3000/" title="Bug Bounty target (localhost only)">
+  <button id="bb-start">New Bug Bounty Run</button>
+  <button id="cancel-run" disabled>Cancel Selected Run</button>
+  <span class="spacer"></span>
+  <details>
+    <summary>Advanced: submit a Detection run (JSON)</summary>
+  </details>
+</div>
+<div class="controls" id="detection-form" style="display:none">
+  <textarea id="detection-json" rows="6" style="width:100%" placeholder='{"trigger_source":"threat_intelligence","trigger_input":{...},"telemetry_context":{...},"llm_proposal":{...}}'></textarea>
+  <button id="detection-start">Submit Detection Run</button>
+</div>
+
+<main>
+
+  <section class="card" id="card-status">
+    <h2>A. System Status</h2>
+    <div id="status-body" class="empty">No active run.</div>
+  </section>
+
+  <section class="card wide" id="card-pipeline">
+    <h2>B. Pipeline</h2>
+    <div class="pipeline" id="pipeline-body"></div>
+  </section>
+
+  <section class="card" id="card-tools">
+    <h2>D. Tool Activity</h2>
+    <div id="tools-body"></div>
+  </section>
+
+  <section class="card" id="card-governor">
+    <h2>E. Security Governor</h2>
+    <div id="governor-body" class="empty">No Governor evaluation yet.</div>
+  </section>
+
+  <section class="card wide" id="card-findings">
+    <h2>F. Findings</h2>
+    <div id="findings-body" class="empty">No active run.</div>
+  </section>
+
+  <section class="card" id="card-ti">
+    <h2>G. Threat Intelligence Context</h2>
+    <div id="ti-body" class="empty">No Threat Intelligence trigger on this run.</div>
+  </section>
+
+  <section class="card" id="card-detection">
+    <h2>H. Detection Engineering</h2>
+    <div id="detection-body" class="empty">No detection rules on this run.</div>
+  </section>
+
+  <section class="card wide" id="card-feed">
+    <h2>C. Live Event Feed</h2>
+    <div id="feed-body" class="feed"><div class="empty">No active run.</div></div>
+  </section>
+
+  <section class="card wide" id="card-safety">
+    <h2>I. Limitations &amp; Safety</h2>
+    <div class="safety">
+      <strong>Local development/research interface</strong> -- not a production-authenticated control plane. No authentication of any kind is implemented.<br>
+      <strong>Run history</strong> is in-memory only for this backend process's lifetime; restarting the backend loses every run.<br>
+      <strong>Security Governor decisions</strong> evaluate caller-supplied observable state only -- never proof of intent or authenticated identity.<br>
+      <strong>Detection rule candidates</strong> are drafts only: <code class="small">deployment_state</code> is always <code class="small">NOT_DEPLOYED</code> in this checkpoint. Syntax validation is structural only, never detection-efficacy testing.<br>
+      <strong>Human review status</strong> shown here is caller-supplied / local development action unless separately authenticated.<br>
+      <strong>Live scanning is localhost-only</strong> for this checkpoint -- the backend refuses any non-<code class="small">localhost</code> Bug Bounty target.
+    </div>
+  </section>
+
+</main>
+
+<script>
+const API = "";
+let currentRunId = null;
+let eventSource = null;
+let feedCount = 0;
+const MAX_FEED_ROWS = 300;
+
+const PIPELINE = [
+  { label: "Bug Bounty", stages: ["intake","planning","tool_policy","governor","tool_execution"] },
+  { label: "Normalize", stages: ["normalization"] },
+  { label: "Correlate", stages: ["correlation"] },
+  { label: "Prioritize", stages: ["prioritization"] },
+  { label: "TI / Hunt", stages: ["threat_intel"] },
+  { label: "Detection", stages: ["detection_engineering"] },
+  { label: "Red / Purple", stages: [] },
+  { label: "Human Review", stages: ["human_review"] },
+  { label: "Complete", stages: ["complete"] },
+];
+const STAGE_ORDER = ["intake","planning","tool_policy","governor","tool_execution","normalization","correlation","prioritization","threat_intel","detection_engineering","human_review","complete"];
+const TERMINAL = new Set(["completed","blocked","failed","cancelled"]);
+
+function el(id) { return document.getElementById(id); }
+function esc(s) { return String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
+
+async function api(path, opts) {
+  const resp = await fetch(API + path, opts);
+  const body = await resp.json().catch(() => ({}));
+  if (!resp.ok) throw Object.assign(new Error(body.message || resp.statusText), { body, status: resp.status });
+  return body;
+}
+
+async function checkHealth() {
+  try {
+    const h = await api("/api/health");
+    el("health-badge").textContent = `backend ok (${h.bind})`;
+    el("health-badge").className = "badge ok";
+  } catch (e) {
+    el("health-badge").textContent = "backend unreachable";
+    el("health-badge").className = "badge blocked";
+  }
+}
+
+async function refreshRunList() {
+  const data = await api("/api/runs").catch(() => ({ runs: [] }));
+  const select = el("run-select");
+  const prior = select.value;
+  select.innerHTML = "";
+  if (!data.runs.length) {
+    select.innerHTML = '<option value="">No runs yet</option>';
+    return;
+  }
+  for (const run of data.runs) {
+    const opt = document.createElement("option");
+    opt.value = run.run_id;
+    opt.textContent = `${run.run_id.slice(0,12)}… · ${run.run_type} · ${run.status}`;
+    select.appendChild(opt);
+  }
+  if (prior && data.runs.some(r => r.run_id === prior)) {
+    select.value = prior;
+  } else if (!currentRunId) {
+    select.value = data.runs[0].run_id;
+    selectRun(select.value);
+  }
+}
+
+function pillClass(state) {
+  return { done: "done", active: "active", pending: "pending", na: "na" }[state] || "pending";
+}
+
+function renderPipeline(run) {
+  const body = el("pipeline-body");
+  body.innerHTML = "";
+  const currentIndex = run ? STAGE_ORDER.indexOf(run.current_stage) : -1;
+  const terminalNonComplete = run && TERMINAL.has(run.status) && run.status !== "completed";
+
+  for (const node of PIPELINE) {
+    let state = "pending";
+    if (node.stages.length === 0) {
+      state = "na";
+    } else if (run) {
+      const nodeMaxIndex = Math.max(...node.stages.map(s => STAGE_ORDER.indexOf(s)));
+      if (currentIndex > nodeMaxIndex || (run.status === "completed" )) {
+        state = "done";
+      } else if (node.stages.includes(run.current_stage)) {
+        state = terminalNonComplete ? (run.status) : "active";
+      } else {
+        state = "pending";
+      }
+    }
+    const div = document.createElement("div");
+    div.className = "node";
+    div.innerHTML = `<span class="pill ${pillClass(state)}">${esc(state === "na" ? "not this block" : state)}</span><span class="label">${esc(node.label)}</span>`;
+    body.appendChild(div);
+  }
+}
+
+function renderStatus(run) {
+  const body = el("status-body");
+  if (!run) { body.innerHTML = '<div class="empty">No active run.</div>'; return; }
+  const duration = run.started_at && run.completed_at ? "finished" : (run.started_at ? "running" : "not started");
+  body.innerHTML = `
+    <div class="row"><span class="k">Run ID</span><span>${esc(run.run_id)}</span></div>
+    <div class="row"><span class="k">Type</span><span>${esc(run.run_type)}</span></div>
+    <div class="row"><span class="k">Target</span><span>${esc(run.target_summary || "—")}</span></div>
+    <div class="row"><span class="k">Status</span><span class="pill ${pillClass(TERMINAL.has(run.status) ? run.status : 'active')}">${esc(run.status)}</span></div>
+    <div class="row"><span class="k">Current stage</span><span>${esc(run.current_stage)}</span></div>
+    <div class="row"><span class="k">Duration state</span><span>${esc(duration)}</span></div>
+    <div class="row"><span class="k">Cancellation requested</span><span>${run.cancellation_requested ? "yes" : "no"}</span></div>
+    <div class="row"><span class="k">Error</span><span>${esc(run.error_summary || "none")}</span></div>
+  `;
+  el("cancel-run").disabled = TERMINAL.has(run.status);
+}
+
+const ALL_TOOLS = ["http_assessor","nmap","nuclei","zap","burp_dast"];
+let systemToolReadiness = {};
+
+function renderTools(run) {
+  const body = el("tools-body");
+  let rows = "";
+  for (const tool of ALL_TOOLS) {
+    let state = "not part of this run";
+    let cls = "na";
+    if (run) {
+      if ((run.executed_tools || []).includes(tool)) { state = "completed"; cls = "done"; }
+      else if ((run.permitted_tools || []).includes(tool)) { state = "permitted, not run"; cls = "pending"; }
+      else if ((run.requested_tools || []).includes(tool)) { state = "requested, not permitted"; cls = "blocked"; }
+      else { state = systemToolReadiness[tool] || "unknown"; cls = state === "available" ? "pending" : "na"; }
+    } else {
+      state = systemToolReadiness[tool] || "unknown";
+      cls = state === "available" ? "pending" : "na";
+    }
+    rows += `<div class="row"><span class="k">${esc(tool)}</span><span class="pill ${cls}">${esc(state)}</span></div>`;
+  }
+  body.innerHTML = rows;
+}
+
+function renderGovernor(payload) {
+  const body = el("governor-body");
+  if (!payload) { body.innerHTML = '<div class="empty">No Governor evaluation yet.</div>'; return; }
+  body.innerHTML = `
+    <div class="row"><span class="k">Decision</span><span class="pill ${payload.decision === 'allow' ? 'done' : 'blocked'}">${esc(payload.decision)}</span></div>
+    <div class="row"><span class="k">Execution allowed</span><span>${payload.execution_allowed ? "true" : "false"}</span></div>
+    <div class="row"><span class="k">Reason codes</span><span>${(payload.reason_codes || []).length ? esc(payload.reason_codes.join(", ")) : "none"}</span></div>
+    <div class="row"><span class="k">Observable only</span><span>true (never proof of intent/authentication)</span></div>
+  `;
+}
+
+function renderFindings(run) {
+  const body = el("findings-body");
+  if (!run) { body.innerHTML = '<div class="empty">No active run.</div>'; return; }
+  const report = run.report;
+  if (!report || !("canonical_findings" in report)) {
+    body.innerHTML = `<div class="empty">${run.run_type === 'bug_bounty' ? '0 observations (no report yet, or none produced)' : 'Not applicable to this run type.'}</div>`;
+    return;
+  }
+  if (!report.canonical_findings.length) {
+    body.innerHTML = '<div class="empty">0 canonical findings.</div>';
+    return;
+  }
+  let rows = report.canonical_findings.map(f => `
+    <tr>
+      <td>${esc(f.title || f.finding_id)}</td>
+      <td class="sev-${esc(f.technical_severity)}">${esc(f.technical_severity)}</td>
+      <td>${esc(f.confidence || "—")}</td>
+      <td>${esc((f.evidence && f.evidence.length) || 0)} evidence item(s)</td>
+      <td>${esc(f.status || "requires_human_review")}</td>
+    </tr>`).join("");
+  body.innerHTML = `<table><thead><tr><th>Finding</th><th>Severity</th><th>Confidence</th><th>Evidence</th><th>Review state</th></tr></thead><tbody>${rows}</tbody></table>`;
+}
+
+let lastTi = null;
+function renderTi(payload) {
+  if (payload) lastTi = payload;
+  const body = el("ti-body");
+  if (!lastTi || lastTi.trigger_type !== "threat_intelligence") {
+    body.innerHTML = '<div class="empty">No Threat Intelligence trigger on this run.</div>';
+    return;
+  }
+  body.innerHTML = `
+    <div class="row"><span class="k">Trigger</span><span>${esc(lastTi.trigger_id)}</span></div>
+    <div class="row"><span class="k">CVE</span><span>${(lastTi.cve || []).length ? esc(lastTi.cve.join(", ")) : "none supplied"}</span></div>
+    <div class="row"><span class="k">CWE</span><span>${(lastTi.cwe || []).length ? esc(lastTi.cwe.join(", ")) : "none supplied"}</span></div>
+    <div class="row"><span class="k">Confidence</span><span>${esc(lastTi.confidence || "—")}</span></div>
+    <div class="row"><span class="k">Affected technology</span><span>${(lastTi.affected_technology || []).length ? esc(lastTi.affected_technology.join(", ")) : "—"}</span></div>
+  `;
+}
+
+const ruleState = {};
+function renderDetection(run) {
+  const body = el("detection-body");
+  const ids = Object.keys(ruleState);
+  if (!ids.length && (!run || !run.report || !("rules_generated" in (run.report || {})))) {
+    body.innerHTML = '<div class="empty">No detection rules on this run.</div>';
+    return;
+  }
+  let rows = ids.map(id => {
+    const r = ruleState[id];
+    return `<tr><td>${esc(id)}</td><td>${esc(r.rule_format || "—")}</td><td>${esc(r.dedup_status || "—")}</td>
+      <td class="pill ${r.validation_status === 'rejected' ? 'rejected' : 'done'}">${esc(r.validation_status || "draft")}</td>
+      <td class="pill done">${esc(r.deployment_state || "NOT_DEPLOYED")}</td></tr>`;
+  }).join("");
+  const summary = run && run.report ? `<div class="row"><span class="k">Human review required</span><span>${run.human_review_required ? "yes" : "no"}</span></div>` : "";
+  body.innerHTML = `${summary}<table><thead><tr><th>Detection ID</th><th>Format</th><th>Dedup</th><th>Validation</th><th>Deployment</th></tr></thead><tbody>${rows || ""}</tbody></table>`;
+}
+
+function appendFeed(event) {
+  const body = el("feed-body");
+  if (feedCount === 0) body.innerHTML = "";
+  const row = document.createElement("div");
+  row.className = "ev";
+  const ts = (event.timestamp || "").replace("T", " ").replace("Z", "");
+  row.innerHTML = `<span class="ts">${esc(ts.slice(11) || ts)}</span><span class="comp">${esc(event.source_component)} / ${esc(event.event_type)}</span><span>${esc(event.summary)}</span>`;
+  body.prepend(row);
+  feedCount++;
+  while (body.children.length > MAX_FEED_ROWS) body.removeChild(body.lastChild);
+}
+
+function handleEvent(event) {
+  appendFeed(event);
+  const p = event.sanitized_payload || {};
+  if (event.event_type === "governor_evaluated") renderGovernor(p);
+  if (event.event_type === "detection_plan_created") renderTi(p);
+  if (event.event_type === "detection_rule_created") {
+    ruleState[p.detection_id] = Object.assign({}, ruleState[p.detection_id], { rule_format: p.rule_format, dedup_status: p.dedup_status });
+    renderDetection(null);
+  }
+  if (event.event_type === "detection_rule_validated") {
+    ruleState[p.detection_id] = Object.assign({}, ruleState[p.detection_id], { validation_status: p.validation_status, deployment_state: p.deployment_state });
+    renderDetection(null);
+  }
+  if (["run_completed","run_blocked","run_failed","run_cancelled"].includes(event.event_type)) {
+    refreshSelectedRun();
+    refreshRunList();
+  }
+}
+
+async function refreshSelectedRun() {
+  if (!currentRunId) return;
+  try {
+    const run = await api(`/api/runs/${currentRunId}`);
+    renderStatus(run);
+    renderPipeline(run);
+    renderTools(run);
+    renderFindings(run);
+    renderDetection(run);
+  } catch (e) { /* run may have been evicted; ignore */ }
+}
+
+function openStream(runId) {
+  if (eventSource) { eventSource.close(); eventSource = null; }
+  eventSource = new EventSource(`/api/runs/${runId}/stream`);
+  eventSource.onmessage = (ev) => {
+    try { handleEvent(JSON.parse(ev.data)); } catch (e) { /* ignore malformed */ }
+  };
+  eventSource.onerror = () => { /* browser auto-reconnects with Last-Event-ID */ };
+}
+
+async function selectRun(runId) {
+  currentRunId = runId;
+  feedCount = 0;
+  Object.keys(ruleState).forEach(k => delete ruleState[k]);
+  lastTi = null;
+  el("feed-body").innerHTML = '<div class="empty">Loading…</div>';
+  el("governor-body").innerHTML = '<div class="empty">No Governor evaluation yet.</div>';
+  if (!runId) {
+    renderStatus(null); renderPipeline(null); renderTools(null); renderFindings(null); renderDetection(null); renderTi(null);
+    return;
+  }
+  await refreshSelectedRun();
+  const evs = await api(`/api/runs/${runId}/events`).catch(() => ({ events: [] }));
+  el("feed-body").innerHTML = "";
+  feedCount = 0;
+  for (const e of evs.events) handleEvent(e);
+  openStream(runId);
+}
+
+el("run-select").addEventListener("change", (e) => selectRun(e.target.value));
+
+el("bb-start").addEventListener("click", async () => {
+  el("bb-start").disabled = true;
+  try {
+    const target = el("bb-target").value.trim();
+    const result = await api("/api/runs/bug-bounty", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ target }),
+    });
+    await refreshRunList();
+    el("run-select").value = result.run_id;
+    await selectRun(result.run_id);
+  } catch (e) {
+    alert("Could not start run: " + (e.body ? e.body.message : e.message));
+  } finally {
+    el("bb-start").disabled = false;
+  }
+});
+
+document.querySelector("details summary").addEventListener("click", () => {
+  setTimeout(() => { el("detection-form").style.display = document.querySelector("details").open ? "flex" : "none"; }, 0);
+});
+
+el("detection-start").addEventListener("click", async () => {
+  let body;
+  try { body = JSON.parse(el("detection-json").value); }
+  catch (e) { alert("Invalid JSON: " + e.message); return; }
+  try {
+    const result = await api("/api/runs/detection", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+    });
+    await refreshRunList();
+    el("run-select").value = result.run_id;
+    await selectRun(result.run_id);
+  } catch (e) {
+    alert("Could not start run: " + (e.body ? e.body.message : e.message));
+  }
+});
+
+el("cancel-run").addEventListener("click", async () => {
+  if (!currentRunId) return;
+  try { await api(`/api/runs/${currentRunId}/cancel`, { method: "POST" }); }
+  catch (e) { alert("Could not cancel: " + (e.body ? e.body.message : e.message)); }
+});
+
+async function loadSystemInfo() {
+  try {
+    const sys = await api("/api/system");
+    systemToolReadiness = sys.tools || {};
+    renderTools(currentRunId ? await api(`/api/runs/${currentRunId}`).catch(() => null) : null);
+  } catch (e) { /* backend unreachable; health badge already reflects this */ }
+}
+
+renderStatus(null); renderPipeline(null); renderTools(null); renderFindings(null); renderDetection(null); renderTi(null);
+checkHealth();
+loadSystemInfo();
+refreshRunList();
+setInterval(checkHealth, 8000);
+setInterval(refreshRunList, 5000);
+setInterval(loadSystemInfo, 15000);
+</script>
+
+</body>
+</html>

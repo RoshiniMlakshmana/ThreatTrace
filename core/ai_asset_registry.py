@@ -228,6 +228,7 @@ _CLAUDE_COMMAND_NAMES: tuple[str, ...] = (
     "bug-bounty-plan",
     "bug-bounty-report",
     "detection-rule-factory",
+    "threattrace-live",
 )
 
 _CLAUDE_SKILL_NAMES: tuple[str, ...] = ("detection-engineering",)
