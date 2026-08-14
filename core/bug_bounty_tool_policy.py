@@ -107,8 +107,9 @@ REASON_CODES = (
 # Fixed, hardcoded tool catalog. `implemented` is the single honest
 # source of truth for "can this actually run today" -- it is never
 # inferred from `risk_level`/`category`, and never overridden by a
-# caller. Only `http_assessor` is `True` in this checkpoint; every
-# other tool_id is a declared, not-yet-built capability.
+# caller. `http_assessor`, `nmap`, and `nuclei` are `True` as of Block
+# 15G-B (see `adapters.bug_bounty_nmap`/`adapters.bug_bounty_nuclei`);
+# every other tool_id remains a declared, not-yet-built capability.
 # ---------------------------------------------------------------------------
 
 _TOOL_CATALOG_ENTRIES: tuple[dict[str, Any], ...] = (
@@ -119,12 +120,12 @@ _TOOL_CATALOG_ENTRIES: tuple[dict[str, Any], ...] = (
     },
     {
         "tool_id": "nmap", "category": "network_recon", "risk_level": "low",
-        "implemented": False, "requires_human_approval": False,
+        "implemented": True, "requires_human_approval": False,
         "supports_authentication": False, "state_changing_capability": False,
     },
     {
         "tool_id": "nuclei", "category": "web_dast", "risk_level": "medium",
-        "implemented": False, "requires_human_approval": False,
+        "implemented": True, "requires_human_approval": False,
         "supports_authentication": False, "state_changing_capability": False,
     },
     {

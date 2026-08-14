@@ -72,9 +72,12 @@ class TestToolCatalogSanity:
             "authenticated_testing", "controlled_validation",
         }
 
-    def test_002_only_http_assessor_implemented(self):
+    def test_002_http_assessor_nmap_nuclei_implemented(self):
+        # As of Block 15G-B, http_assessor, nmap, and nuclei have real
+        # adapters; zap/burp_dast/authenticated_testing/controlled_validation
+        # remain declared-but-not-yet-built.
         for tool_id, entry in TOOL_CATALOG.items():
-            expected = tool_id == "http_assessor"
+            expected = tool_id in {"http_assessor", "nmap", "nuclei"}
             assert entry["implemented"] is expected, tool_id
 
     def test_003_catalog_entries_have_required_fields(self):
@@ -491,7 +494,9 @@ class TestScope:
 
 
 class TestAdapterAvailability:
-    @pytest.mark.parametrize("tool_id", sorted(TOOL_IDS - {"http_assessor"}))
+    # http_assessor, nmap, and nuclei gained real adapters in Block 15G-B;
+    # the remaining four tool_ids are still declared-but-not-yet-built.
+    @pytest.mark.parametrize("tool_id", sorted(TOOL_IDS - {"http_assessor", "nmap", "nuclei"}))
     def test_066_unimplemented_tools_report_adapter_unavailable(self, tool_id):
         permissions = _permissions(
             testing_profile="controlled_validation", allowed_tools=list(TOOL_IDS),
@@ -507,9 +512,10 @@ class TestAdapterAvailability:
     def test_067_permitted_analyst_but_unavailable_adapter_never_executes(self):
         # analyst_permitted True, profile_permitted True, everything else
         # in scope -- still never executable, because the adapter does
-        # not exist yet. This is the core Section 5 guarantee.
-        permissions = _permissions(testing_profile="recon", allowed_tools=["http_assessor", "nmap"])
-        request = _tool_request(tool_id="nmap", testing_mode="recon", ports=[3000])
+        # not exist yet. This is the core Section 5 guarantee. zap has no
+        # adapter as of Block 15G-B (only nmap/nuclei were added).
+        permissions = _permissions(testing_profile="safe_dast", allowed_tools=["http_assessor", "zap"])
+        request = _tool_request(tool_id="zap", testing_mode="safe_dast")
         result = evaluate_tool_permission(permissions=permissions, tool_request=request)
         assert result["analyst_permitted"] is True
         assert result["profile_permitted"] is True
@@ -517,8 +523,24 @@ class TestAdapterAvailability:
         assert result["execution_permitted"] is False
         assert result["execution_performed"] is False
 
-    def test_068_http_assessor_is_the_only_fully_executable_tool(self):
+    def test_068_http_assessor_nmap_and_nuclei_are_fully_executable(self):
         result = evaluate_tool_permission(permissions=_permissions(), tool_request=_tool_request())
+        assert result["adapter_available"] is True
+        assert result["execution_permitted"] is True
+        assert result["execution_performed"] is False
+
+        permissions = _permissions(
+            testing_profile="recon", allowed_tools=["http_assessor", "nmap"], allowed_ports=[3000],
+        )
+        request = _tool_request(tool_id="nmap", testing_mode="recon", ports=[3000])
+        result = evaluate_tool_permission(permissions=permissions, tool_request=request)
+        assert result["adapter_available"] is True
+        assert result["execution_permitted"] is True
+        assert result["execution_performed"] is False
+
+        permissions = _permissions(testing_profile="safe_dast", allowed_tools=["http_assessor", "nuclei"])
+        request = _tool_request(tool_id="nuclei", testing_mode="safe_dast")
+        result = evaluate_tool_permission(permissions=permissions, tool_request=request)
         assert result["adapter_available"] is True
         assert result["execution_permitted"] is True
         assert result["execution_performed"] is False
@@ -615,3 +637,18 @@ class TestDeterminismAndImmutability:
         result = evaluate_tool_permission(permissions=permissions, tool_request=request)
         assert result["execution_permitted"] is False
         assert len(result["reason_codes"]) > 0
+
+
+# ---------------------------------------------------------------------------
+# Block 15G-B: nmap/nuclei adapter catalog flip.
+# ---------------------------------------------------------------------------
+
+
+class TestBlock15GBAdapterFlip:
+    def test_081_nmap_and_nuclei_now_implemented(self):
+        assert TOOL_CATALOG["nmap"]["implemented"] is True
+        assert TOOL_CATALOG["nuclei"]["implemented"] is True
+
+    def test_082_remaining_tools_still_unimplemented(self):
+        for tool_id in ("zap", "burp_dast", "authenticated_testing", "controlled_validation"):
+            assert TOOL_CATALOG[tool_id]["implemented"] is False

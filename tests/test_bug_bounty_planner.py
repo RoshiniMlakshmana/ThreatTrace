@@ -384,15 +384,15 @@ class TestPolicyStatusDerivation:
         assert result["overall_execution_ready"] is True
 
     def test_047_analyst_denied_tool_is_blocked(self):
-        # nuclei is analyst-denied here AND has no adapter yet -- since
-        # adapter availability is checked independently of every other
-        # reason, ADAPTER_UNAVAILABLE is the honest status (it can't run
-        # regardless of analyst permission). A pure "denied but otherwise
-        # runnable" BLOCKED status is exercised in test_047b below using
-        # scope (not tool-selection) as the sole blocker on the one
-        # implemented tool.
+        # zap is analyst-denied here AND has no adapter yet (Block 15G-B
+        # implemented nmap/nuclei only) -- since adapter availability is
+        # checked independently of every other reason, ADAPTER_UNAVAILABLE
+        # is the honest status (it can't run regardless of analyst
+        # permission). A pure "denied but otherwise runnable" BLOCKED
+        # status is exercised in test_047b below using scope (not
+        # tool-selection) as the sole blocker on an implemented tool.
         permissions = _permissions(testing_profile="safe_dast", allowed_tools=["http_assessor"])
-        step = _step(tool_request=_tool_request(tool_id="nuclei", testing_mode="safe_dast"))
+        step = _step(tool_request=_tool_request(tool_id="zap", testing_mode="safe_dast"))
         result = validate_bug_bounty_plan(plan=_plan(step), permissions=permissions)
         assert result["steps"][0]["policy_status"] == "ADAPTER_UNAVAILABLE"
         assert "TOOL_NOT_ALLOWED" in result["steps"][0]["reason_codes"]
@@ -408,8 +408,11 @@ class TestPolicyStatusDerivation:
         assert result["overall_execution_ready"] is False
 
     def test_048_adapter_unavailable_status(self):
-        permissions = _permissions(testing_profile="recon", allowed_tools=["http_assessor", "nmap"])
-        step = _step(tool_request=_tool_request(tool_id="nmap", testing_mode="recon", ports=[3000]))
+        # burp_dast has no adapter yet (Block 15G-B implemented nmap/nuclei
+        # only) -- an otherwise fully-permitted step still reports
+        # ADAPTER_UNAVAILABLE honestly.
+        permissions = _permissions(testing_profile="safe_dast", allowed_tools=["http_assessor", "burp_dast"])
+        step = _step(tool_request=_tool_request(tool_id="burp_dast", testing_mode="safe_dast"))
         result = validate_bug_bounty_plan(plan=_plan(step), permissions=permissions)
         assert result["steps"][0]["policy_status"] == "ADAPTER_UNAVAILABLE"
 
