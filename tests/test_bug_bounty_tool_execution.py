@@ -16,6 +16,7 @@ from core.bug_bounty_tool_execution import (
     BugBountyToolExecutionError,
     execute_bug_bounty_tool,
 )
+from core.security_governor import evaluate_security_governor_event
 
 
 def _permissions(**overrides):
@@ -440,3 +441,62 @@ class TestOutputContract:
         )
         assert permissions == permissions_snapshot
         assert request == request_snapshot
+
+
+# ---------------------------------------------------------------------------
+# Block 15G-B.2: real end-to-end integration with the new
+# "bug_bounty_assessment" Governor operational stage -- these two tests
+# call the real evaluate_security_governor_event (not a hand-built dict)
+# to prove the actual cross-module wiring works, not just the shape
+# contract the tests above already cover.
+# ---------------------------------------------------------------------------
+
+
+def _real_bug_bounty_governor_event(**overrides):
+    event = {
+        "event_version": "1", "actor_role": "bug_bounty", "action_class": "execution_request",
+        "current_stage": "bug_bounty_assessment", "required_role": "bug_bounty",
+        "gateway_decision": "allow", "identity_decision": "allow", "mutation_freeze_active": False,
+        "approval_state": "approved", "decision_binding_state": "valid", "scope_state": "within_scope",
+        "source_truth_state": "unchanged", "remote_content_state": "not_present", "audit_state": "recorded",
+        "prior_policy_denials": 0, "execution_requested": True,
+    }
+    event.update(overrides)
+    return event
+
+
+class TestRealGovernorIntegration:
+    def test_028_real_bug_bounty_assessment_allow_plus_real_policy_allow_permits_adapter(self, monkeypatch):
+        import core.bug_bounty_tool_execution as execution_module
+        monkeypatch.setattr(execution_module, "run_nmap_scan", lambda **kw: _fake_nmap_result())
+
+        real_governor_result = evaluate_security_governor_event(event=_real_bug_bounty_governor_event())
+        assert real_governor_result["execution_allowed"] is True  # sanity on the Governor call itself
+
+        result = execute_bug_bounty_tool(
+            permissions=_permissions(), tool_request=_tool_request(), governor_result=real_governor_result,
+            execution_config=_execution_config(),
+        )
+        assert result["execution_permitted"] is True
+        assert result["execution_blocked_reason"] is None
+        assert result["tool_result"] is not None
+
+    def test_029_real_governor_block_still_prevents_adapter_invocation(self, monkeypatch):
+        # Wrong role for this stage -- a real, honestly-evaluated block,
+        # not a hand-built one. No source-of-truth shortcut was taken.
+        import core.bug_bounty_tool_execution as execution_module
+        spy = {"called": False}
+        monkeypatch.setattr(execution_module, "run_nmap_scan", lambda **kw: spy.update(called=True))
+
+        real_governor_result = evaluate_security_governor_event(
+            event=_real_bug_bounty_governor_event(actor_role="red_team", required_role="red_team"),
+        )
+        assert real_governor_result["decision"] == "block"
+
+        result = execute_bug_bounty_tool(
+            permissions=_permissions(), tool_request=_tool_request(), governor_result=real_governor_result,
+            execution_config=_execution_config(),
+        )
+        assert result["execution_permitted"] is False
+        assert result["execution_blocked_reason"] == "GOVERNOR_DENIED"
+        assert spy["called"] is False

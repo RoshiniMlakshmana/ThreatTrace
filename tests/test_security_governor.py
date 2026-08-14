@@ -16,6 +16,7 @@ import pytest
 from core.security_governor import (
     ACTION_CLASSES,
     REASON_CODES,
+    REQUIRED_ROLE_BY_STAGE,
     ROLES,
     STAGES,
     SecurityGovernorError,
@@ -609,4 +610,146 @@ class TestNeverExecutes:
 
     def test_085_execution_performed_false_even_on_block(self):
         result = evaluate_security_governor_event(event=_event(gateway_decision="deny"))
+        assert result["execution_performed"] is False
+
+
+# ---------------------------------------------------------------------------
+# Block 15G-B.2: the "bug_bounty_assessment" Governor operational stage.
+#
+# Before this checkpoint, "bug_bounty" was a declared ROLES value with no
+# stage mapped to it in REQUIRED_ROLE_BY_STAGE, so any honestly-constructed
+# event with actor_role="bug_bounty" always hit STAGE_BYPASS_ATTEMPT and/or
+# ROLE_SCOPE_VIOLATION regardless of every other field being legitimate --
+# a real gap, not a deliberate policy. These tests cover the fix (items
+# A-M from the Block 15G-B.2 task) without loosening any pre-existing rule.
+# ---------------------------------------------------------------------------
+
+
+def _bug_bounty_event(**overrides):
+    base = {
+        "actor_role": "bug_bounty",
+        "action_class": "execution_request",
+        "current_stage": "bug_bounty_assessment",
+        "required_role": "bug_bounty",
+        "approval_state": "approved",
+        "decision_binding_state": "valid",
+        "execution_requested": True,
+    }
+    base.update(overrides)
+    return _event(**base)
+
+
+class TestBugBountyAssessmentStage:
+    def test_086_honest_bug_bounty_event_no_stage_or_role_violation(self):
+        # A -- correct role/stage/otherwise-safe state produces neither
+        # STAGE_BYPASS_ATTEMPT nor ROLE_SCOPE_VIOLATION, and allows.
+        result = evaluate_security_governor_event(event=_bug_bounty_event())
+        assert "STAGE_BYPASS_ATTEMPT" not in result["reason_codes"]
+        assert "ROLE_SCOPE_VIOLATION" not in result["reason_codes"]
+        assert result["decision"] == "allow"
+        assert result["execution_allowed"] is True
+
+    def test_087_wrong_role_at_bug_bounty_assessment_blocks(self):
+        # B -- an actor claiming a different role at this stage still
+        # violates role scope, exactly like every other stage.
+        result = evaluate_security_governor_event(
+            event=_bug_bounty_event(actor_role="red_team", required_role="red_team")
+        )
+        assert result["decision"] == "block"
+        assert "ROLE_SCOPE_VIOLATION" in result["reason_codes"]
+
+    def test_088_bug_bounty_role_at_red_validation_still_blocks(self):
+        # C -- bug_bounty must not be usable to enter a Handoff-owned
+        # stage it does not belong to; this is not "independently allowed"
+        # anywhere in the existing contract.
+        result = evaluate_security_governor_event(
+            event=_bug_bounty_event(current_stage="red_validation", required_role="red_team")
+        )
+        assert result["decision"] == "block"
+        assert "ROLE_SCOPE_VIOLATION" in result["reason_codes"]
+
+    def test_089_scope_expansion_during_bug_bounty_assessment_blocks(self):
+        # D -- the existing scope rule applies unchanged at this stage.
+        result = evaluate_security_governor_event(
+            event=_bug_bounty_event(scope_state="expansion_attempt")
+        )
+        assert result["decision"] == "block"
+        assert "SCOPE_EXPANSION_ATTEMPT" in result["reason_codes"]
+
+    def test_090_untrusted_remote_content_adopted_as_instruction_blocks(self):
+        # E -- the prompt-injection boundary applies unchanged; a Bug
+        # Bounty target's remote content is untrusted evidence, never an
+        # instruction, exactly as documented throughout core.bug_bounty_*.
+        result = evaluate_security_governor_event(
+            event=_bug_bounty_event(remote_content_state="adopted_as_instruction")
+        )
+        assert result["decision"] == "block"
+        assert "UNTRUSTED_CONTENT_INSTRUCTION_ATTEMPT" in result["reason_codes"]
+
+    def test_091_source_truth_modification_at_bug_bounty_assessment_freezes(self):
+        # F -- mutation/source-truth semantics preserved unchanged.
+        result = evaluate_security_governor_event(
+            event=_bug_bounty_event(source_truth_state="modification_attempted")
+        )
+        assert result["decision"] == "freeze"
+        assert "SOURCE_TRUTH_MODIFICATION" in result["reason_codes"]
+
+    def test_092_approval_missing_at_bug_bounty_assessment_blocks(self):
+        # G -- approval requirements preserved unchanged for an
+        # execution_request.
+        result = evaluate_security_governor_event(
+            event=_bug_bounty_event(approval_state="pending")
+        )
+        assert result["decision"] == "block"
+        assert "APPROVAL_REQUIRED" in result["reason_codes"]
+        assert result["execution_allowed"] is False
+
+    def test_093_decision_binding_missing_at_bug_bounty_assessment_blocks(self):
+        # H -- Decision Binding requirement preserved unchanged.
+        result = evaluate_security_governor_event(
+            event=_bug_bounty_event(decision_binding_state="missing")
+        )
+        assert result["decision"] == "block"
+        assert "DECISION_BINDING_REQUIRED" in result["reason_codes"]
+
+    def test_094_audit_bypass_at_bug_bounty_assessment_freezes(self):
+        # I -- audit requirement preserved unchanged.
+        result = evaluate_security_governor_event(
+            event=_bug_bounty_event(audit_state="bypass_attempted")
+        )
+        assert result["decision"] == "freeze"
+        assert "AUDIT_BYPASS_ATTEMPT" in result["reason_codes"]
+
+    def test_095_repeated_policy_denial_at_bug_bounty_assessment_escalates(self):
+        # J -- repeated-denial escalation preserved unchanged.
+        result = evaluate_security_governor_event(
+            event=_bug_bounty_event(prior_policy_denials=3, scope_state="expansion_attempt")
+        )
+        assert result["decision"] == "freeze"
+        assert "REPEATED_POLICY_DENIAL" in result["reason_codes"]
+
+    def test_096_all_preexisting_handoff_stage_mappings_unchanged(self):
+        # K -- adding bug_bounty_assessment must not alter any of the six
+        # original Handoff-aligned stage mappings.
+        assert REQUIRED_ROLE_BY_STAGE["threat_intel_review"] == "threat_intelligence"
+        assert REQUIRED_ROLE_BY_STAGE["threat_hunt"] == "threat_hunting"
+        assert REQUIRED_ROLE_BY_STAGE["detection_engineering"] == "blue_team"
+        assert REQUIRED_ROLE_BY_STAGE["red_validation"] == "red_team"
+        assert REQUIRED_ROLE_BY_STAGE["purple_remediation"] == "purple_ir"
+        assert REQUIRED_ROLE_BY_STAGE["human_review"] == "human_analyst"
+        assert REQUIRED_ROLE_BY_STAGE["bug_bounty_assessment"] == "bug_bounty"
+        assert len(REQUIRED_ROLE_BY_STAGE) == 7
+        assert STAGES == {
+            "threat_intel_review", "threat_hunt", "detection_engineering", "red_validation",
+            "purple_remediation", "human_review", "bug_bounty_assessment",
+        }
+
+    def test_097_bug_bounty_assessment_result_observable_only_true(self):
+        # L
+        result = evaluate_security_governor_event(event=_bug_bounty_event())
+        assert result["observable_only"] is True
+
+    def test_098_bug_bounty_assessment_result_execution_performed_false(self):
+        # M -- true even for the allowing case.
+        result = evaluate_security_governor_event(event=_bug_bounty_event())
         assert result["execution_performed"] is False

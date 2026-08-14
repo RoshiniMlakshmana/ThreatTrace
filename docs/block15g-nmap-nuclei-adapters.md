@@ -1,8 +1,11 @@
 # Block 15G-B — Nmap + Nuclei Tool Adapters
 
-Status: implemented and validated. Not committed. `nmap`/`nuclei` were not
-installed in the development environment this block was built in, so live
-execution has not been observed — see §23.
+Status: implemented and validated. Not committed. As of Block 15G-B.2,
+`nmap` 7.991 and `nuclei` v3.11.1 are installed, the `bug_bounty_assessment`
+Governor gap is closed (§4 below, and `core.security_governor`'s own
+"Governor operational stage vs. Security Handoff stage" docstring
+section), and both adapters have completed real, successful live scans
+against the local Juice Shop container via `execute_bug_bounty_tool`.
 
 ## 1. Purpose
 
@@ -71,6 +74,23 @@ outright; the module checks both explicitly rather than relying on that
 invariant. **This module never calls `evaluate_security_governor_event`
 itself and never fabricates a passing result** — the caller must already
 have obtained one from a real Governor evaluation.
+
+**Block 15G-B.2 update:** the first real end-to-end validation attempt
+(against real, installed Nmap/Nuclei binaries) discovered that no
+honestly-constructed Governor event for `actor_role: "bug_bounty"` could
+ever pass — `core.security_governor`'s stage/role vocabulary had no
+stage mapped to the `bug_bounty` role it already declared, so every such
+event hit `STAGE_BYPASS_ATTEMPT`/`ROLE_SCOPE_VIOLATION` regardless of
+being otherwise legitimate. Block 15G-B.2 closed this gap by adding a
+`bug_bounty_assessment` **Governor operational stage** (→
+`required_role: "bug_bounty"`) to `core.security_governor.STAGES`/
+`REQUIRED_ROLE_BY_STAGE` — see that module's own docstring section
+"Governor operational stage vs. Security Handoff stage" for the full
+rationale. Nothing about approval, Decision Binding, mutation freeze,
+scope, source-truth protection, the untrusted-remote-content boundary,
+or audit requirements was changed or exempted for Bug Bounty — the gap
+was purely "no stage existed to evaluate it under," not a missing
+exemption.
 
 ## 5. Execution boundary
 

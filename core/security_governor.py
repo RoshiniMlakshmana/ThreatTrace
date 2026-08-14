@@ -26,6 +26,50 @@ this module returns -- never a daemon, never something this module
 enacts. `execution_performed` is always `False`; this module never
 executes a tool, calls MCP, contacts Supabase, or performs any I/O.
 
+## Governor operational stage vs. Security Handoff stage (Block 15G-B.2)
+
+`core.security_governor.STAGES` and `core.security_handoff.STAGES` are
+two **deliberately separate** closed vocabularies -- this module never
+imports the other's, exactly as documented above. They represent two
+different abstractions, and this checkpoint's one new stage,
+`"bug_bounty_assessment"`, makes that distinction load-bearing for the
+first time:
+
+- A **Security Handoff stage** (`core.security_handoff.STAGES`) is a
+  narrower, six-stage *defensive workflow state machine* a finding case
+  advances through: threat-intel review, threat hunt, detection
+  engineering, Red validation, Purple remediation, human review. It is
+  unchanged by this checkpoint and remains exactly those six stages --
+  `"bug_bounty_assessment"` is never added there.
+- A **Governor operational stage** (`core.security_governor.STAGES`) is
+  the broader set of situations the Governor can evaluate an observable
+  action against. It is not required to mirror the Handoff's workflow.
+  `"bug_bounty_assessment"` is a Governor operational stage the Handoff
+  has no equivalent of: bounded, analyst-approved Bug Bounty tool
+  execution (`core.bug_bounty_tool_execution`) happens **before** any
+  Handoff case necessarily exists -- a Bug Bounty run is often exactly
+  what produces the Block 15A finding a Handoff case would later be
+  created from. The Governor supervises this pre-Handoff activity using
+  its own stage, without pretending the Handoff has such a stage, and
+  without forcing Bug Bounty execution to masquerade as `red_validation`
+  or any other Handoff-owned stage/role it does not actually belong to.
+
+`"bug_bounty_assessment"` maps to `required_role: "bug_bounty"` in
+`REQUIRED_ROLE_BY_STAGE` below -- the same `"bug_bounty"` value `ROLES`
+already declared since this module's original checkpoint, but which no
+stage previously mapped to. Before this checkpoint, that meant no
+honestly-constructed event with `actor_role: "bug_bounty"` could ever
+avoid `STAGE_BYPASS_ATTEMPT`/`ROLE_SCOPE_VIOLATION` at *any* stage --
+not a deliberate policy (Bug Bounty execution was never meant to be
+permanently ungovernable), but a real gap this checkpoint closes. Every
+other rule -- gateway/identity denial, mutation freeze, scope expansion,
+source-truth protection, the untrusted-remote-content boundary, audit
+requirements, Decision Binding, approval requirements, repeated-denial
+escalation -- applies to a `bug_bounty_assessment` event exactly as it
+does to every other stage. Nothing about Bug Bounty is exempted from any
+existing rule; the only thing that changed is that a legitimate stage
+now exists for it to be evaluated *under*.
+
 ## Remote content and role-generated text are untrusted data
 
 `remote_content_state` describes only a caller-asserted classification
@@ -84,7 +128,10 @@ ACTION_CLASSES = frozenset({
 # A Governor's own private copy of the Block 15C stage graph -- deliberately
 # never imported from core.security_handoff, exactly like every other
 # closely-related pair of modules in this project owns its own copy of a
-# shared shape rather than sharing one.
+# shared shape rather than sharing one. "bug_bounty_assessment" (Block
+# 15G-B.2) is a Governor-only operational stage with no Security Handoff
+# equivalent -- see the module docstring's "Governor operational stage
+# vs. Security Handoff stage" section.
 STAGES = frozenset({
     "threat_intel_review",
     "threat_hunt",
@@ -92,12 +139,14 @@ STAGES = frozenset({
     "red_validation",
     "purple_remediation",
     "human_review",
+    "bug_bounty_assessment",
 })
 
 REQUIRED_ROLE_BY_STAGE: Mapping[str, str] = MappingProxyType({
     "threat_intel_review": "threat_intelligence",
     "threat_hunt": "threat_hunting",
     "detection_engineering": "blue_team",
+    "bug_bounty_assessment": "bug_bounty",
     "red_validation": "red_team",
     "purple_remediation": "purple_ir",
     "human_review": "human_analyst",
