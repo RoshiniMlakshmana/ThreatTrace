@@ -1,0 +1,92 @@
+{
+  "summary_version": "1",
+  "block": "17A",
+  "commit_validated": "494cde16758b7ff5af918768a559732691e1d31a",
+  "environment": {
+    "os": "Windows",
+    "python": "3.13",
+    "docker_version": "29.3.1",
+    "target": "http://localhost:3000/",
+    "target_bind": "127.0.0.1:3000",
+    "zap_bind": "127.0.0.1:8080",
+    "zap_version": "2.17.0"
+  },
+  "tool_readiness": {
+    "http_assessor": {"state": "ready", "version": null},
+    "nmap": {"state": "ready", "version": "7.991", "note": "not on session PATH by default; confirmed via known absolute install path"},
+    "nuclei": {"state": "missing", "version": null, "note": "binary disappeared from disk mid-session; confirmed v3.11.1 earlier in the same session"},
+    "nuclei_templates": {"state": "ready"},
+    "docker": {"state": "ready", "version": "29.3.1"},
+    "zap": {"state": "ready", "version": "2.17.0"},
+    "burp_dast": {"state": "not_configured"}
+  },
+  "bug_bounty": {
+    "multi_tool_run": {
+      "tools_requested": ["http_assessor", "nmap", "nuclei", "zap"],
+      "tools_executed": ["http_assessor", "nmap", "zap"],
+      "tools_unavailable": ["nuclei"],
+      "raw_observation_count": 11,
+      "normalized_evidence_count": 11,
+      "correlation_groups": 9,
+      "duplicate_evidence_count": 0,
+      "canonical_finding_count": 7,
+      "informational_observation_count": 2,
+      "severity_breakdown": {"low": 5, "medium": 2, "high": 0, "critical": 0},
+      "multi_tool_corroborated_finding_count": 1,
+      "canonical_finding_ids": [
+        "CF-9e27db3adaf4d2cb", "CF-bdb6a8ba8a52c3de", "CF-d18b7480c3c37926",
+        "CF-5c54c603315c1ec9", "CF-19d2ce40de40dc2b", "CF-a25fd8be25dee568", "CF-1d32771ce4746417"
+      ]
+    },
+    "live_platform_run": {
+      "run_id": "RUN-6e9b191e746ced9981b023aaacc66c8e",
+      "status": "completed",
+      "event_count": 15,
+      "governor_decision": "allow",
+      "canonical_finding_count": 3
+    },
+    "bug_bounty_to_detection_feasibility": {
+      "source_finding_id": "CF-9e27db3adaf4d2cb",
+      "telemetry_decision": "TELEMETRY_GAP",
+      "rules_proposed": 0
+    }
+  },
+  "threat_intelligence": {
+    "sources_queried": ["cisa_kev", "nvd", "epss"],
+    "records_retrieved": {"cisa_kev": 10, "nvd": 5, "epss": 1},
+    "trigger_cve": "CVE-2026-8037",
+    "trigger_title": "Progress LoadMaster Command Injection Vulnerability",
+    "nvd_match_found": false,
+    "corroboration_state": "conflicting",
+    "corroboration_note": "KEV known_exploited=true vs EPSS known_exploited=false on the same CVE; expected deterministic model behavior"
+  },
+  "detection_engineering": {
+    "run_id": "RUN-b65a2b9f175932d765d8825daa406eed",
+    "status": "completed",
+    "event_count": 13,
+    "telemetry_decision": "GENERATE_RULE",
+    "governor_decision": "allow",
+    "rules_generated": 2,
+    "rules_rejected": 0,
+    "formats_generated": ["sigma", "splunk_spl"],
+    "generic_rule_count": 2,
+    "context_tuned_rule_count": 1,
+    "validation_status_distribution": {"syntax_validated": 2},
+    "deployment_state_distribution": {"NOT_DEPLOYED": 2},
+    "human_approval_state_distribution": {"pending": 2}
+  },
+  "governor_negative_validation": {
+    "role_scope_violation": {"decision": "block", "execution_allowed": false, "reason_code": "ROLE_SCOPE_VIOLATION"},
+    "scope_expansion_attempt": {"decision": "block", "execution_allowed": false, "reason_code": "SCOPE_EXPANSION_ATTEMPT"},
+    "untrusted_content_adopted": {"decision": "block", "execution_allowed": false, "reason_code": "UNTRUSTED_CONTENT_INSTRUCTION_ATTEMPT"}
+  },
+  "testing": {
+    "full_regression_passed": 7391,
+    "full_regression_skipped": 1,
+    "full_regression_failed": 0
+  },
+  "no_claims_made": [
+    "mttd_reduction", "soc_efficiency_improvement", "false_positive_reduction",
+    "causal_effectiveness", "production_accuracy"
+  ]
+}
