@@ -426,10 +426,21 @@ function renderPipeline(run) {
   }
 }
 
+// awaiting_human_review is a real, stable, non-terminal RUN_STATUSES
+// value (backend.models.RUN_STATUSES) -- a run sitting there is neither
+// "finished" nor genuinely "running" (tool_execution is long over), so
+// it gets its own honest duration-state label instead of falling into
+// the generic "running" bucket that only fits an in-progress run.
+function durationState(run) {
+  if (run.started_at && run.completed_at) return "finished";
+  if (run.status === "awaiting_human_review") return "awaiting review";
+  return run.started_at ? "running" : "not started";
+}
+
 function renderStatus(run) {
   const body = el("status-body");
   if (!run) { body.innerHTML = '<div class="empty">No active run.</div>'; return; }
-  const duration = run.started_at && run.completed_at ? "finished" : (run.started_at ? "running" : "not started");
+  const duration = durationState(run);
   body.innerHTML = `
     <div class="row"><span class="k">Run ID</span><span>${esc(run.run_id)}</span></div>
     <div class="row"><span class="k">Type</span><span>${esc(run.run_type)}</span></div>
@@ -896,6 +907,29 @@ function handleEvent(event) {
     refreshSelectedRun();
     refreshRunList();
   }
+  // A Full Security Lifecycle run reaches "awaiting_human_review", which
+  // is intentionally NON-terminal -- backend.orchestrator.
+  // run_security_lifecycle_workflow writes run.lifecycle and each
+  // per-finding sub-stage result incrementally, well before any of the
+  // terminal events above ever fire (they may never fire at all until a
+  // human records a review). Without refreshing on these real,
+  // already-in-EVENT_TYPES lifecycle events too, the dashboard's local
+  // run object goes stale the moment downstream lifecycle work starts,
+  // even though the backend already has real data to show. Deliberately
+  // NOT every event type here (e.g. tool_started/tool_completed) --
+  // only the ones that actually change authoritative run-level state.
+  if ([
+    "context_prioritized",
+    "threat_intel_review_completed",
+    "threat_hunt_completed",
+    "detection_engineering_completed",
+    "red_validation_completed",
+    "purple_remediation_completed",
+    "human_review_required",
+    "human_review_recorded",
+  ].includes(event.event_type)) {
+    refreshSelectedRun();
+  }
 }
 
 async function refreshSelectedRun() {
@@ -909,7 +943,14 @@ async function refreshSelectedRun() {
     renderDetection(run);
     renderAttackSurface(run);
     renderLifecycle(run);
-    if (TERMINAL.has(run.status)) loadEvaluation(currentRunId);
+    // core.bug_bounty_juice_shop_evaluation.evaluate_bug_bounty_run_against_
+    // juice_shop_benchmark (which GET /api/runs/{id}/evaluation calls
+    // directly) gates purely on run.report being present -- it does not
+    // require run.status to be terminal. Gating this frontend call on
+    // TERMINAL.has(run.status) hid a real, already-computable evaluation
+    // for any run sitting at the real, non-terminal "awaiting_human_review"
+    // status once its Bug Bounty phase (and therefore its report) was done.
+    if (run.report) loadEvaluation(currentRunId);
     else renderEvaluation(null);
   } catch (e) { /* run may have been evicted; ignore */ }
 }

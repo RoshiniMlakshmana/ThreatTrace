@@ -156,12 +156,14 @@ class TestEventSourceWiring:
     def test_011_terminal_event_triggers_authoritative_refresh(self, dashboard_html):
         # run_completed (and the other terminal types) must trigger a
         # fresh GET /api/runs/{id} (via refreshSelectedRun) and, since
-        # that call checks TERMINAL.has(run.status), a fresh
-        # GET /api/runs/{id}/evaluation (via loadEvaluation) -- never
-        # stale client-side state after completion.
+        # that call checks run.report (not run status terminality --
+        # core.bug_bounty_juice_shop_evaluation gates purely on report
+        # presence), a fresh GET /api/runs/{id}/evaluation (via
+        # loadEvaluation) -- never stale client-side state after
+        # completion.
         assert '["run_completed","run_blocked","run_failed","run_cancelled"].includes(event.event_type)' in dashboard_html
         assert "refreshSelectedRun();" in dashboard_html
-        assert "if (TERMINAL.has(run.status)) loadEvaluation(currentRunId);" in dashboard_html
+        assert "if (run.report) loadEvaluation(currentRunId);" in dashboard_html
 
 
 class TestNoHardcodedFakeData:
@@ -617,7 +619,219 @@ class TestSSEFixPreservation:
     def test_M4_terminal_refresh_still_wired(self, dashboard_html):
         assert '["run_completed","run_blocked","run_failed","run_cancelled"].includes(event.event_type)' in dashboard_html
         assert "refreshSelectedRun();" in dashboard_html
-        assert "if (TERMINAL.has(run.status)) loadEvaluation(currentRunId);" in dashboard_html
+        assert "if (run.report) loadEvaluation(currentRunId);" in dashboard_html
 
     def test_M5_observed_event_types_populated_from_every_event(self, dashboard_html):
         assert "observedEventTypes.add(event.event_type);" in dashboard_html
+
+
+class TestLifecycleRefreshFix:
+    """Regression tests for the Full Security Lifecycle dashboard
+    synchronization defect: a run that reached the real, non-terminal
+    "awaiting_human_review" status went stale on-screen because
+    handleEvent() only ever called refreshSelectedRun() for the four
+    Bug-Bounty-only terminal event types, and refreshSelectedRun()
+    itself only loaded evaluation data when run.status was terminal.
+    Both gates are now driven by real backend signals (the actual
+    lifecycle event vocabulary, and run.report presence) instead of
+    Bug-Bounty-only terminality."""
+
+    def _lifecycle_result(self, *, finding_id="CF-1", ti_outcome="no_relevant_intel",
+                           hunt_outcome="telemetry_gap", detection_outcome="not_applicable",
+                           red_outcome="controlled_validation_unavailable",
+                           purple_outcome="recommendation_created", approval_state="pending"):
+        return {
+            "finding_id": finding_id,
+            "ti_result": {"outcome": ti_outcome},
+            "hunt_result": {"outcome": hunt_outcome},
+            "detection_result": {"outcome": detection_outcome},
+            "red_validation_result": {"outcome": red_outcome},
+            "purple_result": {"outcome": purple_outcome, "recommendations": ["Add a documented mitigation."]},
+            "case": {"case_id": f"SH-{finding_id}", "approval_state": approval_state},
+        }
+
+    def _awaiting_review_run(self, results=None, **overrides):
+        results = results if results is not None else [self._lifecycle_result()]
+        base = {
+            "run_id": "RUN-test", "run_type": "bug_bounty", "status": "awaiting_human_review",
+            "current_stage": "human_review", "human_review_required": True,
+            "started_at": "2026-08-16T21:22:20Z", "completed_at": None,
+            "report": {"canonical_findings": []},
+            "attack_surface": {
+                "status": "completed",
+                "attack_surface_summary": {"endpoint_count": 3, "parameter_count": 1, "form_count": 0, "api_endpoint_count": 2},
+                "telemetry": {}, "endpoints": [], "parameters": [],
+            },
+            "lifecycle": {
+                "lifecycle_version": "1", "context_label": "demo/research context",
+                "total_canonical_findings": len(results), "findings_selected": [r["finding_id"] for r in results],
+                "selection_reason": "highest priority_score.final", "results": results,
+            },
+        }
+        base.update(overrides)
+        return base
+
+    def _fetch_after_event(self, dashboard_script, run, event_type):
+        """Sets currentRunId, stubs fetch to record every URL requested
+        and to serve `run` for GET /api/runs/{id}, calls the real
+        handleEvent(event) (which is fire-and-forget for
+        refreshSelectedRun, exactly as in the live dashboard), waits one
+        macrotask for any triggered async refresh to actually run its
+        fetch, and returns the list of requested URLs."""
+        # Written directly for _run_node (not _eval_js): this needs a real
+        # `await` before printing, which a JSON.stringify(<expression>)
+        # wrapper around a Promise cannot provide -- console.log would
+        # otherwise fire before the awaited setTimeout resolves.
+        script = _NODE_STUBS + dashboard_script + f"""
+(async function() {{
+    let calls = [];
+    global.fetch = async (url) => {{
+        calls.push(url);
+        if (String(url).includes('/evaluation')) {{
+            return {{ ok: true, json: async () => ({{ evaluation_state: "evaluated" }}) }};
+        }}
+        return {{ ok: true, json: async () => ({json.dumps(run)}) }};
+    }};
+    // Let the page's own bootstrap (checkHealth/loadSystemInfo/
+    // refreshRunList, called at the bottom of the real script) settle
+    // first, while currentRunId is still null -- loadSystemInfo() itself
+    // conditionally fetches /api/runs/{{currentRunId}} when a run is
+    // already selected, which would otherwise be indistinguishable from
+    // a refresh genuinely triggered by handleEvent below.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    calls = [];
+    currentRunId = "RUN-test";
+    handleEvent({{
+        event_type: {json.dumps(event_type)}, timestamp: "2026-08-16T21:30:00Z",
+        source_component: "orchestrator", summary: "x", sanitized_payload: {{}},
+    }});
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    console.log(JSON.stringify(calls));
+}})();
+"""
+        return json.loads(_run_node(script))
+
+    def _render_body(self, dashboard_script, element_id, fn_call):
+        expr = f"""(function() {{
+            const captured = {{ html: null }};
+            const real = document.getElementById;
+            document.getElementById = (id) => {{
+                if (id === {json.dumps(element_id)}) {{
+                    const el = {{ set innerHTML(v) {{ captured.html = v; }}, get innerHTML() {{ return captured.html; }} }};
+                    return el;
+                }}
+                return real(id);
+            }};
+            {fn_call};
+            document.getElementById = real;
+            return captured.html;
+        }})()"""
+        return _eval_js(dashboard_script, expr)
+
+    # A: a real lifecycle sub-stage event triggers an authoritative refresh
+    def test_A_lifecycle_event_triggers_refresh(self, dashboard_script):
+        run = self._awaiting_review_run()
+        calls = self._fetch_after_event(dashboard_script, run, "detection_engineering_completed")
+        assert any("/api/runs/RUN-test" in c and "/evaluation" not in c for c in calls)
+
+    # B: human_review_required specifically triggers a refresh
+    def test_B_human_review_required_triggers_refresh(self, dashboard_script):
+        run = self._awaiting_review_run()
+        calls = self._fetch_after_event(dashboard_script, run, "human_review_required")
+        assert any("/api/runs/RUN-test" in c and "/evaluation" not in c for c in calls)
+
+    # C: awaiting_human_review displays as an honest stable state, never "running"
+    def test_C_awaiting_human_review_displays_correctly(self, dashboard_script):
+        run = self._awaiting_review_run()
+        expr = f"durationState({json.dumps(run)})"
+        assert _eval_js(dashboard_script, expr) == "awaiting review"
+        html = self._render_body(dashboard_script, "status-body", f"renderStatus({json.dumps(run)})")
+        assert "awaiting review" in html
+        assert ">running<" not in html
+
+    # D: Complete must remain pending while awaiting review, never green
+    def test_D_complete_remains_pending_while_awaiting_review(self, dashboard_script):
+        run = self._awaiting_review_run()
+        node = {"key": "complete", "stages": ["complete"]}
+        expr = f"computeNodeState({json.dumps(node)}, {json.dumps(run)}, new Set())"
+        state = _eval_js(dashboard_script, expr)["state"]
+        assert state == "pending"
+
+    # E: Lifecycle Detail renders real content for this run -- keyed off
+    # the real run.lifecycle field, never run_type (which stays
+    # "bug_bounty" for a lifecycle run by design, since it shares the
+    # same concurrency slot as a plain Bug Bounty run).
+    def test_E_lifecycle_detail_renders_for_lifecycle_run(self, dashboard_script):
+        run = self._awaiting_review_run()
+        assert run["run_type"] == "bug_bounty"
+        html = self._render_body(dashboard_script, "lifecycle-body", f"renderLifecycle({json.dumps(run)})")
+        assert "Not a Full Security Lifecycle run." not in html
+        assert "CF-1" in html
+
+    # F: TI outcome renders from real per-finding lifecycle data
+    def test_F_ti_result_renders(self, dashboard_script):
+        run = self._awaiting_review_run([self._lifecycle_result(ti_outcome="reviewed_relevant")])
+        html = self._render_body(dashboard_script, "lifecycle-body", f"renderLifecycle({json.dumps(run)})")
+        assert "Relevant intel found" in html
+
+    # G: Hunt outcome renders honestly (never claims real execution)
+    def test_G_hunt_result_renders(self, dashboard_script):
+        run = self._awaiting_review_run([self._lifecycle_result(hunt_outcome="hunt_candidate_created")])
+        html = self._render_body(dashboard_script, "lifecycle-body", f"renderLifecycle({json.dumps(run)})")
+        assert "Hunt scoped (not executed)" in html
+
+    # H: Detection outcome renders
+    def test_H_detection_result_renders(self, dashboard_script):
+        run = self._awaiting_review_run([self._lifecycle_result(detection_outcome="candidate_ready")])
+        html = self._render_body(dashboard_script, "lifecycle-body", f"renderLifecycle({json.dumps(run)})")
+        assert "Rule candidate created" in html
+
+    # I: Red Validation outcome renders honestly -- never a fabricated
+    # "executed"/"passed" claim, since no real exploit engine exists.
+    def test_I_red_result_renders_honestly(self, dashboard_script):
+        run = self._awaiting_review_run()
+        html = self._render_body(dashboard_script, "lifecycle-body", f"renderLifecycle({json.dumps(run)})")
+        assert "Controlled validation unavailable" in html
+        assert "exploit executed" not in html.lower()
+
+    # J: Purple recommendation renders, never claims applied
+    def test_J_purple_recommendation_renders(self, dashboard_script):
+        run = self._awaiting_review_run()
+        html = self._render_body(dashboard_script, "lifecycle-body", f"renderLifecycle({json.dumps(run)})")
+        assert "Add a documented mitigation." in html
+
+    # K: Attack Surface data still renders correctly for a run that is
+    # simultaneously a lifecycle run -- the two real data sources
+    # (run.attack_surface, run.lifecycle) must not interfere.
+    def test_K_attack_surface_still_renders_on_lifecycle_run(self, dashboard_script):
+        run = self._awaiting_review_run()
+        html = self._render_body(dashboard_script, "attack-surface-body", f"renderAttackSurface({json.dumps(run)})")
+        assert "No discovery data for this run." not in html
+        assert ">3<" in html  # endpoint_count
+
+    # L: the existing named-SSE event fix remains fully intact
+    def test_L_named_sse_fix_still_intact(self, dashboard_html):
+        from backend.models import EVENT_TYPES as BACKEND_EVENT_TYPES
+
+        assert "eventSource.addEventListener(eventType, onStreamMessage)" in dashboard_html
+        match = re.search(r"const EVENT_TYPES = \[(.*?)\];", dashboard_html, re.DOTALL)
+        assert match is not None
+        js_types = set(re.findall(r'"([a-z_]+)"', match.group(1)))
+        assert js_types == set(BACKEND_EVENT_TYPES)
+
+    # M: ordinary Bug Bounty-only run behavior is unchanged -- no
+    # lifecycle field means the honest empty state stays, a completed
+    # status still means "finished", and a low-level tool event that
+    # isn't part of the new lifecycle-refresh vocabulary never triggers
+    # a spurious extra API call.
+    def test_M_plain_bug_bounty_run_unaffected(self, dashboard_script):
+        run = _completed_run(started_at="2026-08-16T21:22:20Z", completed_at="2026-08-16T21:24:00Z", lifecycle=None)
+        html = self._render_body(dashboard_script, "lifecycle-body", f"renderLifecycle({json.dumps(run)})")
+        assert "Not a Full Security Lifecycle run." in html
+        expr = f"durationState({json.dumps(run)})"
+        assert _eval_js(dashboard_script, expr) == "finished"
+
+    def test_M2_irrelevant_low_level_event_does_not_trigger_refresh(self, dashboard_script):
+        run = self._awaiting_review_run()
+        calls = self._fetch_after_event(dashboard_script, run, "tool_completed")
+        assert not any("/api/runs/RUN-test" in c for c in calls)
