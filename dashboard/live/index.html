@@ -162,12 +162,12 @@
 
   <section class="card" id="card-ti">
     <h2>G. Threat Intelligence Context</h2>
-    <div id="ti-body" class="empty">No Threat Intelligence trigger on this run.</div>
+    <div id="ti-body" class="empty">No Threat Intelligence activity on this run.</div>
   </section>
 
   <section class="card" id="card-detection">
     <h2>H. Detection Engineering</h2>
-    <div id="detection-body" class="empty">No detection rules on this run.</div>
+    <div id="detection-body" class="empty">No Detection Engineering activity on this run.</div>
   </section>
 
   <section class="card wide" id="card-feed">
@@ -196,19 +196,47 @@ let eventSource = null;
 let feedCount = 0;
 const MAX_FEED_ROWS = 300;
 
+// Every event_type actually observed (via historical replay or live SSE)
+// for the currently selected run -- reset on each selectRun(), populated
+// by handleEvent(). This is the ONLY source of truth for whether an
+// optional/skippable stage (Prioritize/TI-Hunt/Detection) genuinely ran;
+// current_stage/run.status must never be used to infer that, since
+// backend.orchestrator's run_bug_bounty_workflow jumps its current_stage
+// directly from "correlation" to "complete", SKIPPING prioritization/
+// threat_intel/detection_engineering/human_review entirely rather than
+// visiting them -- a completed run's current_stage index being past
+// those stages' index in STAGE_ORDER does not mean they happened.
+let observedEventTypes = new Set();
+
 const PIPELINE = [
-  { label: "Bug Bounty", stages: ["intake","planning","tool_policy","governor","tool_execution"] },
-  { label: "Normalize", stages: ["normalization"] },
-  { label: "Correlate", stages: ["correlation"] },
-  { label: "Prioritize", stages: ["prioritization"] },
-  { label: "TI / Hunt", stages: ["threat_intel"] },
-  { label: "Detection", stages: ["detection_engineering"] },
-  { label: "Red / Purple", stages: [] },
-  { label: "Human Review", stages: ["human_review"] },
-  { label: "Complete", stages: ["complete"] },
+  { key: "bug_bounty", label: "Bug Bounty", stages: ["intake","planning","tool_policy","governor","tool_execution"] },
+  { key: "normalize", label: "Normalize", stages: ["normalization"] },
+  { key: "correlate", label: "Correlate", stages: ["correlation"] },
+  { key: "prioritize", label: "Prioritize", stages: ["prioritization"] },
+  { key: "ti_hunt", label: "TI / Hunt", stages: ["threat_intel"] },
+  { key: "detection", label: "Detection", stages: ["detection_engineering"] },
+  { key: "red_purple", label: "Red / Purple", stages: [] },
+  { key: "human_review", label: "Human Review", stages: ["human_review"] },
+  { key: "complete", label: "Complete", stages: ["complete"] },
 ];
 const STAGE_ORDER = ["intake","planning","tool_policy","governor","tool_execution","normalization","correlation","prioritization","threat_intel","detection_engineering","human_review","complete"];
 const TERMINAL = new Set(["completed","blocked","failed","cancelled"]);
+
+// Mirrors backend.models.EVENT_TYPES exactly. The backend's SSE stream
+// (backend/app.py's stream_events) sends every message with an explicit
+// `event: <event_type>` field -- per the SSE spec, EventSource.onmessage
+// only ever fires for the default, unnamed "message" type, so a message
+// carrying any of these named types is invisible to onmessage. Every
+// type must be registered individually via addEventListener for the
+// live stream to ever deliver anything.
+const EVENT_TYPES = [
+  "run_created","run_started","planner_started","planner_completed","tool_policy_evaluated",
+  "governor_evaluated","tool_started","tool_completed","tool_failed","http_assessment_completed",
+  "evidence_normalized","finding_correlated","canonical_finding_created","context_prioritized",
+  "handoff_transition","threat_intel_ingested","threat_intel_normalized","telemetry_evaluated",
+  "detection_plan_created","detection_rule_created","detection_rule_validated","human_review_required",
+  "run_blocked","run_failed","run_cancelled","run_completed",
+];
 
 function el(id) { return document.getElementById(id); }
 function esc(s) { return String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
@@ -255,32 +283,86 @@ async function refreshRunList() {
 }
 
 function pillClass(state) {
-  return { done: "done", active: "active", pending: "pending", na: "na" }[state] || "pending";
+  return {
+    done: "done", completed: "done", active: "active", pending: "pending",
+    na: "na", not_run: "na", not_applicable: "na",
+    awaiting_review: "warn",
+    blocked: "blocked", failed: "failed", cancelled: "blocked",
+  }[state] || "pending";
+}
+
+function pipelineStateLabel(state) {
+  return {
+    na: "not run", not_run: "not run", not_applicable: "not applicable",
+    awaiting_review: "awaiting review", pending: "pending", active: "active", done: "done",
+    blocked: "blocked", failed: "failed", cancelled: "cancelled",
+  }[state] || state;
+}
+
+// Real, evidence-based state for one pipeline node. Never infers an
+// optional stage ran merely because run.status/current_stage advanced
+// past it -- see observedEventTypes's own comment for why that
+// inference is false for this backend's actual orchestrator behavior.
+function computeNodeState(node, run, eventsSeen) {
+  if (!run) return node.stages.length === 0 ? "na" : "pending";
+
+  if (node.key === "complete") {
+    // The one node whose entire purpose IS to reflect run.status
+    // directly -- this is the authoritative, truthful signal for it,
+    // per this project's own documented run/status contract.
+    if (run.status === "completed") return "done";
+    if (TERMINAL.has(run.status)) return run.status; // blocked / failed / cancelled
+    return "pending";
+  }
+  if (node.key === "red_purple") {
+    // Never implemented by any current workflow -- always neutral,
+    // never shown as failed/blocked.
+    return "na";
+  }
+  if (node.key === "prioritize") {
+    return eventsSeen.has("context_prioritized") ? "done" : "not_run";
+  }
+  if (node.key === "ti_hunt") {
+    return (eventsSeen.has("threat_intel_ingested") || eventsSeen.has("threat_intel_normalized")) ? "done" : "not_run";
+  }
+  if (node.key === "detection") {
+    return eventsSeen.has("detection_plan_created") ? "done" : "not_run";
+  }
+  if (node.key === "human_review") {
+    if (!run.human_review_required) return "not_applicable";
+    // No current workflow ever records an actual review decision
+    // (approve/reject) -- run.human_review_decision is not part of
+    // today's real backend contract; this check is forward-compatible
+    // only and always falls through to "awaiting_review" today.
+    // Caller-supplied approval is never treated as authenticated
+    // identity -- see core.bug_bounty_tool_policy's own documentation.
+    if (run.human_review_decision) return "done";
+    return "awaiting_review";
+  }
+
+  // Mandatory sequential stages (Bug Bounty / Normalize / Correlate):
+  // these ARE always visited in strict STAGE_ORDER for any run that
+  // isn't blocked/failed early, so index comparison against
+  // current_stage is valid here -- never combined with a blanket
+  // run.status === "completed" override, which would also mark a
+  // stage "done" it never actually reached (e.g. Normalize on a run
+  // that failed during tool_execution, before normalization ever ran).
+  const currentIndex = STAGE_ORDER.indexOf(run.current_stage);
+  const nodeMaxIndex = Math.max(...node.stages.map(s => STAGE_ORDER.indexOf(s)));
+  const terminalNonComplete = TERMINAL.has(run.status) && run.status !== "completed";
+  if (currentIndex > nodeMaxIndex) return "done";
+  if (node.stages.includes(run.current_stage)) return terminalNonComplete ? run.status : "active";
+  return "pending";
 }
 
 function renderPipeline(run) {
   const body = el("pipeline-body");
   body.innerHTML = "";
-  const currentIndex = run ? STAGE_ORDER.indexOf(run.current_stage) : -1;
-  const terminalNonComplete = run && TERMINAL.has(run.status) && run.status !== "completed";
-
   for (const node of PIPELINE) {
-    let state = "pending";
-    if (node.stages.length === 0) {
-      state = "na";
-    } else if (run) {
-      const nodeMaxIndex = Math.max(...node.stages.map(s => STAGE_ORDER.indexOf(s)));
-      if (currentIndex > nodeMaxIndex || (run.status === "completed" )) {
-        state = "done";
-      } else if (node.stages.includes(run.current_stage)) {
-        state = terminalNonComplete ? (run.status) : "active";
-      } else {
-        state = "pending";
-      }
-    }
+    const state = computeNodeState(node, run, observedEventTypes);
     const div = document.createElement("div");
     div.className = "node";
-    div.innerHTML = `<span class="pill ${pillClass(state)}">${esc(state === "na" ? "not this block" : state)}</span><span class="label">${esc(node.label)}</span>`;
+    div.innerHTML = `<span class="pill ${pillClass(state)}">${esc(pipelineStateLabel(state))}</span><span class="label">${esc(node.label)}</span>`;
     body.appendChild(div);
   }
 }
@@ -380,15 +462,30 @@ function renderFindings(run) {
     body.innerHTML = '<div class="empty">0 canonical findings.</div>';
     return;
   }
-  let rows = report.canonical_findings.map(f => `
+  // core.bug_bounty_final_report._build_canonical_finding's real schema
+  // has no field literally called "evidence" -- the authoritative
+  // fields are tools_used (source tool ids) and evidence_sources (one
+  // entry per corroborating evidence record; evidence_digests is a
+  // parallel real fallback). Reading a nonexistent f.evidence always
+  // silently evaluated to 0, which is why this table used to claim
+  // "0 evidence item(s)" on findings that plainly had real evidence.
+  let rows = report.canonical_findings.map(f => {
+    const sources = Array.isArray(f.tools_used) && f.tools_used.length ? f.tools_used.join(", ") : "unknown";
+    const evidenceCount = Array.isArray(f.evidence_sources) ? f.evidence_sources.length
+      : (Array.isArray(f.evidence_digests) ? f.evidence_digests.length : null);
+    const evidenceText = evidenceCount === null ? "no evidence metadata" : `${evidenceCount} record${evidenceCount === 1 ? "" : "s"}`;
+    const reviewState = f.status === "requires_human_review" ? "Awaiting Review" : (f.status || "—");
+    return `
     <tr>
       <td>${esc(f.title || f.finding_id)}</td>
       <td class="sev-${esc(f.technical_severity)}">${esc(f.technical_severity)}</td>
       <td>${esc(f.confidence || "—")}</td>
-      <td>${esc((f.evidence && f.evidence.length) || 0)} evidence item(s)</td>
-      <td>${esc(f.status || "requires_human_review")}</td>
-    </tr>`).join("");
-  body.innerHTML = `<table><thead><tr><th>Finding</th><th>Severity</th><th>Confidence</th><th>Evidence</th><th>Review state</th></tr></thead><tbody>${rows}</tbody></table>`;
+      <td>${esc(sources)}</td>
+      <td>${esc(evidenceText)}</td>
+      <td>${esc(reviewState)}</td>
+    </tr>`;
+  }).join("");
+  body.innerHTML = `<table><thead><tr><th>Finding</th><th>Severity</th><th>Confidence</th><th>Sources</th><th>Evidence</th><th>Review State</th></tr></thead><tbody>${rows}</tbody></table>`;
 }
 
 // All values rendered below come directly from run.attack_surface (set by
@@ -591,7 +688,7 @@ function renderTi(payload) {
   if (payload) lastTi = payload;
   const body = el("ti-body");
   if (!lastTi || lastTi.trigger_type !== "threat_intelligence") {
-    body.innerHTML = '<div class="empty">No Threat Intelligence trigger on this run.</div>';
+    body.innerHTML = '<div class="empty">No Threat Intelligence activity on this run.</div>';
     return;
   }
   body.innerHTML = `
@@ -608,7 +705,7 @@ function renderDetection(run) {
   const body = el("detection-body");
   const ids = Object.keys(ruleState);
   if (!ids.length && (!run || !run.report || !("rules_generated" in (run.report || {})))) {
-    body.innerHTML = '<div class="empty">No detection rules on this run.</div>';
+    body.innerHTML = '<div class="empty">No Detection Engineering activity on this run.</div>';
     return;
   }
   let rows = ids.map(id => {
@@ -635,6 +732,7 @@ function appendFeed(event) {
 
 function handleEvent(event) {
   appendFeed(event);
+  observedEventTypes.add(event.event_type);
   const p = event.sanitized_payload || {};
   if (event.event_type === "governor_evaluated") renderGovernor(p);
   if (event.event_type === "detection_plan_created") renderTi(p);
@@ -670,9 +768,15 @@ async function refreshSelectedRun() {
 function openStream(runId) {
   if (eventSource) { eventSource.close(); eventSource = null; }
   eventSource = new EventSource(`/api/runs/${runId}/stream`);
-  eventSource.onmessage = (ev) => {
+  const onStreamMessage = (ev) => {
     try { handleEvent(JSON.parse(ev.data)); } catch (e) { /* ignore malformed */ }
   };
+  // The backend names every message's SSE `event:` field after its own
+  // event_type (see backend/app.py's stream_events) -- a named-type
+  // message never reaches a bare onmessage handler, so every type in
+  // EVENT_TYPES must be listened for explicitly.
+  for (const eventType of EVENT_TYPES) eventSource.addEventListener(eventType, onStreamMessage);
+  eventSource.onmessage = onStreamMessage; // defensive: default/unnamed messages, if any
   eventSource.onerror = () => { /* browser auto-reconnects with Last-Event-ID */ };
 }
 
@@ -681,17 +785,22 @@ async function selectRun(runId) {
   feedCount = 0;
   Object.keys(ruleState).forEach(k => delete ruleState[k]);
   lastTi = null;
+  observedEventTypes = new Set();
   el("feed-body").innerHTML = '<div class="empty">Loading…</div>';
   el("governor-body").innerHTML = '<div class="empty">No Governor evaluation yet.</div>';
   if (!runId) {
     renderStatus(null); renderPipeline(null); renderTools(null); renderFindings(null); renderDetection(null); renderTi(null); renderEvaluation(null); renderAttackSurface(null);
     return;
   }
-  await refreshSelectedRun();
+  // Fetch and replay full event history FIRST so observedEventTypes is
+  // completely populated before the authoritative run refresh below --
+  // otherwise a stage that genuinely happened earlier in this run's
+  // history could still render "not_run" on first selection.
   const evs = await api(`/api/runs/${runId}/events`).catch(() => ({ events: [] }));
   el("feed-body").innerHTML = "";
   feedCount = 0;
   for (const e of evs.events) handleEvent(e);
+  await refreshSelectedRun();
   openStream(runId);
 }
 
