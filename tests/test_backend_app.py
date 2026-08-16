@@ -126,6 +126,234 @@ class TestCreateRunValidation:
         assert r.json()["error_code"] == "INVALID_JSON"
 
 
+class TestSecurityLifecycleEndpoint:
+    """POST /api/runs/security-lifecycle -- validation only. A real full
+    run is exercised at the orchestrator level (fake transport/execute_tool,
+    tests/test_backend_orchestrator.py::TestSecurityLifecycleWorkflow) --
+    these tests only confirm routing/validation, never wait for a real
+    background scan against Juice Shop."""
+
+    @pytest.fixture(autouse=True)
+    def _isolated_backend_state(self, monkeypatch):
+        from backend.event_bus import EventBus
+        from backend.run_store import RunStore
+
+        monkeypatch.setattr(backend_app, "_run_store", RunStore())
+        monkeypatch.setattr(backend_app, "_event_bus", EventBus())
+
+    @pytest.mark.parametrize("target", [
+        "http://example.com/", "https://example.com/", "http://8.8.8.8/", "file:///etc/passwd",
+    ])
+    def test_036_rejects_unsafe_targets(self, client, target):
+        r = client.post("/api/runs/security-lifecycle", json={"target": target})
+        assert r.status_code == 400
+        assert r.json()["error_code"] == "INVALID_TARGET"
+
+    def test_037_rejects_non_list_available_telemetry(self, client):
+        r = client.post(
+            "/api/runs/security-lifecycle",
+            json={"target": "http://localhost:3000/", "available_telemetry": "web_server"},
+        )
+        assert r.status_code == 400
+        assert r.json()["error_code"] == "INVALID_AVAILABLE_TELEMETRY"
+
+    def test_038_rejects_non_string_available_telemetry_entries(self, client):
+        r = client.post(
+            "/api/runs/security-lifecycle",
+            json={"target": "http://localhost:3000/", "available_telemetry": [1, 2]},
+        )
+        assert r.status_code == 400
+        assert r.json()["error_code"] == "INVALID_AVAILABLE_TELEMETRY"
+
+    def test_039_rejects_non_object_detection_llm_proposals(self, client):
+        r = client.post(
+            "/api/runs/security-lifecycle",
+            json={"target": "http://localhost:3000/", "detection_llm_proposals": "not an object"},
+        )
+        assert r.status_code == 400
+        assert r.json()["error_code"] == "INVALID_DETECTION_LLM_PROPOSALS"
+
+    def test_040_accepted_response_shape(self, client, monkeypatch):
+        # Patch the real workflow so this test never performs real I/O
+        # or waits on a background scan -- only the API contract
+        # (immediate 202 + run_id) is under test here.
+        started = {}
+
+        def _fake_workflow(**kwargs):
+            started.update(kwargs)
+
+        monkeypatch.setattr(backend_app, "run_security_lifecycle_workflow", _fake_workflow)
+        r = client.post("/api/runs/security-lifecycle", json={"target": "http://localhost:3000/"})
+        assert r.status_code == 202
+        body = r.json()
+        assert body["run_id"].startswith("RUN-")
+        assert body["status"] == "created"
+
+    def test_041_concurrent_run_rejected(self, client, monkeypatch):
+        def _fake_workflow(**kwargs):
+            import time as _time
+            _time.sleep(0.05)
+
+        monkeypatch.setattr(backend_app, "run_security_lifecycle_workflow", _fake_workflow)
+        r1 = client.post("/api/runs/security-lifecycle", json={"target": "http://localhost:3000/"})
+        assert r1.status_code == 202
+        r2 = client.post("/api/runs/security-lifecycle", json={"target": "http://localhost:3000/"})
+        assert r2.status_code == 409
+        assert r2.json()["error_code"] == "CONCURRENT_RUN_ACTIVE"
+
+    def test_042_available_telemetry_and_proposals_forwarded(self, client, monkeypatch):
+        captured = {}
+
+        def _fake_workflow(**kwargs):
+            captured.update(kwargs)
+
+        monkeypatch.setattr(backend_app, "run_security_lifecycle_workflow", _fake_workflow)
+        client.post(
+            "/api/runs/security-lifecycle",
+            json={
+                "target": "http://localhost:3000/", "available_telemetry": ["web_server"],
+                "detection_llm_proposals": {"CF-1": {"detection_objective": "x"}},
+            },
+        )
+        assert captured["available_telemetry"] == ["web_server"]
+        assert captured["detection_llm_proposals"] == {"CF-1": {"detection_objective": "x"}}
+
+
+class TestLifecycleReviewEndpoint:
+    @pytest.fixture(autouse=True)
+    def _isolated_backend_state(self, monkeypatch):
+        from backend.event_bus import EventBus
+        from backend.run_store import RunStore
+
+        monkeypatch.setattr(backend_app, "_run_store", RunStore())
+        monkeypatch.setattr(backend_app, "_event_bus", EventBus())
+
+    @staticmethod
+    def _real_finding_and_prioritization():
+        # Built via the real core.context_prioritization/core.security_handoff
+        # functions (never a hand-rolled dict) so these tests never have
+        # to guess either module's own required shape.
+        from core.context_prioritization import prioritize_finding
+
+        finding = {
+            "finding_version": "1", "finding_id": "CF-1", "finding_status": "candidate",
+            "technical_severity": "medium", "confidence": "medium", "vulnerability_class": "security_header_misconfiguration",
+            "evidence": [{"evidence_digest": "sha256:" + "a" * 64}], "validation": None,
+            "owasp_category": None, "cwe": None,
+        }
+        import backend.orchestrator as orchestrator
+
+        prioritization = prioritize_finding(finding=finding, context=dict(orchestrator.DEMO_LIFECYCLE_CONTEXT))
+        return finding, prioritization
+
+    def _real_case_at_human_review(self):
+        from core.security_handoff import append_security_stage_result, create_security_handoff_case
+
+        finding, prioritization = self._real_finding_and_prioritization()
+        case = create_security_handoff_case(finding=finding, prioritization=prioritization)
+        for stage, role, result_type, outcome in (
+            ("threat_intel_review", "threat_intelligence", "assessment", "reviewed_no_match"),
+            ("threat_hunt", "threat_hunting", "plan", "not_applicable"),
+            # detection_engineering's "not_applicable" outcome advances
+            # straight to purple_remediation, skipping red_validation
+            # entirely (core.security_handoff's own real transition
+            # graph) -- never submitted here unless the case is
+            # actually still at that stage.
+            ("detection_engineering", "blue_team", "candidate", "not_applicable"),
+            ("red_validation", "red_team", "assessment", "not_applicable"),
+            ("purple_remediation", "purple_ir", "recommendation", "planned"),
+        ):
+            if case["current_stage"] != stage:
+                continue
+            case = append_security_stage_result(
+                case=case, stage=stage, role=role, result_type=result_type, outcome=outcome,
+                evidence_references=[{"reference_type": "finding", "reference": "CF-1"}], recommendation="test",
+            )
+        return case
+
+    def _awaiting_review_run(self):
+        run = backend_app._run_store.create_run(run_type="bug_bounty", created_at="2026-08-15T00:00:00Z")
+        _finding, prioritization = self._real_finding_and_prioritization()
+        case = self._real_case_at_human_review()
+        governor_result = {
+            "governor_version": "1", "decision": "allow", "reason_codes": [],
+            "observable_only": True, "execution_performed": False,
+        }
+        backend_app._run_store.transition(
+            run_id=run["run_id"], new_status="awaiting_human_review", current_stage="human_review",
+            lifecycle={
+                "lifecycle_version": "1",
+                "results": [{"finding_id": "CF-1", "case": case, "prioritization": prioritization}],
+                "governor_result": governor_result,
+            },
+        )
+        return run["run_id"], case["case_id"]
+
+    def test_043_unknown_run_404(self, client):
+        r = client.post(
+            f"/api/runs/RUN-{'0' * 32}/lifecycle/review",
+            json={"case_id": "SH-1", "approval_state": "approved", "approval_reference": "ref"},
+        )
+        assert r.status_code == 404
+
+    def test_044_rejects_missing_case_id(self, client):
+        run_id, _case_id = self._awaiting_review_run()
+        r = client.post(
+            f"/api/runs/{run_id}/lifecycle/review",
+            json={"approval_state": "approved", "approval_reference": "ref"},
+        )
+        assert r.status_code == 400
+        assert r.json()["error_code"] == "INVALID_CASE_ID"
+
+    def test_045_rejects_invalid_approval_state(self, client):
+        run_id, case_id = self._awaiting_review_run()
+        r = client.post(
+            f"/api/runs/{run_id}/lifecycle/review",
+            json={"case_id": case_id, "approval_state": "maybe", "approval_reference": "ref"},
+        )
+        assert r.status_code == 400
+        assert r.json()["error_code"] == "INVALID_APPROVAL_STATE"
+
+    def test_046_rejects_missing_approval_reference(self, client):
+        run_id, case_id = self._awaiting_review_run()
+        r = client.post(
+            f"/api/runs/{run_id}/lifecycle/review",
+            json={"case_id": case_id, "approval_state": "approved"},
+        )
+        assert r.status_code == 400
+        assert r.json()["error_code"] == "INVALID_APPROVAL_REFERENCE"
+
+    def test_047_unknown_case_id_400(self, client):
+        run_id, _case_id = self._awaiting_review_run()
+        r = client.post(
+            f"/api/runs/{run_id}/lifecycle/review",
+            json={"case_id": "SH-does-not-exist", "approval_state": "approved", "approval_reference": "ref"},
+        )
+        assert r.status_code == 400
+        assert r.json()["error_code"] == "CASE_NOT_FOUND"
+
+    def test_048_real_approval_recorded_via_api(self, client):
+        run_id, case_id = self._awaiting_review_run()
+        r = client.post(
+            f"/api/runs/{run_id}/lifecycle/review",
+            json={"case_id": case_id, "approval_state": "approved", "approval_reference": "ref-1"},
+        )
+        assert r.status_code == 200
+        body = r.json()
+        assert body["status"] == "completed"
+        assert body["lifecycle"]["results"][0]["case"]["approval_state"] == "approved"
+
+    def test_049_run_not_awaiting_review_rejected(self, client):
+        run = backend_app._run_store.create_run(run_type="bug_bounty", created_at="2026-08-15T00:00:00Z")
+        backend_app._run_store.transition(run_id=run["run_id"], new_status="planning", current_stage="planning")
+        r = client.post(
+            f"/api/runs/{run['run_id']}/lifecycle/review",
+            json={"case_id": "SH-1", "approval_state": "approved", "approval_reference": "ref"},
+        )
+        assert r.status_code == 400
+        assert r.json()["error_code"] == "RUN_NOT_AWAITING_REVIEW"
+
+
 class TestErrorSanitization:
     def test_011_internal_error_never_leaks_traceback(self, client, monkeypatch):
         def _boom(*, run_id):

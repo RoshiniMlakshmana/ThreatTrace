@@ -33,11 +33,14 @@ global.document = {
   getElementById: () => fakeElement(),
   querySelector: () => ({ addEventListener: () => {}, open: false }),
   createElement: () => fakeElement(),
+  addEventListener: () => {},
 };
 global.fetch = async () => ({ ok: true, json: async () => ({ runs: [], tools: {}, categories: [] }) });
 global.setInterval = () => {};
 global.EventSource = function () { this.close = () => {}; };
 global.alert = () => {};
+global.window = { prompt: () => null };
+global.HTMLElement = class {};
 // The script's own top-level bootstrap calls (checkHealth/loadSystemInfo/
 // refreshRunList) are irrelevant to what these tests actually exercise --
 // swallow any rejection from them rather than let it crash the process.
@@ -113,7 +116,10 @@ class TestRequiredSections:
         assert heading in dashboard_html
 
     def test_005_pipeline_stages_present(self, dashboard_html):
-        for label in ["Bug Bounty", "Normalize", "Correlate", "Prioritize", "TI / Hunt", "Detection", "Red / Purple", "Human Review"]:
+        for label in [
+            "Bug Bounty", "Normalize", "Correlate", "Prioritize", "TI / Hunt", "Detection",
+            "Red Validation", "Purple", "Human Review",
+        ]:
             assert label in dashboard_html
 
 
@@ -289,7 +295,28 @@ class TestPipelineTruthModel:
 
     def _state(self, dashboard_script, node, run, events_seen=()):
         expr = f"computeNodeState({json.dumps(node)}, {json.dumps(run)}, new Set({json.dumps(list(events_seen))}))"
-        return _eval_js(dashboard_script, expr)
+        return _eval_js(dashboard_script, expr)["state"]
+
+    def _lifecycle_run(self, results, **overrides):
+        base = {
+            "status": "awaiting_human_review", "current_stage": "human_review",
+            "lifecycle": {
+                "lifecycle_version": "1", "total_canonical_findings": len(results),
+                "findings_selected": [r["finding_id"] for r in results], "results": results,
+            },
+        }
+        base.update(overrides)
+        return _completed_run(**base)
+
+    def _result(self, *, finding_id="CF-1", ti_outcome="no_relevant_intel", hunt_outcome="telemetry_gap",
+                detection_outcome="not_applicable", purple_outcome="recommendation_created", approval_state="pending"):
+        return {
+            "finding_id": finding_id,
+            "ti_result": {"outcome": ti_outcome}, "hunt_result": {"outcome": hunt_outcome},
+            "detection_result": {"outcome": detection_outcome}, "purple_result": {"outcome": purple_outcome},
+            "red_validation_result": {"outcome": "controlled_validation_unavailable"},
+            "case": {"case_id": f"SH-{finding_id}", "approval_state": approval_state},
+        }
 
     # A: completed Bug Bounty-only run -> Bug Bounty = done
     def test_A_bug_bounty_stage_done_on_completed_run(self, dashboard_script):
@@ -316,34 +343,59 @@ class TestPipelineTruthModel:
 
     # D: no TI data/events -> TI / Hunt = not_run
     def test_D_ti_hunt_not_run_without_real_events(self, dashboard_script):
-        node = {"key": "ti_hunt", "stages": ["threat_intel"]}
+        node = {"key": "ti_hunt", "stages": ["threat_intel", "threat_hunt"]}
         assert self._state(dashboard_script, node, _completed_run()) == "not_run"
 
-    def test_D2_ti_hunt_done_when_real_event_observed(self, dashboard_script):
-        node = {"key": "ti_hunt", "stages": ["threat_intel"]}
-        result = self._state(dashboard_script, node, _completed_run(), events_seen=["threat_intel_ingested"])
-        assert result == "done"
+    def test_D2_ti_hunt_active_while_started_but_not_yet_in_results(self, dashboard_script):
+        node = {"key": "ti_hunt", "stages": ["threat_intel", "threat_hunt"]}
+        result = self._state(dashboard_script, node, _completed_run(), events_seen=["threat_intel_review_started"])
+        assert result == "active"
+
+    def test_D3_ti_hunt_done_when_real_lifecycle_results_present(self, dashboard_script):
+        node = {"key": "ti_hunt", "stages": ["threat_intel", "threat_hunt"]}
+        run = self._lifecycle_run([self._result(hunt_outcome="hunt_candidate_created")])
+        assert self._state(dashboard_script, node, run) == "done"
+
+    def test_D4_ti_hunt_neutral_when_no_intel_and_telemetry_gap(self, dashboard_script):
+        node = {"key": "ti_hunt", "stages": ["threat_intel", "threat_hunt"]}
+        run = self._lifecycle_run([self._result(ti_outcome="no_relevant_intel", hunt_outcome="telemetry_gap")])
+        assert self._state(dashboard_script, node, run) == "na"
 
     # E: no detection data/events -> Detection = not_run
     def test_E_detection_not_run_without_real_events(self, dashboard_script):
         node = {"key": "detection", "stages": ["detection_engineering"]}
         assert self._state(dashboard_script, node, _completed_run()) == "not_run"
 
-    def test_E2_detection_done_when_real_event_observed(self, dashboard_script):
+    def test_E2_detection_done_when_real_lifecycle_results_present(self, dashboard_script):
         node = {"key": "detection", "stages": ["detection_engineering"]}
-        result = self._state(dashboard_script, node, _completed_run(), events_seen=["detection_plan_created"])
-        assert result == "done"
+        run = self._lifecycle_run([self._result(detection_outcome="candidate_ready")])
+        assert self._state(dashboard_script, node, run) == "done"
 
-    # F: no Red/Purple data -> Red / Purple = not_run/not applicable
-    def test_F_red_purple_always_neutral_never_failed(self, dashboard_script):
-        node = {"key": "red_purple", "stages": []}
-        assert self._state(dashboard_script, node, _completed_run()) == "na"
+    def test_E3_detection_neutral_when_no_rule(self, dashboard_script):
+        node = {"key": "detection", "stages": ["detection_engineering"]}
+        run = self._lifecycle_run([self._result(detection_outcome="not_applicable")])
+        assert self._state(dashboard_script, node, run) == "na"
 
-    def test_F2_red_purple_neutral_even_on_a_failed_run(self, dashboard_script):
-        node = {"key": "red_purple", "stages": []}
-        run = _completed_run(status="failed", current_stage="tool_execution")
+    # F: Red Validation never falsely marked done; Purple recommendation only
+    def test_F_red_validation_always_neutral_never_done(self, dashboard_script):
+        node = {"key": "red_validation", "stages": ["red_validation"]}
+        run = self._lifecycle_run([self._result()])
+        assert self._state(dashboard_script, node, run) == "na"
+
+    def test_F2_red_validation_never_failed(self, dashboard_script):
+        node = {"key": "red_validation", "stages": ["red_validation"]}
+        run = self._lifecycle_run([self._result()], status="failed")
         state = self._state(dashboard_script, node, run)
         assert state not in ("failed", "blocked")
+
+    def test_F3_red_validation_not_run_without_lifecycle(self, dashboard_script):
+        node = {"key": "red_validation", "stages": ["red_validation"]}
+        assert self._state(dashboard_script, node, _completed_run()) == "not_run"
+
+    def test_F4_purple_done_but_never_applied(self, dashboard_script):
+        node = {"key": "purple", "stages": ["purple_remediation"]}
+        run = self._lifecycle_run([self._result(purple_outcome="recommendation_created")])
+        assert self._state(dashboard_script, node, run) == "done"
 
     # G: requires_human_review with no review result -> awaiting_review/pending
     def test_G_human_review_awaiting_when_required_and_undecided(self, dashboard_script):
@@ -356,16 +408,24 @@ class TestPipelineTruthModel:
         run = _completed_run(human_review_required=False)
         assert self._state(dashboard_script, node, run) == "not_applicable"
 
-    # H: actual recorded review result -> Human Review = done
-    def test_H_human_review_done_when_a_real_decision_field_is_present(self, dashboard_script):
-        # No current backend code path ever sets human_review_decision
-        # -- this is a forward-compatible-only check. Documented here
-        # explicitly so a future reviewer knows this branch is
-        # currently unreachable with real production data, not dead
-        # code by accident.
+    def test_G3_human_review_awaiting_with_real_pending_case(self, dashboard_script):
         node = {"key": "human_review", "stages": ["human_review"]}
-        run = _completed_run(human_review_required=True, human_review_decision="approved")
+        run = self._lifecycle_run([self._result(approval_state="pending")])
+        assert self._state(dashboard_script, node, run) == "awaiting_review"
+
+    # H: actual recorded review result -> Human Review = done
+    def test_H_human_review_done_when_all_real_cases_reviewed(self, dashboard_script):
+        node = {"key": "human_review", "stages": ["human_review"]}
+        run = self._lifecycle_run([self._result(approval_state="approved")], status="completed", current_stage="complete")
         assert self._state(dashboard_script, node, run) == "done"
+
+    def test_H2_human_review_awaiting_if_any_case_still_pending(self, dashboard_script):
+        node = {"key": "human_review", "stages": ["human_review"]}
+        run = self._lifecycle_run([
+            self._result(finding_id="CF-1", approval_state="approved"),
+            self._result(finding_id="CF-2", approval_state="pending"),
+        ])
+        assert self._state(dashboard_script, node, run) == "awaiting_review"
 
     # I: completed run -> Complete = done
     def test_I_complete_done_on_completed_run(self, dashboard_script):
@@ -375,6 +435,14 @@ class TestPipelineTruthModel:
     def test_I2_complete_not_done_on_a_still_running_run(self, dashboard_script):
         node = {"key": "complete", "stages": ["complete"]}
         run = _completed_run(status="running", current_stage="tool_execution")
+        assert self._state(dashboard_script, node, run) != "done"
+
+    def test_I3_complete_not_done_while_awaiting_human_review(self, dashboard_script):
+        # Real regression guard: a Full Security Lifecycle run's
+        # non-terminal "awaiting_human_review" status must never show
+        # Complete = done -- the run genuinely isn't finished yet.
+        node = {"key": "complete", "stages": ["complete"]}
+        run = self._lifecycle_run([self._result()])
         assert self._state(dashboard_script, node, run) != "done"
 
     def test_no_blanket_completed_override_remains_in_source(self, dashboard_html):
@@ -461,6 +529,72 @@ class TestFindingsEvidenceDisplay:
         # title to a fixed tool list.
         assert 'title === "Content Security Policy' not in dashboard_html
         assert "CSP Header Not Set" not in dashboard_html or "tools_used" in dashboard_html
+
+
+class TestSecurityLifecycleUI:
+    """Full Security Lifecycle dashboard UI: the new run-mode button,
+    the K/L pipeline nodes, and the new lifecycle detail card."""
+
+    def test_050_lifecycle_button_present_distinct_from_bug_bounty_button(self, dashboard_html):
+        assert 'id="lifecycle-start"' in dashboard_html
+        assert "Run Full Security Lifecycle" in dashboard_html
+        assert 'id="bb-start"' in dashboard_html
+        assert "New Bug Bounty Run" in dashboard_html
+
+    def test_051_lifecycle_button_posts_to_dedicated_endpoint(self, dashboard_html):
+        assert '"/api/runs/security-lifecycle"' in dashboard_html
+
+    def test_052_lifecycle_button_never_silently_reuses_bug_bounty_endpoint(self, dashboard_html):
+        import re
+
+        match = re.search(r'el\("lifecycle-start"\)\.addEventListener\("click".*?\}\);', dashboard_html, re.DOTALL)
+        assert match is not None
+        assert "/api/runs/bug-bounty" not in match.group(0)
+
+    def test_053_lifecycle_card_present(self, dashboard_html):
+        assert "L. Security Lifecycle Detail" in dashboard_html
+        assert 'id="lifecycle-body"' in dashboard_html
+
+    def test_054_lifecycle_empty_state_honest(self, dashboard_html):
+        assert "Not a Full Security Lifecycle run." in dashboard_html
+
+    def test_055_renderLifecycle_wired_into_refresh_and_reset(self, dashboard_html):
+        assert dashboard_html.count("renderLifecycle(") >= 3
+
+    def test_056_review_action_labeled_local_not_authenticated(self, dashboard_html):
+        assert "local development/research review action only" in dashboard_html
+        assert "never authenticated" in dashboard_html
+
+    def test_057_review_posts_to_dedicated_lifecycle_review_endpoint(self, dashboard_html):
+        assert "/lifecycle/review" in dashboard_html
+
+    def test_058_purple_recommendation_never_claims_applied(self, dashboard_html):
+        assert "recommendation_created" in dashboard_html or "Recommendation created" in dashboard_html
+        assert "not applied" in dashboard_html.lower()
+
+    def test_059_red_validation_never_claims_executed_attack(self, dashboard_html):
+        lowered = dashboard_html.lower()
+        assert "controlled_validation_unavailable" in dashboard_html or "controlled validation unavailable" in lowered
+        assert "exploit executed" not in lowered
+
+    def test_060_hunt_labeled_scoped_not_executed(self, dashboard_html):
+        assert "Hunt scoped (not executed)" in dashboard_html
+
+    def test_061_lifecycle_outcomes_come_from_real_data_not_hardcoded_finding(self, dashboard_html):
+        # lifecycleOutcomeLabel maps outcome CODES to display text -- it
+        # must never reference a specific Juice Shop finding title.
+        import re
+
+        match = re.search(r"function lifecycleOutcomeLabel\(outcome\) \{.*?\n\}", dashboard_html, re.DOTALL)
+        assert match is not None
+        assert "CSP" not in match.group(0)
+        assert "Juice" not in match.group(0)
+
+    def test_062_pipeline_shows_split_red_and_purple_nodes(self, dashboard_html):
+        # Regression guard: the old combined "Red / Purple" node is gone
+        # -- Red Validation and Purple are now tracked/labeled separately.
+        assert '"key": "red_validation"' in dashboard_html or "key: \"red_validation\"" in dashboard_html
+        assert '"key": "purple"' in dashboard_html or "key: \"purple\"" in dashboard_html
 
 
 class TestSSEFixPreservation:

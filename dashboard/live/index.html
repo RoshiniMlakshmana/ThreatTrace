@@ -106,7 +106,8 @@
 <div class="controls">
   <label>Run: <select id="run-select"><option value="">No runs yet</option></select></label>
   <input id="bb-target" type="text" value="http://localhost:3000/" title="Bug Bounty target (localhost only)">
-  <button id="bb-start">New Bug Bounty Run</button>
+  <button id="bb-start" title="Fast, bounded: http_assessor/crawler/nmap/nuclei/zap only">New Bug Bounty Run</button>
+  <button id="lifecycle-start" title="Slower: Bug Bounty phase, then real Context Prioritization, Security Handoff, Threat Intel/Hunt review, Detection Engineering review, Red Validation fact-check, and Purple remediation for the highest-priority findings">Run Full Security Lifecycle</button>
   <button id="cancel-run" disabled>Cancel Selected Run</button>
   <span class="spacer"></span>
   <details>
@@ -153,6 +154,11 @@
   <section class="card wide" id="card-findings">
     <h2>F. Findings</h2>
     <div id="findings-body" class="empty">No active run.</div>
+  </section>
+
+  <section class="card wide" id="card-lifecycle">
+    <h2>L. Security Lifecycle Detail</h2>
+    <div id="lifecycle-body"><div class="empty">Not a Full Security Lifecycle run.</div></div>
   </section>
 
   <section class="card wide" id="card-evaluation">
@@ -213,13 +219,14 @@ const PIPELINE = [
   { key: "normalize", label: "Normalize", stages: ["normalization"] },
   { key: "correlate", label: "Correlate", stages: ["correlation"] },
   { key: "prioritize", label: "Prioritize", stages: ["prioritization"] },
-  { key: "ti_hunt", label: "TI / Hunt", stages: ["threat_intel"] },
+  { key: "ti_hunt", label: "TI / Hunt", stages: ["threat_intel","threat_hunt"] },
   { key: "detection", label: "Detection", stages: ["detection_engineering"] },
-  { key: "red_purple", label: "Red / Purple", stages: [] },
+  { key: "red_validation", label: "Red Validation", stages: ["red_validation"] },
+  { key: "purple", label: "Purple", stages: ["purple_remediation"] },
   { key: "human_review", label: "Human Review", stages: ["human_review"] },
   { key: "complete", label: "Complete", stages: ["complete"] },
 ];
-const STAGE_ORDER = ["intake","planning","tool_policy","governor","tool_execution","normalization","correlation","prioritization","threat_intel","detection_engineering","human_review","complete"];
+const STAGE_ORDER = ["intake","planning","tool_policy","governor","tool_execution","normalization","correlation","prioritization","threat_intel","threat_hunt","detection_engineering","red_validation","purple_remediation","human_review","complete"];
 const TERMINAL = new Set(["completed","blocked","failed","cancelled"]);
 
 // Mirrors backend.models.EVENT_TYPES exactly. The backend's SSE stream
@@ -232,9 +239,16 @@ const TERMINAL = new Set(["completed","blocked","failed","cancelled"]);
 const EVENT_TYPES = [
   "run_created","run_started","planner_started","planner_completed","tool_policy_evaluated",
   "governor_evaluated","tool_started","tool_completed","tool_failed","http_assessment_completed",
-  "evidence_normalized","finding_correlated","canonical_finding_created","context_prioritized",
-  "handoff_transition","threat_intel_ingested","threat_intel_normalized","telemetry_evaluated",
-  "detection_plan_created","detection_rule_created","detection_rule_validated","human_review_required",
+  "evidence_normalized","finding_correlated","canonical_finding_created",
+  "context_prioritization_started","context_prioritized","handoff_transition",
+  "threat_intel_ingested","threat_intel_normalized",
+  "threat_intel_review_started","threat_intel_review_completed",
+  "threat_hunt_started","threat_hunt_completed","telemetry_evaluated",
+  "detection_plan_created","detection_rule_created","detection_rule_validated",
+  "detection_engineering_started","detection_engineering_completed",
+  "red_validation_started","red_validation_completed",
+  "purple_remediation_started","purple_remediation_completed",
+  "human_review_required","human_review_recorded",
   "run_blocked","run_failed","run_cancelled","run_completed",
 ];
 
@@ -299,45 +313,89 @@ function pipelineStateLabel(state) {
   }[state] || state;
 }
 
-// Real, evidence-based state for one pipeline node. Never infers an
-// optional stage ran merely because run.status/current_stage advanced
-// past it -- see observedEventTypes's own comment for why that
-// inference is false for this backend's actual orchestrator behavior.
+// Real, evidence-based state+label for one pipeline node. Never infers
+// an optional stage ran merely because run.status/current_stage
+// advanced past it -- see observedEventTypes's own comment for why
+// that inference is false for this backend's actual orchestrator
+// behavior. Returns {state, label} -- `state` drives the CSS pill
+// class (a small fixed vocabulary), `label` is the exact human-
+// readable text, which for lifecycle nodes reflects the real
+// aggregated outcome (e.g. "no intel", "telemetry gap"), never a bare
+// generic "done".
 function computeNodeState(node, run, eventsSeen) {
-  if (!run) return node.stages.length === 0 ? "na" : "pending";
+  if (!run) return { state: node.stages.length === 0 ? "na" : "pending", label: null };
 
   if (node.key === "complete") {
     // The one node whose entire purpose IS to reflect run.status
     // directly -- this is the authoritative, truthful signal for it,
     // per this project's own documented run/status contract.
-    if (run.status === "completed") return "done";
-    if (TERMINAL.has(run.status)) return run.status; // blocked / failed / cancelled
-    return "pending";
+    if (run.status === "completed") return { state: "done", label: null };
+    if (TERMINAL.has(run.status)) return { state: run.status, label: null }; // blocked / failed / cancelled
+    return { state: "pending", label: null };
   }
-  if (node.key === "red_purple") {
-    // Never implemented by any current workflow -- always neutral,
-    // never shown as failed/blocked.
-    return "na";
-  }
+
+  const lifecycle = run.lifecycle;
+  const results = lifecycle && Array.isArray(lifecycle.results) ? lifecycle.results : null;
+
   if (node.key === "prioritize") {
-    return eventsSeen.has("context_prioritized") ? "done" : "not_run";
+    if (results) return { state: "done", label: `done (${lifecycle.findings_selected.length} of ${lifecycle.total_canonical_findings} selected)` };
+    return { state: eventsSeen.has("context_prioritized") ? "done" : "not_run", label: null };
   }
+
+  // Before `run.lifecycle` is populated (only written once, right
+  // before the run reaches "awaiting_human_review"), a still-running
+  // lifecycle run's per-finding sub-stages have no aggregate outcome
+  // yet -- fall back to the real "_started" event as an honest "active"
+  // signal, never silently "not_run" while genuinely in progress.
+  const activeIfStarted = (...startedEventTypes) =>
+    startedEventTypes.some(t => eventsSeen.has(t)) ? { state: "active", label: null } : { state: "not_run", label: null };
+
   if (node.key === "ti_hunt") {
-    return (eventsSeen.has("threat_intel_ingested") || eventsSeen.has("threat_intel_normalized")) ? "done" : "not_run";
+    if (!results || !results.length) return activeIfStarted("threat_intel_review_started", "threat_hunt_started");
+    const tiOutcomes = new Set(results.map(r => r.ti_result && r.ti_result.outcome));
+    const huntOutcomes = new Set(results.map(r => r.hunt_result && r.hunt_result.outcome));
+    if (tiOutcomes.has("reviewed_relevant")) return { state: "done", label: "relevant intel found" };
+    if (huntOutcomes.has("hunt_candidate_created")) return { state: "done", label: "hunt scoped" };
+    if (huntOutcomes.has("telemetry_gap")) return { state: "na", label: "telemetry gap" };
+    if (tiOutcomes.has("no_relevant_intel") || tiOutcomes.has("reviewed_no_match")) return { state: "na", label: "no intel" };
+    return { state: "na", label: "evaluated" };
   }
+
   if (node.key === "detection") {
-    return eventsSeen.has("detection_plan_created") ? "done" : "not_run";
+    if (!results || !results.length) return activeIfStarted("detection_engineering_started");
+    const outcomes = new Set(results.map(r => r.detection_result && r.detection_result.outcome));
+    if (outcomes.has("candidate_ready")) return { state: "done", label: "rule candidate created" };
+    if (outcomes.has("needs_review")) return { state: "warn", label: "needs review" };
+    return { state: "na", label: "no rule" };
   }
+
+  if (node.key === "red_validation") {
+    if (!results || !results.length) return activeIfStarted("red_validation_started");
+    // Real, fixed fact: controlled_validation is a declared, not-yet-
+    // implemented capability in this project (see
+    // core.bug_bounty_tool_policy.TOOL_CATALOG) -- never shown as
+    // failed/blocked, never green "done".
+    return { state: "na", label: "controlled validation unavailable" };
+  }
+
+  if (node.key === "purple") {
+    if (!results || !results.length) return activeIfStarted("purple_remediation_started");
+    const allCreated = results.every(r => r.purple_result && r.purple_result.outcome === "recommendation_created");
+    return { state: allCreated ? "done" : "na", label: "recommendation created (not applied)" };
+  }
+
   if (node.key === "human_review") {
-    if (!run.human_review_required) return "not_applicable";
-    // No current workflow ever records an actual review decision
-    // (approve/reject) -- run.human_review_decision is not part of
-    // today's real backend contract; this check is forward-compatible
-    // only and always falls through to "awaiting_review" today.
-    // Caller-supplied approval is never treated as authenticated
-    // identity -- see core.bug_bounty_tool_policy's own documentation.
-    if (run.human_review_decision) return "done";
-    return "awaiting_review";
+    if (results && results.length) {
+      const allReviewed = results.every(r => r.case && r.case.approval_state !== "pending");
+      return allReviewed
+        ? { state: "done", label: "reviewed" }
+        : { state: "awaiting_review", label: `awaiting review (${results.filter(r => r.case.approval_state === "pending").length} pending)` };
+    }
+    if (!run.human_review_required) return { state: "not_applicable", label: null };
+    // No plain Bug-Bounty-only run ever records a real per-finding
+    // review decision today -- this always honestly stays
+    // "awaiting_review" for that run type.
+    return { state: "awaiting_review", label: null };
   }
 
   // Mandatory sequential stages (Bug Bounty / Normalize / Correlate):
@@ -350,19 +408,20 @@ function computeNodeState(node, run, eventsSeen) {
   const currentIndex = STAGE_ORDER.indexOf(run.current_stage);
   const nodeMaxIndex = Math.max(...node.stages.map(s => STAGE_ORDER.indexOf(s)));
   const terminalNonComplete = TERMINAL.has(run.status) && run.status !== "completed";
-  if (currentIndex > nodeMaxIndex) return "done";
-  if (node.stages.includes(run.current_stage)) return terminalNonComplete ? run.status : "active";
-  return "pending";
+  if (currentIndex > nodeMaxIndex) return { state: "done", label: null };
+  if (node.stages.includes(run.current_stage)) return { state: terminalNonComplete ? run.status : "active", label: null };
+  return { state: "pending", label: null };
 }
 
 function renderPipeline(run) {
   const body = el("pipeline-body");
   body.innerHTML = "";
   for (const node of PIPELINE) {
-    const state = computeNodeState(node, run, observedEventTypes);
+    const { state, label } = computeNodeState(node, run, observedEventTypes);
+    const text = label || pipelineStateLabel(state);
     const div = document.createElement("div");
     div.className = "node";
-    div.innerHTML = `<span class="pill ${pillClass(state)}">${esc(pipelineStateLabel(state))}</span><span class="label">${esc(node.label)}</span>`;
+    div.innerHTML = `<span class="pill ${pillClass(state)}" title="${esc(text)}">${esc(text)}</span><span class="label">${esc(node.label)}</span>`;
     body.appendChild(div);
   }
 }
@@ -487,6 +546,95 @@ function renderFindings(run) {
   }).join("");
   body.innerHTML = `<table><thead><tr><th>Finding</th><th>Severity</th><th>Confidence</th><th>Sources</th><th>Evidence</th><th>Review State</th></tr></thead><tbody>${rows}</tbody></table>`;
 }
+
+// All values rendered below come directly from the real run.lifecycle
+// object (set by backend.orchestrator.run_security_lifecycle_workflow /
+// record_lifecycle_human_review from real core.bug_bounty_threat_intel_review /
+// core.bug_bounty_threat_hunt_review / core.security_handoff /
+// core.bug_bounty_purple_remediation results) -- this function never
+// computes an outcome itself, and a plain Bug Bounty-only run (whose
+// run.lifecycle is always null) always shows the honest "not a Full
+// Security Lifecycle run" empty state, never a fabricated one.
+function lifecycleOutcomeLabel(outcome) {
+  return {
+    no_relevant_intel: "No relevant intel", reviewed_no_match: "No matching intel", reviewed_relevant: "Relevant intel found",
+    hunt_candidate_created: "Hunt scoped (not executed)", telemetry_gap: "Telemetry gap",
+    candidate_ready: "Rule candidate created", needs_review: "Needs review", not_applicable: "Not applicable",
+    controlled_validation_unavailable: "Controlled validation unavailable",
+    recommendation_created: "Recommendation created (not applied)",
+  }[outcome] || outcome || "—";
+}
+
+function renderLifecycle(run) {
+  const body = el("lifecycle-body");
+  const lifecycle = run && run.lifecycle;
+  if (!lifecycle) { body.innerHTML = '<div class="empty">Not a Full Security Lifecycle run.</div>'; return; }
+
+  const summary = `
+    <div class="row"><span class="k">Context</span><span>${esc(lifecycle.context_label || "demo/research context")}</span></div>
+    <div class="row"><span class="k">Canonical findings</span><span>${esc(lifecycle.total_canonical_findings ?? 0)}</span></div>
+    <div class="row"><span class="k">Findings selected</span><span>${esc((lifecycle.findings_selected || []).length)} (${esc(lifecycle.selection_reason || "—")})</span></div>
+  `;
+
+  const results = Array.isArray(lifecycle.results) ? lifecycle.results : [];
+  if (!results.length) {
+    body.innerHTML = summary + '<div class="empty">No findings selected for downstream review.</div>';
+    return;
+  }
+
+  const rows = results.map(r => {
+    const c = r.case || {};
+    const reviewCell = c.approval_state === "pending"
+      ? `<button class="lifecycle-approve" data-case-id="${esc(c.case_id)}">Approve</button>
+         <button class="lifecycle-reject" data-case-id="${esc(c.case_id)}">Reject</button>`
+      : `Reviewed &mdash; ${esc((c.approval_state || "—").charAt(0).toUpperCase() + (c.approval_state || "").slice(1))} (${esc(c.approval_reference || "—")})`;
+    return `
+    <tr>
+      <td>${esc(r.finding_id)}</td>
+      <td>${esc(lifecycleOutcomeLabel(r.ti_result && r.ti_result.outcome))}</td>
+      <td>${esc(lifecycleOutcomeLabel(r.hunt_result && r.hunt_result.outcome))}</td>
+      <td>${esc(lifecycleOutcomeLabel(r.detection_result && r.detection_result.outcome))}</td>
+      <td>${esc(lifecycleOutcomeLabel(r.red_validation_result && r.red_validation_result.outcome))}</td>
+      <td>${(r.purple_result && r.purple_result.recommendations || []).map(esc).join("<br>")}</td>
+      <td>${reviewCell}</td>
+    </tr>`;
+  }).join("");
+
+  const reviewNote = `<div class="surface-note">Human review actions here are a <strong>local development/research review action only</strong> -- this backend implements no authentication, so the reference you enter is never verified against any real identity.</div>`;
+
+  body.innerHTML = summary + reviewNote + `
+    <table><thead><tr>
+      <th>Finding</th><th>Threat Intel</th><th>Threat Hunt</th><th>Detection</th><th>Red Validation</th><th>Purple Recommendation</th><th>Human Review</th>
+    </tr></thead><tbody>${rows}</tbody></table>`;
+}
+
+// Event delegation for the dynamically-generated Approve/Reject
+// buttons inside #lifecycle-body -- installed once at load time.
+document.addEventListener("click", async (ev) => {
+  const target = ev.target;
+  if (!(target instanceof HTMLElement)) return;
+  const isApprove = target.classList.contains("lifecycle-approve");
+  const isReject = target.classList.contains("lifecycle-reject");
+  if (!isApprove && !isReject) return;
+  const caseId = target.getAttribute("data-case-id");
+  const approvalState = isApprove ? "approved" : "rejected";
+  const reference = window.prompt(
+    `Enter a local review reference for this ${approvalState === "approved" ? "approval" : "rejection"} (never authenticated, local development/research use only):`,
+    "local-analyst",
+  );
+  if (!reference || !reference.trim()) return;
+  target.disabled = true;
+  try {
+    await api(`/api/runs/${currentRunId}/lifecycle/review`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ case_id: caseId, approval_state: approvalState, approval_reference: reference.trim() }),
+    });
+    await refreshSelectedRun();
+  } catch (e) {
+    alert("Could not record review: " + (e.body ? e.body.message : e.message));
+    target.disabled = false;
+  }
+});
 
 // All values rendered below come directly from run.attack_surface (set by
 // backend.orchestrator from a real core.bug_bounty_crawler result, or from
@@ -760,6 +908,7 @@ async function refreshSelectedRun() {
     renderFindings(run);
     renderDetection(run);
     renderAttackSurface(run);
+    renderLifecycle(run);
     if (TERMINAL.has(run.status)) loadEvaluation(currentRunId);
     else renderEvaluation(null);
   } catch (e) { /* run may have been evicted; ignore */ }
@@ -789,7 +938,7 @@ async function selectRun(runId) {
   el("feed-body").innerHTML = '<div class="empty">Loading…</div>';
   el("governor-body").innerHTML = '<div class="empty">No Governor evaluation yet.</div>';
   if (!runId) {
-    renderStatus(null); renderPipeline(null); renderTools(null); renderFindings(null); renderDetection(null); renderTi(null); renderEvaluation(null); renderAttackSurface(null);
+    renderStatus(null); renderPipeline(null); renderTools(null); renderFindings(null); renderDetection(null); renderTi(null); renderEvaluation(null); renderAttackSurface(null); renderLifecycle(null);
     return;
   }
   // Fetch and replay full event history FIRST so observedEventTypes is
@@ -820,6 +969,23 @@ el("bb-start").addEventListener("click", async () => {
     alert("Could not start run: " + (e.body ? e.body.message : e.message));
   } finally {
     el("bb-start").disabled = false;
+  }
+});
+
+el("lifecycle-start").addEventListener("click", async () => {
+  el("lifecycle-start").disabled = true;
+  try {
+    const target = el("bb-target").value.trim();
+    const result = await api("/api/runs/security-lifecycle", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ target }),
+    });
+    await refreshRunList();
+    el("run-select").value = result.run_id;
+    await selectRun(result.run_id);
+  } catch (e) {
+    alert("Could not start Full Security Lifecycle run: " + (e.body ? e.body.message : e.message));
+  } finally {
+    el("lifecycle-start").disabled = false;
   }
 });
 
@@ -858,7 +1024,7 @@ async function loadSystemInfo() {
   } catch (e) { renderReadiness(null); /* backend unreachable; health badge already reflects this */ }
 }
 
-renderStatus(null); renderPipeline(null); renderTools(null); renderFindings(null); renderDetection(null); renderTi(null); renderAttackSurface(null);
+renderStatus(null); renderPipeline(null); renderTools(null); renderFindings(null); renderDetection(null); renderTi(null); renderAttackSurface(null); renderLifecycle(null);
 checkHealth();
 loadSystemInfo();
 refreshRunList();

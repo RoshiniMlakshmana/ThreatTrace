@@ -80,7 +80,13 @@ from starlette.routing import Route
 
 from backend.event_bus import EventBus, EventBusError
 from backend.models import TERMINAL_STATUSES, RunModelError, validate_local_only_target
-from backend.orchestrator import TRIGGER_SOURCES, run_bug_bounty_workflow, run_detection_workflow
+from backend.orchestrator import (
+    TRIGGER_SOURCES,
+    record_lifecycle_human_review,
+    run_bug_bounty_workflow,
+    run_detection_workflow,
+    run_security_lifecycle_workflow,
+)
 from backend.run_store import RunStore, RunStoreError, is_valid_run_id
 from core.bug_bounty_juice_shop_evaluation import evaluate_bug_bounty_run_against_juice_shop_benchmark
 from runtime.tool_runtime import evaluate_tool_readiness
@@ -306,6 +312,97 @@ async def create_bug_bounty_run(request: Request) -> Response:
 
 
 @_api_route
+async def create_security_lifecycle_run(request: Request) -> Response:
+    """Starts one real Full Security Lifecycle run: the exact same Bug
+    Bounty phase `POST /api/runs/bug-bounty` runs, continued into real
+    Context Prioritization, Security Handoff, Threat Intel/Hunt review,
+    Detection Engineering review, a Red Validation fact-check, and a
+    Purple remediation recommendation for the highest-priority findings.
+    Remains localhost/demo-target only -- `validate_local_only_target`
+    is the same authoritative check `create_bug_bounty_run` uses, never
+    weakened or bypassed here. Shares the same single-active-offensive-
+    assessment concurrency slot as a plain Bug Bounty run (this run
+    still executes the exact same real nmap/nuclei/zap tools)."""
+    body = await _read_json_body(request)
+    try:
+        target = validate_local_only_target(body.get("target"))
+    except RunModelError as exc:
+        raise _ApiError(400, _error_code_from_message(str(exc)), str(exc))
+
+    available_telemetry = body.get("available_telemetry")
+    if available_telemetry is None:
+        available_telemetry = []
+    if not isinstance(available_telemetry, list) or not all(isinstance(item, str) for item in available_telemetry):
+        raise _ApiError(400, "INVALID_AVAILABLE_TELEMETRY", "available_telemetry must be a list of strings.")
+
+    detection_llm_proposals = body.get("detection_llm_proposals")
+    if detection_llm_proposals is not None and not isinstance(detection_llm_proposals, dict):
+        raise _ApiError(400, "INVALID_DETECTION_LLM_PROPOSALS", "detection_llm_proposals must be a JSON object.")
+
+    if _run_store.active_bug_bounty_run_id() is not None:
+        raise _ApiError(409, "CONCURRENT_RUN_ACTIVE", "Another Bug Bounty run is already active.")
+
+    run = _run_store.create_run(run_type="bug_bounty", created_at=_now())
+    if not _run_store.try_acquire_bug_bounty_slot(run_id=run["run_id"]):
+        _run_store.transition(
+            run_id=run["run_id"], new_status="blocked", completed_at=_now(),
+            limitations=["CONCURRENT_RUN_ACTIVE: another Bug Bounty run claimed the slot first."],
+        )
+        raise _ApiError(409, "CONCURRENT_RUN_ACTIVE", "Another Bug Bounty run is already active.")
+
+    _event_bus.publish(
+        run_id=run["run_id"], event_type="run_created", timestamp=_now(), stage="intake",
+        source_component="orchestrator", summary=f"Run created (full_security_lifecycle) for target {target}",
+        sanitized_payload={"target": target, "mode": "full_security_lifecycle"},
+    )
+
+    thread = threading.Thread(
+        target=run_security_lifecycle_workflow,
+        kwargs={
+            "run_id": run["run_id"], "target": target, "run_store": _run_store, "event_bus": _event_bus,
+            "available_telemetry": available_telemetry, "detection_llm_proposals": detection_llm_proposals,
+        },
+        daemon=True,
+    )
+    thread.start()
+
+    return JSONResponse({"run_id": run["run_id"], "status": run["status"]}, status_code=202)
+
+
+@_api_route
+async def record_lifecycle_review(request: Request) -> Response:
+    """Records one local development/research review decision
+    (`"approved"`/`"rejected"`) against one Security Handoff case within
+    an `"awaiting_human_review"` Full Security Lifecycle run. No
+    authentication exists in this backend -- `approval_reference` is
+    always a caller-supplied string, never verified against any real
+    identity."""
+    run_id = _require_valid_run_id(request.path_params["run_id"])
+    _get_run_or_404(run_id)
+    body = await _read_json_body(request)
+
+    case_id = body.get("case_id")
+    if not isinstance(case_id, str) or not case_id.strip():
+        raise _ApiError(400, "INVALID_CASE_ID", "case_id must be a non-blank string.")
+    approval_state = body.get("approval_state")
+    if approval_state not in ("approved", "rejected"):
+        raise _ApiError(400, "INVALID_APPROVAL_STATE", "approval_state must be 'approved' or 'rejected'.")
+    approval_reference = body.get("approval_reference")
+    if not isinstance(approval_reference, str) or not approval_reference.strip():
+        raise _ApiError(400, "INVALID_APPROVAL_REFERENCE", "approval_reference must be a non-blank string.")
+
+    try:
+        updated_run = record_lifecycle_human_review(
+            run_id=run_id, case_id=case_id, approval_state=approval_state, approval_reference=approval_reference,
+            run_store=_run_store, event_bus=_event_bus,
+        )
+    except ValueError as exc:
+        raise _ApiError(400, _error_code_from_message(str(exc)), str(exc))
+
+    return JSONResponse({"run_id": run_id, "status": updated_run["status"], "lifecycle": updated_run["lifecycle"]})
+
+
+@_api_route
 async def create_detection_run(request: Request) -> Response:
     body = await _read_json_body(request)
 
@@ -455,6 +552,7 @@ routes = [
     Route("/api/system", system_info, methods=["GET"]),
     Route("/api/runs", list_runs, methods=["GET"]),
     Route("/api/runs/bug-bounty", create_bug_bounty_run, methods=["POST"]),
+    Route("/api/runs/security-lifecycle", create_security_lifecycle_run, methods=["POST"]),
     Route("/api/runs/detection", create_detection_run, methods=["POST"]),
     Route("/api/runs/{run_id}", get_run, methods=["GET"]),
     Route("/api/runs/{run_id}/events", get_events, methods=["GET"]),
@@ -462,6 +560,7 @@ routes = [
     Route("/api/runs/{run_id}/report", get_report, methods=["GET"]),
     Route("/api/runs/{run_id}/evaluation", get_evaluation, methods=["GET"]),
     Route("/api/runs/{run_id}/cancel", cancel_run, methods=["POST"]),
+    Route("/api/runs/{run_id}/lifecycle/review", record_lifecycle_review, methods=["POST"]),
 ]
 
 app = Starlette(routes=routes)

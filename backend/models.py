@@ -97,15 +97,27 @@ EVENT_TYPES = frozenset({
     "evidence_normalized",
     "finding_correlated",
     "canonical_finding_created",
+    "context_prioritization_started",
     "context_prioritized",
     "handoff_transition",
     "threat_intel_ingested",
     "threat_intel_normalized",
+    "threat_intel_review_started",
+    "threat_intel_review_completed",
+    "threat_hunt_started",
+    "threat_hunt_completed",
     "telemetry_evaluated",
     "detection_plan_created",
     "detection_rule_created",
     "detection_rule_validated",
+    "detection_engineering_started",
+    "detection_engineering_completed",
+    "red_validation_started",
+    "red_validation_completed",
+    "purple_remediation_started",
+    "purple_remediation_completed",
     "human_review_required",
+    "human_review_recorded",
     "run_blocked",
     "run_failed",
     "run_cancelled",
@@ -122,7 +134,10 @@ STAGES = frozenset({
     "correlation",
     "prioritization",
     "threat_intel",
+    "threat_hunt",
     "detection_engineering",
+    "red_validation",
+    "purple_remediation",
     "human_review",
     "complete",
 })
@@ -138,6 +153,12 @@ SOURCE_COMPONENTS = frozenset({
     "bug_bounty_finding_correlation",
     "bug_bounty_final_report",
     "threat_intelligence",
+    "context_prioritization",
+    "security_handoff",
+    "bug_bounty_threat_intel_review",
+    "bug_bounty_threat_hunt_review",
+    "bug_bounty_purple_remediation",
+    "security_experience_memory",
     "detection_trigger",
     "detection_telemetry",
     "detection_planner",
@@ -172,6 +193,7 @@ _RUN_FIELD_DEFAULTS: dict[str, Any] = {
     "cancellation_requested": False,
     "report": None,
     "attack_surface": None,
+    "lifecycle": None,
 }
 
 _RUN_MUTABLE_FIELDS = frozenset(_RUN_FIELD_DEFAULTS) | {"status", "current_stage", "started_at", "completed_at"}
@@ -243,7 +265,9 @@ def build_run(*, run_id: Any, run_type: Any, created_at: Any) -> dict[str, Any]:
     `detection_trigger_count`/`rule_candidate_count` (`0`),
     `governor_decisions` (empty list), `human_review_required`
     (`False`), `limitations` (empty list), `error_summary` (`None`),
-    `cancellation_requested` (`False`), `report` (`None`).
+    `cancellation_requested` (`False`), `report` (`None`), `attack_surface`
+    (`None`), `lifecycle` (`None` -- populated only for a Full Security
+    Lifecycle run; a plain Bug-Bounty-only run never sets this).
     """
     validated_run_id = _require_nonblank_string(run_id, _raise_run, "INVALID_RUN_ID", "run_id")
     if not isinstance(run_type, str) or run_type not in RUN_TYPES:

@@ -53,11 +53,13 @@ cancellation is out of scope for this checkpoint.
 from __future__ import annotations
 
 import traceback
+from collections.abc import Mapping
 from datetime import datetime, timezone
 from typing import Any, Callable
 from urllib.parse import urlsplit
 
 from adapters.bug_bounty_http import BugBountyHttpTransport
+from adapters.threat_intel_nvd import fetch_nvd_records
 from backend.event_bus import EventBus
 from backend.models import TERMINAL_STATUSES, resolve_execution_target, validate_local_only_target
 from backend.run_store import RunStore
@@ -66,9 +68,13 @@ from core.bug_bounty_crawler import BugBountyCrawlerError, run_bug_bounty_crawl
 from core.bug_bounty_evidence_normalization import BugBountyEvidenceNormalizationError, normalize_bug_bounty_evidence
 from core.bug_bounty_final_report import BugBountyFinalReportError, build_final_bug_bounty_report
 from core.bug_bounty_finding_correlation import BugBountyFindingCorrelationError, correlate_bug_bounty_evidence
+from core.bug_bounty_purple_remediation import PurpleRemediationError, build_purple_remediation_recommendation
 from core.bug_bounty_scope import BugBountyScopeError, create_bug_bounty_scope
+from core.bug_bounty_threat_hunt_review import ThreatHuntReviewError, review_threat_hunt_for_finding
+from core.bug_bounty_threat_intel_review import ThreatIntelReviewError, review_threat_intelligence_for_finding
 from core.bug_bounty_tool_execution import BugBountyToolExecutionError, execute_bug_bounty_tool
 from core.bug_bounty_tool_policy import BugBountyToolPolicyError, evaluate_tool_permission
+from core.context_prioritization import ContextPrioritizationError, prioritize_finding
 from core.detection_engineering_report import DetectionEngineeringReportError, build_detection_engineering_report
 from core.detection_planner import DetectionPlannerError, validate_detection_plan
 from core.detection_rule import DetectionRuleError, apply_validation_result, build_detection_rule
@@ -77,6 +83,13 @@ from core.detection_rule_validation import DetectionRuleValidationError, validat
 from core.detection_telemetry import DetectionTelemetryError, evaluate_telemetry_feasibility
 from core.detection_trigger import DetectionTriggerError, build_bug_bounty_trigger, build_threat_intelligence_trigger
 from core.security_governor import SecurityGovernorError, evaluate_security_governor_event
+from core.security_experience_memory import SecurityExperienceMemoryError, create_security_experience
+from core.security_handoff import (
+    SecurityHandoffError,
+    append_security_stage_result,
+    create_security_handoff_case,
+    record_security_handoff_approval,
+)
 
 ORCHESTRATOR_VERSION = "1"
 
@@ -84,7 +97,10 @@ TRIGGER_SOURCES = frozenset({"bug_bounty", "threat_intelligence"})
 
 _MAX_ERROR_SUMMARY_LENGTH = 200
 
-__all__ = ["run_bug_bounty_workflow", "run_detection_workflow", "TRIGGER_SOURCES"]
+__all__ = [
+    "run_bug_bounty_workflow", "run_detection_workflow", "run_security_lifecycle_workflow",
+    "record_lifecycle_human_review", "TRIGGER_SOURCES",
+]
 
 
 def _default_clock() -> str:
@@ -248,56 +264,40 @@ def _build_tool_request(*, run_id: str, tool_id: str, execution_target: str, por
     }
 
 
-def run_bug_bounty_workflow(
+def _run_bug_bounty_core(
     *,
     run_id: str,
     target: str,
     run_store: RunStore,
     event_bus: EventBus,
-    clock: Callable[[], str] | None = None,
+    active_clock: Callable[[], str],
+    emit: _Emitter,
     transport: Any = None,
     env: Any = None,
     execute_tool: Callable[..., dict[str, Any]] = execute_bug_bounty_tool,
-) -> None:
-    """Run one real, bounded, local-only Bug Bounty assessment against
-    `target` (already validated by `backend.models.
-    validate_local_only_target` -- this function re-validates it anyway,
-    defense in depth) through the existing Tool Policy -> Governor ->
-    `http_assessor`/`nmap`/`nuclei`/`zap` -> Evidence Normalization ->
-    Correlation -> Final Report chain, publishing an event at every
-    stage.
+) -> dict[str, Any] | None:
+    """Runs the Bug Bounty phase (scope validation through Tool Policy,
+    Governor, tool execution, Normalization, Correlation, and Final
+    Report) WITHOUT ever marking the run terminal -- unlike
+    `run_bug_bounty_workflow` (a thin wrapper around this function that
+    marks `"completed"` immediately after), this function lets the
+    caller decide what "the run is complete" actually means, so a Full
+    Security Lifecycle run (`run_security_lifecycle_workflow`) can reuse
+    this exact same code path and then continue into further stages
+    before ever transitioning the run to a terminal status --
+    `backend.run_store`'s own terminal-status invariant means a run can
+    never be updated again once marked `"completed"`/`"blocked"`/
+    `"failed"`/`"cancelled"`, so the Bug Bounty phase itself must never
+    be the one to make that call for a lifecycle run.
 
-    `target` is the *display* target (what a user/browser submits --
-    e.g. `http://localhost:3000/`). `backend.models.
-    resolve_execution_target` maps it to the real *execution* target
-    this function actually connects to -- a no-op on host-native
-    deployments, or the configured Docker Compose service address
-    (`http://juice-shop:3000`) on the self-hosted Docker deployment,
-    but only for that one fixed, immutable alias (see that function's
-    own docstring). Every tool this function requests is attempted
-    honestly: an unavailable adapter (missing binary, unreachable
-    daemon) is reported via `tool_failed`, never silently skipped or
-    fabricated as executed.
-
-    `transport` defaults to a real `adapters.bug_bounty_http.
-    BugBountyHttpTransport()` when not supplied; tests inject a fake
-    object satisfying `core.bug_bounty_assessment`'s own minimal
-    `request(*, url, method, headers=None)` protocol instead, exactly
-    like that module's own established injected-transport pattern.
-    `execute_tool` defaults to the real `core.bug_bounty_tool_execution.
-    execute_bug_bounty_tool` (used for `nmap`/`nuclei`/`zap`) and is
-    injectable the same way, so tests never perform real subprocess/
-    network I/O for those three tools either. `env` is injectable for
-    the same reason `backend.models.resolve_execution_target` itself
-    accepts one -- defaults to the real process environment.
-
-    Intended to be called from a background thread by `backend.app`,
-    never from the asyncio event loop directly (it performs real
-    blocking network I/O by default).
+    Returns the real `report` dict (from `core.bug_bounty_final_report.
+    build_final_bug_bounty_report`) on success. Returns `None` if the
+    run was blocked (tool policy denied every tool, or Governor denied
+    execution), cancelled, or failed -- in every one of those cases,
+    `run_store` already reflects the terminal outcome (this function
+    itself calls `run_store.transition`/`_fail_run` before returning),
+    and the caller must simply return without any further action.
     """
-    active_clock = clock or _default_clock
-    emit = _Emitter(run_id=run_id, event_bus=event_bus, clock=active_clock)
-
     try:
         target = validate_local_only_target(target)
         execution_target = resolve_execution_target(display_target=target, env=env)
@@ -313,7 +313,7 @@ def run_bug_bounty_workflow(
 
         if _is_cancelled(run_store=run_store, run_id=run_id):
             _stop_cancelled(run_store=run_store, run_id=run_id, emit=emit, stage="planning", clock=active_clock)
-            return
+            return None
 
         emit(
             "planner_started", "planning", "orchestrator",
@@ -351,7 +351,7 @@ def run_bug_bounty_workflow(
                 limitations=["Tool policy denied every requested tool."],
             )
             emit("run_blocked", "tool_policy", "bug_bounty_tool_policy", "Blocked: tool policy denied every requested tool.")
-            return
+            return None
 
         run_store.update_fields(run_id=run_id, permitted_tools=permitted_tools)
 
@@ -409,11 +409,11 @@ def run_bug_bounty_workflow(
                 limitations=[f"Governor decision: {governor_result['decision']}"],
             )
             emit("run_blocked", "governor", "security_governor", "Blocked: Governor did not allow execution.")
-            return
+            return None
 
         if _is_cancelled(run_store=run_store, run_id=run_id):
             _stop_cancelled(run_store=run_store, run_id=run_id, emit=emit, stage="governor", clock=active_clock)
-            return
+            return None
 
         run_store.transition(run_id=run_id, new_status="running", current_stage="tool_execution")
 
@@ -599,12 +599,7 @@ def run_bug_bounty_workflow(
             canonical_finding_count=len(report["canonical_findings"]), report=report,
             human_review_required=True,
         )
-        run_store.transition(run_id=run_id, new_status="completed", current_stage="complete", completed_at=active_clock())
-        emit(
-            "run_completed", "complete", "orchestrator",
-            f"Bug Bounty run complete: {len(report['canonical_findings'])} canonical findings.",
-            {"canonical_finding_count": len(report["canonical_findings"])},
-        )
+        return report
 
     except (
         BugBountyScopeError, BugBountyToolPolicyError, SecurityGovernorError, BugBountyAssessmentError,
@@ -612,9 +607,604 @@ def run_bug_bounty_workflow(
         BugBountyFindingCorrelationError, BugBountyFinalReportError,
     ) as exc:
         _fail_run(run_store=run_store, emit=emit, run_id=run_id, exc=exc, stage="tool_execution", clock=active_clock)
+        return None
     except Exception as exc:  # noqa: BLE001 -- last-resort honest failure boundary, never a silent crash
         traceback.print_exc()
         _fail_run(run_store=run_store, emit=emit, run_id=run_id, exc=exc, stage="tool_execution", clock=active_clock)
+        return None
+
+
+def run_bug_bounty_workflow(
+    *,
+    run_id: str,
+    target: str,
+    run_store: RunStore,
+    event_bus: EventBus,
+    clock: Callable[[], str] | None = None,
+    transport: Any = None,
+    env: Any = None,
+    execute_tool: Callable[..., dict[str, Any]] = execute_bug_bounty_tool,
+) -> None:
+    """Run one real, bounded, local-only Bug Bounty assessment against
+    `target` (already validated by `backend.models.
+    validate_local_only_target` -- this function re-validates it anyway,
+    defense in depth) through the existing Tool Policy -> Governor ->
+    `http_assessor`/`nmap`/`nuclei`/`zap` -> Evidence Normalization ->
+    Correlation -> Final Report chain, publishing an event at every
+    stage.
+
+    `target` is the *display* target (what a user/browser submits --
+    e.g. `http://localhost:3000/`). `backend.models.
+    resolve_execution_target` maps it to the real *execution* target
+    this function actually connects to -- a no-op on host-native
+    deployments, or the configured Docker Compose service address
+    (`http://juice-shop:3000`) on the self-hosted Docker deployment,
+    but only for that one fixed, immutable alias (see that function's
+    own docstring). Every tool this function requests is attempted
+    honestly: an unavailable adapter (missing binary, unreachable
+    daemon) is reported via `tool_failed`, never silently skipped or
+    fabricated as executed.
+
+    `transport` defaults to a real `adapters.bug_bounty_http.
+    BugBountyHttpTransport()` when not supplied; tests inject a fake
+    object satisfying `core.bug_bounty_assessment`'s own minimal
+    `request(*, url, method, headers=None)` protocol instead, exactly
+    like that module's own established injected-transport pattern.
+    `execute_tool` defaults to the real `core.bug_bounty_tool_execution.
+    execute_bug_bounty_tool` (used for `nmap`/`nuclei`/`zap`) and is
+    injectable the same way, so tests never perform real subprocess/
+    network I/O for those three tools either. `env` is injectable for
+    the same reason `backend.models.resolve_execution_target` itself
+    accepts one -- defaults to the real process environment.
+
+    This function is a thin wrapper around `_run_bug_bounty_core`: it
+    runs the exact same Bug Bounty phase, then immediately marks the
+    run `"completed"`/`"complete"` and emits `run_completed` -- the
+    same behavior this function has always had. A Full Security
+    Lifecycle run (`run_security_lifecycle_workflow`) calls
+    `_run_bug_bounty_core` directly instead, so it can continue into
+    further stages before ever marking the run terminal.
+
+    Intended to be called from a background thread by `backend.app`,
+    never from the asyncio event loop directly (it performs real
+    blocking network I/O by default).
+    """
+    active_clock = clock or _default_clock
+    emit = _Emitter(run_id=run_id, event_bus=event_bus, clock=active_clock)
+
+    report = _run_bug_bounty_core(
+        run_id=run_id, target=target, run_store=run_store, event_bus=event_bus, active_clock=active_clock,
+        emit=emit, transport=transport, env=env, execute_tool=execute_tool,
+    )
+    if report is None:
+        return
+
+    run_store.transition(run_id=run_id, new_status="completed", current_stage="complete", completed_at=active_clock())
+    emit(
+        "run_completed", "complete", "orchestrator",
+        f"Bug Bounty run complete: {len(report['canonical_findings'])} canonical findings.",
+        {"canonical_finding_count": len(report["canonical_findings"])},
+    )
+
+
+# ---------------------------------------------------------------------------
+# Full Security Lifecycle workflow
+# ---------------------------------------------------------------------------
+
+# Bounded, deterministic -- a real Bug Bounty run can produce many
+# canonical findings; only the highest-priority `MAX_LIFECYCLE_FINDINGS`
+# (by real core.context_prioritization.prioritize_finding score, never
+# title/discovery order) are ever carried into the expensive downstream
+# stages (Threat Intel/Hunt/Detection/Red/Purple review).
+MAX_LIFECYCLE_FINDINGS = 3
+
+# An explicitly-labeled demo/research context -- never presented as a
+# real organization's risk profile. This project's only live target is
+# the local OWASP Juice Shop research container; every field here is
+# chosen to honestly describe that (a throwaway, non-production,
+# internet-inaccessible research sandbox), never a fabricated business
+# context.
+DEMO_LIFECYCLE_CONTEXT: dict[str, Any] = {
+    "context_version": "1",
+    "industry": "general",
+    "environment": "sandbox",
+    "asset_criticality": "low",
+    "exposure": "internal",
+    "data_sensitivity": "public",
+    "detection_coverage": "unknown",
+    "compensating_controls": "unknown",
+    "threat_activity": "none_observed",
+    "regulatory_relevance": "none",
+}
+
+
+def _canonical_finding_to_prioritization_input(canonical_finding: Mapping[str, Any]) -> dict[str, Any]:
+    """Adapts a real `core.bug_bounty_final_report` canonical finding
+    into the shape both `core.context_prioritization.prioritize_finding`
+    AND `core.security_handoff.create_security_handoff_case` require
+    (each matching `core.bug_bounty_findings.create_bug_bounty_finding`'s
+    own contract, but validated to different depths by each caller).
+
+    `prioritize_finding` only checks the *presence* of
+    `vulnerability_class`/`evidence`/`validation`/`owasp_category`/`cwe`
+    -- never their content. `create_security_handoff_case`, however,
+    validates `evidence` more strictly: a non-empty list of mappings,
+    each carrying a well-formed `evidence_digest` (`sha256:<64 hex>`).
+    The canonical finding's own real `evidence_digests` (a list of
+    already-sha256-formatted strings, produced by
+    `core.bug_bounty_final_report` from real correlated evidence
+    records) is reshaped into that exact `[{"evidence_digest": ...}]`
+    form here -- this is a real digest already computed over real
+    evidence, never a fabricated one.
+
+    `finding_status` is always `"candidate"`: every canonical finding
+    this project produces carries `status: "requires_human_review"`
+    (never a recorded human validation), so `"candidate"` -- never
+    `"validated"` -- is the only honest mapping. `confidence` defaults
+    to `"medium"` only if the canonical finding's own value is somehow
+    outside the recognized confidence levels (structurally required by
+    both downstream functions; never silently drops a finding from
+    prioritization/handoff).
+    """
+    confidence = canonical_finding.get("confidence")
+    if confidence not in ("low", "medium", "high"):
+        confidence = "medium"
+    real_digests = [d for d in (canonical_finding.get("evidence_digests") or []) if isinstance(d, str) and d]
+    return {
+        "finding_version": "1",
+        "finding_id": canonical_finding["finding_id"],
+        "finding_status": "candidate",
+        "technical_severity": canonical_finding.get("technical_severity"),
+        "confidence": confidence,
+        "vulnerability_class": canonical_finding.get("vulnerability_class"),
+        "evidence": [{"evidence_digest": digest} for digest in real_digests],
+        "validation": canonical_finding.get("validation_state"),
+        "owasp_category": canonical_finding.get("owasp_category"),
+        "cwe": canonical_finding.get("cwe"),
+    }
+
+
+def _select_top_findings(
+    canonical_findings: list[dict[str, Any]], prioritizations_by_id: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    ranked = sorted(
+        canonical_findings, key=lambda f: prioritizations_by_id[f["finding_id"]]["priority_score"]["final"], reverse=True,
+    )
+    return ranked[:MAX_LIFECYCLE_FINDINGS]
+
+
+def _review_detection_engineering_for_finding(
+    *, canonical_finding: Mapping[str, Any], available_telemetry: list[str], llm_proposal: Any, run_id: str,
+) -> dict[str, Any]:
+    """Real Detection Trigger -> Telemetry Feasibility -> (only with a
+    genuine caller-supplied `llm_proposal`) Detection Planner ->
+    deterministic validation -> rule candidate -> deduplication ->
+    structural syntax validation, exactly reusing every existing
+    `core.detection_*` function `run_detection_workflow` itself calls --
+    never reimplemented. Never fabricates an `llm_proposal` when the
+    caller supplied none for this finding: `outcome` is honestly
+    `"not_applicable"` in that case, exactly like a genuine
+    `"TELEMETRY_GAP"`, distinguished only by `reason`.
+    """
+    trigger = build_bug_bounty_trigger(canonical_finding=dict(canonical_finding))
+    telemetry_result = evaluate_telemetry_feasibility(
+        required_telemetry_candidates=trigger["required_telemetry_candidates"], available_telemetry=available_telemetry,
+    )
+
+    if telemetry_result["decision"] == "TELEMETRY_GAP":
+        return {
+            "trigger_id": trigger["trigger_id"], "telemetry_decision": telemetry_result["decision"],
+            "outcome": "not_applicable", "reason": "telemetry_gap", "rule": None,
+        }
+    if not isinstance(llm_proposal, Mapping):
+        return {
+            "trigger_id": trigger["trigger_id"], "telemetry_decision": telemetry_result["decision"],
+            "outcome": "not_applicable", "reason": "no_llm_proposal_supplied", "rule": None,
+        }
+
+    plan = {
+        "plan_version": "1", "plan_id": f"DP-{run_id}-{trigger['trigger_id']}", "trigger": trigger,
+        "telemetry_feasibility": telemetry_result, "detection_objective": llm_proposal.get("detection_objective"),
+        "proposed_rules": llm_proposal.get("proposed_rules", []),
+        "telemetry_recommendation": llm_proposal.get("telemetry_recommendation"),
+    }
+    validated_plan = validate_detection_plan(plan=plan)
+    if not validated_plan["proposed_rules"]:
+        return {
+            "trigger_id": trigger["trigger_id"], "telemetry_decision": telemetry_result["decision"],
+            "outcome": "not_applicable", "reason": "llm_proposal_had_no_rules", "rule": None,
+        }
+
+    draft = validated_plan["proposed_rules"][0]
+    rule = build_detection_rule(validated_rule_draft=draft, trigger=trigger, data_source=None)
+    check_rule_duplicate(candidate_rule=rule, existing_rules=[])
+    syntax_result = validate_rule_syntax(rule_format=rule["rule_format"], rule_content=rule["generic_rule"])
+    if syntax_result["syntax_valid"]:
+        rule = apply_validation_result(
+            rule=rule, validation_status="syntax_validated",
+            known_limitations_addendum="Structural syntax check only -- not detection-efficacy tested.",
+        )
+        outcome, reason = "candidate_ready", "rule_generated"
+    else:
+        rule = apply_validation_result(
+            rule=rule, validation_status="rejected",
+            known_limitations_addendum="Failed bounded structural syntax check: " + "; ".join(syntax_result["issues"]),
+        )
+        outcome, reason = "needs_review", "syntax_rejected"
+
+    return {
+        "trigger_id": trigger["trigger_id"], "telemetry_decision": telemetry_result["decision"],
+        "outcome": outcome, "reason": reason, "rule": rule,
+    }
+
+
+def _process_lifecycle_finding(
+    *, run_id: str, canonical_finding: dict[str, Any], prioritization: dict[str, Any],
+    available_telemetry: list[str], llm_proposal: Any, emit: _Emitter,
+) -> dict[str, Any]:
+    """Walks one selected canonical finding through the real Security
+    Handoff stage graph (`core.security_handoff`), calling a real review
+    function/module at every stage -- never fabricating a result, never
+    reimplementing `core.security_handoff`'s own transition logic."""
+    adapted_finding = _canonical_finding_to_prioritization_input(canonical_finding)
+    case = create_security_handoff_case(finding=adapted_finding, prioritization=prioritization)
+
+    # --- Threat Intelligence review ---
+    emit(
+        "threat_intel_review_started", "threat_intel", "bug_bounty_threat_intel_review",
+        f"Reviewing threat intelligence for {canonical_finding['finding_id']}.",
+    )
+    ti_result = review_threat_intelligence_for_finding(canonical_finding=canonical_finding, nvd_fetch=fetch_nvd_records)
+    ti_handoff_outcome = {"no_relevant_intel": "reviewed_no_match", "reviewed_no_match": "reviewed_no_match", "reviewed_relevant": "reviewed_relevant"}[ti_result["outcome"]]
+    case = append_security_stage_result(
+        case=case, stage="threat_intel_review", role="threat_intelligence", result_type="assessment",
+        outcome=ti_handoff_outcome, evidence_references=[{"reference_type": "finding", "reference": canonical_finding["finding_id"]}],
+        recommendation=f"Threat intel review outcome: {ti_result['outcome']}.",
+    )
+    emit(
+        "threat_intel_review_completed", "threat_intel", "bug_bounty_threat_intel_review",
+        f"Threat intel outcome for {canonical_finding['finding_id']}: {ti_result['outcome']}.",
+        {"finding_id": canonical_finding["finding_id"], "outcome": ti_result["outcome"], "real_query_performed": ti_result["real_query_performed"]},
+    )
+
+    # --- Threat Hunt review ---
+    emit(
+        "threat_hunt_started", "threat_hunt", "bug_bounty_threat_hunt_review",
+        f"Reviewing hunt feasibility for {canonical_finding['finding_id']}.",
+    )
+    hunt_result = review_threat_hunt_for_finding(canonical_finding=canonical_finding, available_telemetry=available_telemetry)
+    hunt_handoff_outcome = "planned" if hunt_result["outcome"] == "hunt_candidate_created" else "not_applicable"
+    case = append_security_stage_result(
+        case=case, stage="threat_hunt", role="threat_hunting", result_type="plan",
+        outcome=hunt_handoff_outcome, evidence_references=[{"reference_type": "finding", "reference": canonical_finding["finding_id"]}],
+        recommendation=hunt_result["hunt_hypothesis"],
+    )
+    emit(
+        "threat_hunt_completed", "threat_hunt", "bug_bounty_threat_hunt_review",
+        f"Hunt outcome for {canonical_finding['finding_id']}: {hunt_result['outcome']}.",
+        {"finding_id": canonical_finding["finding_id"], "outcome": hunt_result["outcome"], "missing_telemetry": hunt_result["missing_telemetry"]},
+    )
+
+    # --- Detection Engineering review ---
+    emit(
+        "detection_engineering_started", "detection_engineering", "detection_trigger",
+        f"Evaluating detection engineering for {canonical_finding['finding_id']}.",
+    )
+    detection_result = _review_detection_engineering_for_finding(
+        canonical_finding=canonical_finding, available_telemetry=available_telemetry,
+        llm_proposal=llm_proposal, run_id=run_id,
+    )
+    case = append_security_stage_result(
+        case=case, stage="detection_engineering", role="blue_team", result_type="candidate",
+        outcome=detection_result["outcome"], evidence_references=[{"reference_type": "finding", "reference": canonical_finding["finding_id"]}],
+        recommendation=f"Detection engineering outcome: {detection_result['outcome']} ({detection_result['reason']}).",
+    )
+    emit(
+        "detection_engineering_completed", "detection_engineering", "detection_trigger",
+        f"Detection outcome for {canonical_finding['finding_id']}: {detection_result['outcome']} ({detection_result['reason']}).",
+        {"finding_id": canonical_finding["finding_id"], "outcome": detection_result["outcome"], "reason": detection_result["reason"]},
+    )
+
+    # --- Red Validation ---
+    # Real, honest, fixed fact: authenticated_testing/controlled_validation
+    # are declared, not-yet-implemented capabilities (see
+    # core.bug_bounty_tool_policy.TOOL_CATALOG) -- there is no automated
+    # exploit/validation engine anywhere in this project, so this outcome
+    # is always the same real fact, never a per-finding guess.
+    red_validation_result = {"outcome": "controlled_validation_unavailable", "reason": "controlled_validation not implemented"}
+    if case["current_stage"] == "red_validation":
+        emit(
+            "red_validation_started", "red_validation", "security_handoff",
+            f"Evaluating red validation availability for {canonical_finding['finding_id']}.",
+        )
+        case = append_security_stage_result(
+            case=case, stage="red_validation", role="red_team", result_type="assessment",
+            outcome="not_applicable", evidence_references=[{"reference_type": "finding", "reference": canonical_finding["finding_id"]}],
+            recommendation="Controlled/automated validation is not implemented in this project -- human validation required.",
+        )
+        emit(
+            "red_validation_completed", "red_validation", "security_handoff",
+            f"Red validation for {canonical_finding['finding_id']}: controlled_validation_unavailable.",
+            {"finding_id": canonical_finding["finding_id"], "outcome": "controlled_validation_unavailable"},
+        )
+
+    # --- Purple Remediation ---
+    emit(
+        "purple_remediation_started", "purple_remediation", "bug_bounty_purple_remediation",
+        f"Building remediation recommendation for {canonical_finding['finding_id']}.",
+    )
+    purple_result = build_purple_remediation_recommendation(
+        canonical_finding=canonical_finding, ti_result=ti_result, hunt_result=hunt_result,
+        detection_result=detection_result, red_validation_result=red_validation_result,
+    )
+    case = append_security_stage_result(
+        case=case, stage="purple_remediation", role="purple_ir", result_type="recommendation",
+        outcome="planned", evidence_references=[{"reference_type": "finding", "reference": canonical_finding["finding_id"]}],
+        recommendation="; ".join(purple_result["recommendations"]),
+    )
+    emit(
+        "purple_remediation_completed", "purple_remediation", "bug_bounty_purple_remediation",
+        f"Remediation recommendation created for {canonical_finding['finding_id']}.",
+        {"finding_id": canonical_finding["finding_id"], "recommendation_count": len(purple_result["recommendations"])},
+    )
+
+    # append_security_stage_result auto-transitions to "human_review"
+    # with approval_state="pending" the instant purple_remediation
+    # completes with a non-blocking outcome -- see core.security_handoff's
+    # own transition graph. This is never set manually here.
+    emit(
+        "human_review_required", "human_review", "security_handoff",
+        f"Handoff case {case['case_id']} awaiting human review.", {"case_id": case["case_id"], "finding_id": canonical_finding["finding_id"]},
+    )
+
+    return {
+        "finding_id": canonical_finding["finding_id"], "case": case, "prioritization": prioritization,
+        "ti_result": ti_result, "hunt_result": hunt_result, "detection_result": detection_result,
+        "red_validation_result": red_validation_result, "purple_result": purple_result,
+    }
+
+
+def run_security_lifecycle_workflow(
+    *,
+    run_id: str,
+    target: str,
+    run_store: RunStore,
+    event_bus: EventBus,
+    clock: Callable[[], str] | None = None,
+    transport: Any = None,
+    env: Any = None,
+    execute_tool: Callable[..., dict[str, Any]] = execute_bug_bounty_tool,
+    available_telemetry: Any = (),
+    detection_llm_proposals: Any = None,
+) -> None:
+    """Run one real, bounded, local-only Full Security Lifecycle
+    assessment: the exact same Bug Bounty phase `run_bug_bounty_workflow`
+    runs (reused via `_run_bug_bounty_core`, never duplicated), followed
+    by real Context Prioritization, Security Handoff case creation, and
+    a real Threat Intel review / Threat Hunt review / Detection
+    Engineering review / Red Validation fact-check / Purple Remediation
+    recommendation for each of the highest-priority
+    `MAX_LIFECYCLE_FINDINGS` canonical findings.
+
+    `available_telemetry` (default empty) is a list of
+    `core.detection_telemetry.TELEMETRY_TYPES` values the caller
+    declares as actually available -- passed unchanged to both the
+    Threat Hunt feasibility check and the Detection Engineering
+    telemetry check. `detection_llm_proposals` (default `None`) is an
+    optional mapping of `finding_id -> llm_proposal` (shaped exactly
+    like `run_detection_workflow`'s own `llm_proposal` parameter) for
+    any finding the caller wants a real detection-rule-generation
+    attempt for; a finding with no entry here always gets
+    `outcome="not_applicable"` for Detection Engineering -- this
+    function never fabricates an LLM proposal itself.
+
+    Every dashboard-visible stage state is backed by a real recorded
+    event/result -- this function never marks a stage `"done"` merely
+    because the run itself reached a terminal status.
+    """
+    active_clock = clock or _default_clock
+    emit = _Emitter(run_id=run_id, event_bus=event_bus, clock=active_clock)
+    telemetry_list = list(available_telemetry or [])
+    proposals = detection_llm_proposals if isinstance(detection_llm_proposals, Mapping) else {}
+
+    report = _run_bug_bounty_core(
+        run_id=run_id, target=target, run_store=run_store, event_bus=event_bus, active_clock=active_clock,
+        emit=emit, transport=transport, env=env, execute_tool=execute_tool,
+    )
+    if report is None:
+        return
+
+    if _is_cancelled(run_store=run_store, run_id=run_id):
+        _stop_cancelled(run_store=run_store, run_id=run_id, emit=emit, stage="correlation", clock=active_clock)
+        return
+
+    canonical_findings = report["canonical_findings"]
+
+    run_store.transition(run_id=run_id, new_status="prioritizing", current_stage="prioritization")
+    emit(
+        "context_prioritization_started", "prioritization", "context_prioritization",
+        f"Prioritizing {len(canonical_findings)} canonical finding(s) (demo/research context).",
+    )
+
+    prioritizations_by_id: dict[str, dict[str, Any]] = {}
+    try:
+        for finding in canonical_findings:
+            adapted = _canonical_finding_to_prioritization_input(finding)
+            prioritizations_by_id[finding["finding_id"]] = prioritize_finding(finding=adapted, context=DEMO_LIFECYCLE_CONTEXT)
+    except ContextPrioritizationError as exc:
+        _fail_run(run_store=run_store, emit=emit, run_id=run_id, exc=exc, stage="prioritization", clock=active_clock)
+        return
+
+    selected_findings = _select_top_findings(canonical_findings, prioritizations_by_id)
+    emit(
+        "context_prioritized", "prioritization", "context_prioritization",
+        f"{len(canonical_findings)} finding(s) prioritized; {len(selected_findings)} selected for downstream lifecycle review.",
+        {
+            "total_canonical_findings": len(canonical_findings), "findings_prioritized": len(prioritizations_by_id),
+            "findings_selected": len(selected_findings),
+            "selection_reason": f"top {MAX_LIFECYCLE_FINDINGS} by real context_prioritization priority_score",
+        },
+    )
+
+    lifecycle_results: list[dict[str, Any]] = []
+    try:
+        for finding in selected_findings:
+            result = _process_lifecycle_finding(
+                run_id=run_id, canonical_finding=finding, prioritization=prioritizations_by_id[finding["finding_id"]],
+                available_telemetry=telemetry_list, llm_proposal=proposals.get(finding["finding_id"]), emit=emit,
+            )
+            lifecycle_results.append(result)
+    except (
+        SecurityHandoffError, ThreatIntelReviewError, ThreatHuntReviewError, DetectionTriggerError,
+        DetectionTelemetryError, DetectionPlannerError, DetectionRuleError, DetectionRuleDeduplicationError,
+        DetectionRuleValidationError, PurpleRemediationError,
+    ) as exc:
+        _fail_run(run_store=run_store, emit=emit, run_id=run_id, exc=exc, stage="human_review", clock=active_clock)
+        return
+
+    governor_event = {
+        "event_version": "1", "actor_role": "purple_ir", "action_class": "stage_contribution",
+        "current_stage": "purple_remediation", "required_role": "purple_ir", "gateway_decision": "allow",
+        "identity_decision": "allow", "mutation_freeze_active": False, "approval_state": "not_required",
+        "decision_binding_state": "not_required", "scope_state": "within_scope", "source_truth_state": "unchanged",
+        "remote_content_state": "not_present", "audit_state": "recorded", "prior_policy_denials": 0,
+        "execution_requested": False,
+    }
+    governor_result = evaluate_security_governor_event(event=governor_event)
+    emit(
+        "governor_evaluated", "human_review", "security_governor",
+        f"Governor decision: {governor_result['decision']}",
+        {"decision": governor_result["decision"], "reason_codes": governor_result["reason_codes"], "execution_allowed": governor_result["execution_allowed"]},
+    )
+
+    run_store.update_fields(
+        run_id=run_id,
+        lifecycle={
+            "lifecycle_version": "1",
+            "context": dict(DEMO_LIFECYCLE_CONTEXT),
+            "context_label": "demo/research context",
+            "total_canonical_findings": len(canonical_findings),
+            "findings_prioritized": len(prioritizations_by_id),
+            "findings_selected": [f["finding_id"] for f in selected_findings],
+            "selection_reason": f"top {MAX_LIFECYCLE_FINDINGS} by real context_prioritization priority_score",
+            "results": lifecycle_results,
+            "governor_decision": governor_result["decision"],
+            "governor_result": governor_result,
+            "experiences": [],
+        },
+        governor_decisions=[{"stage": "bug_bounty_assessment", "decision": "allow"}, {"stage": "purple_remediation", "decision": governor_result["decision"]}],
+        human_review_required=True,
+    )
+
+    # Deliberately NOT "completed" here -- every selected finding's real
+    # Security Handoff case is now genuinely awaiting a human decision
+    # (`approval_state: "pending"`), and `backend.run_store`'s own
+    # terminal-status invariant means a run can never be updated again
+    # once marked `"completed"`. Leaving the run at the real, existing,
+    # non-terminal `"awaiting_human_review"` status (exactly like
+    # `run_detection_workflow`'s own intermediate use of it) is what
+    # lets `record_lifecycle_human_review` below actually record a
+    # caller's local review decision after this function returns. This
+    # run only becomes `"completed"` once every selected finding has a
+    # real recorded decision -- never merely because the lifecycle
+    # stages themselves finished running.
+    run_store.transition(run_id=run_id, new_status="awaiting_human_review", current_stage="human_review")
+    emit(
+        "human_review_required", "human_review", "orchestrator",
+        f"Full Security Lifecycle run: {len(selected_findings)} finding(s) carried through downstream review, "
+        f"{len(canonical_findings) - len(selected_findings)} not selected. All selected findings await human review.",
+        {"canonical_finding_count": len(canonical_findings), "findings_selected": len(selected_findings)},
+    )
+
+
+def record_lifecycle_human_review(
+    *, run_id: str, case_id: str, approval_state: str, approval_reference: str,
+    run_store: RunStore, event_bus: EventBus, clock: Callable[[], str] | None = None,
+) -> dict[str, Any]:
+    """Records one caller-supplied local review decision (`"approved"`
+    or `"rejected"`) against one specific Security Handoff case within
+    an `"awaiting_human_review"` Full Security Lifecycle run, via the
+    real, unmodified `core.security_handoff.
+    record_security_handoff_approval` (never reimplemented here).
+
+    This is a **local development/research review action only** -- this
+    backend implements no authentication of any kind, so
+    `approval_reference` is always a caller-supplied string, never
+    verified against any real identity or credential. Calling this
+    function never means an authenticated analyst approved anything; it
+    only means a caller of this local backend reported that decision,
+    exactly as `core.security_handoff.record_security_handoff_approval`
+    itself already documents.
+
+    Raises `RunStoreError` for an unknown `run_id`. Raises `ValueError`
+    (`RUN_NOT_AWAITING_REVIEW`) if the run's `status` is not
+    `"awaiting_human_review"`, or (`CASE_NOT_FOUND`) if no lifecycle
+    result carries a case with the given `case_id`. Propagates
+    `SecurityHandoffError` unchanged for an invalid `approval_state`/
+    `approval_reference`, or a case not actually in `"human_review"`
+    with `approval_state == "pending"` (e.g. already reviewed).
+
+    Once every selected finding's case has a non-`"pending"`
+    `approval_state`, the run transitions to `"completed"`/`"complete"`
+    and a real `run_completed` event is published -- never before every
+    case has a real recorded decision.
+    """
+    active_clock = clock or _default_clock
+    emit = _Emitter(run_id=run_id, event_bus=event_bus, clock=active_clock)
+
+    run = run_store.get_run(run_id=run_id)
+    if run["status"] != "awaiting_human_review":
+        raise ValueError(f"RUN_NOT_AWAITING_REVIEW: run status is {run['status']!r}, not 'awaiting_human_review'")
+
+    lifecycle = dict(run["lifecycle"])
+    results = [dict(r) for r in lifecycle["results"]]
+    target_index = next((i for i, r in enumerate(results) if r["case"]["case_id"] == case_id), None)
+    if target_index is None:
+        raise ValueError(f"CASE_NOT_FOUND: no lifecycle result carries case_id {case_id!r}")
+
+    updated_case = record_security_handoff_approval(
+        case=results[target_index]["case"], approval_state=approval_state, approval_reference=approval_reference,
+    )
+    results[target_index] = dict(results[target_index], case=updated_case)
+    lifecycle["results"] = results
+
+    emit(
+        "human_review_recorded", "human_review", "security_handoff",
+        f"Local review recorded for case {case_id}: {approval_state} (reference={approval_reference}).",
+        {"case_id": case_id, "approval_state": approval_state, "review_type": "local_development_research_review_action"},
+    )
+
+    all_reviewed = all(r["case"]["approval_state"] != "pending" for r in results)
+    if all_reviewed:
+        # Security Experience Memory: real, gated creation, via the
+        # exact same governor_result this lifecycle run already
+        # computed -- never reused merely because the run reached a
+        # terminal status. core.security_experience_memory.
+        # create_security_experience itself enforces the real gate
+        # (Governor decision not block/freeze, case at human_review with
+        # approval_state=="approved", at least one stage result and one
+        # evidence digest) -- a "rejected" case, or any case while the
+        # Governor decision was block/freeze, always yields
+        # experience_status="rejected"/reusable=False here, never
+        # silently promoted to reusable.
+        experiences = [
+            create_security_experience(
+                case=r["case"], prioritization=r["prioritization"], governor_result=lifecycle["governor_result"],
+            )
+            for r in results
+        ]
+        lifecycle["experiences"] = experiences
+        run_store.update_fields(run_id=run_id, lifecycle=lifecycle)
+        run_store.transition(run_id=run_id, new_status="completed", current_stage="complete", completed_at=active_clock())
+        emit(
+            "run_completed", "complete", "orchestrator",
+            f"Full Security Lifecycle run complete: all {len(results)} selected finding(s) reviewed.",
+            {"reviewed_count": len(results)},
+        )
+    else:
+        run_store.update_fields(run_id=run_id, lifecycle=lifecycle)
+
+    return run_store.get_run(run_id=run_id)
 
 
 def _fail_run(
