@@ -49,9 +49,14 @@
   .pill.done { color: var(--good); border-color: var(--good); }
   .pill.active { color: var(--warn); border-color: var(--warn); animation: pulse 1.6s infinite; }
   .pill.pending { color: var(--pending); border-color: var(--pending); }
-  .pill.blocked, .pill.failed, .pill.rejected { color: var(--bad); border-color: var(--bad); }
+  .pill.blocked, .pill.failed, .pill.rejected, .pill.bad { color: var(--bad); border-color: var(--bad); }
   .pill.na { color: var(--muted); border-color: var(--border); }
+  .pill.good { color: var(--good); border-color: var(--good); }
+  .pill.warn { color: var(--warn); border-color: var(--warn); }
   @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.5; } }
+  .readiness-grid { display: flex; flex-wrap: wrap; gap: 20px 28px; }
+  .readiness-col { min-width: 190px; flex: 1; }
+  .readiness-col-title { font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); margin-bottom: 6px; }
   .pipeline { display: flex; flex-wrap: wrap; gap: 6px; }
   .pipeline .node { display: flex; flex-direction: column; align-items: center; gap: 4px; min-width: 84px; }
   .pipeline .node .label { font-size: 11px; color: var(--muted); text-align: center; }
@@ -67,6 +72,26 @@
   .safety strong { color: var(--text); }
   code.small { font-size: 11.5px; background: var(--panel-2); padding: 1px 5px; border-radius: 4px; }
   details summary { cursor: pointer; color: var(--accent); font-size: 12.5px; margin-top: 6px; }
+  .eval-metrics { display: flex; flex-wrap: wrap; gap: 14px; margin-bottom: 10px; }
+  .eval-metric { background: var(--panel-2); border: 1px solid var(--border); border-radius: 8px; padding: 10px 16px; min-width: 140px; }
+  .eval-metric-label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); margin-bottom: 4px; }
+  .eval-metric-value { font-size: 26px; font-weight: 600; }
+  .eval-qualifier { font-size: 12px; color: var(--muted); font-style: italic; margin-bottom: 10px; padding: 6px 10px; background: var(--panel-2); border-left: 3px solid var(--accent); border-radius: 4px; }
+  .eval-tpfntn { display: flex; gap: 10px; margin-bottom: 16px; flex-wrap: wrap; }
+  .eval-tpfntn .pill { font-size: 13px; padding: 4px 12px; }
+  .eval-subsection-title { font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); margin: 16px 0 6px; border-top: 1px solid var(--border); padding-top: 12px; }
+  .eval-note { font-size: 12px; color: var(--muted); margin-bottom: 8px; }
+  .eval-limitations { margin: 0; padding-left: 18px; font-size: 12.5px; color: var(--muted); line-height: 1.6; }
+  .eval-limitations li { margin-bottom: 3px; }
+  .eval-target .row .k { min-width: 110px; }
+  .eval-digest { cursor: help; }
+  .eval-not-evaluated { color: var(--muted); font-size: 13px; padding: 10px; background: var(--panel-2); border-radius: 6px; }
+  .surface-metrics { display: flex; flex-wrap: wrap; gap: 14px; margin-bottom: 10px; }
+  .surface-metric { background: var(--panel-2); border: 1px solid var(--border); border-radius: 8px; padding: 10px 16px; min-width: 120px; }
+  .surface-metric-label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); margin-bottom: 4px; }
+  .surface-metric-value { font-size: 22px; font-weight: 600; }
+  .surface-note { font-size: 12px; color: var(--muted); margin: 8px 0; }
+  .surface-subsection-title { font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); margin: 14px 0 6px; border-top: 1px solid var(--border); padding-top: 10px; }
 </style>
 </head>
 <body>
@@ -95,6 +120,11 @@
 
 <main>
 
+  <section class="card wide" id="card-readiness">
+    <h2>System Readiness</h2>
+    <div id="readiness-body" class="readiness-grid empty">Checking backend…</div>
+  </section>
+
   <section class="card" id="card-status">
     <h2>A. System Status</h2>
     <div id="status-body" class="empty">No active run.</div>
@@ -110,6 +140,11 @@
     <div id="tools-body"></div>
   </section>
 
+  <section class="card wide" id="card-attack-surface">
+    <h2>K. Attack Surface Discovery</h2>
+    <div id="attack-surface-body"><div class="empty">No discovery data for this run.</div></div>
+  </section>
+
   <section class="card" id="card-governor">
     <h2>E. Security Governor</h2>
     <div id="governor-body" class="empty">No Governor evaluation yet.</div>
@@ -118,6 +153,11 @@
   <section class="card wide" id="card-findings">
     <h2>F. Findings</h2>
     <div id="findings-body" class="empty">No active run.</div>
+  </section>
+
+  <section class="card wide" id="card-evaluation">
+    <h2>J. Accuracy &amp; Evaluation</h2>
+    <div id="evaluation-body"><div class="empty">No benchmark evaluation available for this run.</div></div>
   </section>
 
   <section class="card" id="card-ti">
@@ -275,14 +315,46 @@ function renderTools(run) {
       if ((run.executed_tools || []).includes(tool)) { state = "completed"; cls = "done"; }
       else if ((run.permitted_tools || []).includes(tool)) { state = "permitted, not run"; cls = "pending"; }
       else if ((run.requested_tools || []).includes(tool)) { state = "requested, not permitted"; cls = "blocked"; }
-      else { state = systemToolReadiness[tool] || "unknown"; cls = state === "available" ? "pending" : "na"; }
+      else { state = systemToolReadiness[tool] || "unknown"; cls = state === "ready" ? "pending" : "na"; }
     } else {
       state = systemToolReadiness[tool] || "unknown";
-      cls = state === "available" ? "pending" : "na";
+      cls = state === "ready" ? "pending" : "na";
     }
     rows += `<div class="row"><span class="k">${esc(tool)}</span><span class="pill ${cls}">${esc(state)}</span></div>`;
   }
   body.innerHTML = rows;
+}
+
+// Overall backend/tool readiness (from /api/system's categorized view),
+// shown independently of any run. Optional items (Burp DAST, authenticated
+// testing, controlled validation) are never rendered red -- an unconfigured
+// optional integration is not a platform failure.
+function readinessClass(item) {
+  if (item.state === "ready") return "good";
+  if (!item.required) return "warn";
+  if (item.state === "container_available") return "warn";
+  return "bad";
+}
+
+function renderReadiness(categories) {
+  const body = el("readiness-body");
+  if (!categories || !categories.length) {
+    body.className = "readiness-grid empty";
+    body.textContent = "Backend unreachable.";
+    return;
+  }
+  body.className = "readiness-grid";
+  body.innerHTML = categories.map(cat => `
+    <div class="readiness-col">
+      <div class="readiness-col-title">${esc(cat.label)}</div>
+      ${cat.items.map(item => `
+        <div class="row">
+          <span class="k">${esc(item.label)}${item.required ? "" : " (optional)"}</span>
+          <span class="pill ${readinessClass(item)}" title="${esc(item.detail || "")}">${esc(item.state)}${item.version ? " " + esc(item.version) : ""}</span>
+        </div>
+      `).join("")}
+    </div>
+  `).join("");
 }
 
 function renderGovernor(payload) {
@@ -317,6 +389,201 @@ function renderFindings(run) {
       <td>${esc(f.status || "requires_human_review")}</td>
     </tr>`).join("");
   body.innerHTML = `<table><thead><tr><th>Finding</th><th>Severity</th><th>Confidence</th><th>Evidence</th><th>Review state</th></tr></thead><tbody>${rows}</tbody></table>`;
+}
+
+// All values rendered below come directly from run.attack_surface (set by
+// backend.orchestrator from a real core.bug_bounty_crawler result, or from
+// a "failed" record if the crawler raised -- see that module's own
+// try/except). This function never computes a count itself and never
+// hardcodes an endpoint/parameter -- only formats what the backend already
+// produced. Endpoint/parameter tables are capped for display only; the
+// summary counts always reflect the true, un-capped total.
+const MAX_SURFACE_ROWS_DISPLAYED = 25;
+function surfaceStatusClass(status) {
+  if (status === "completed") return "good";
+  if (status === "partial") return "warn";
+  if (status === "failed") return "bad";
+  return "na";
+}
+
+function renderAttackSurface(run) {
+  const body = el("attack-surface-body");
+  const surface = run && run.attack_surface;
+  if (!surface) { body.innerHTML = '<div class="empty">No discovery data for this run.</div>'; return; }
+
+  if (surface.status === "failed") {
+    body.innerHTML = `
+      <div class="row"><span class="k">Status</span><span class="pill bad">FAILED</span></div>
+      <div class="surface-note">Discovery did not complete for this run; other tools (http_assessor/nmap/nuclei/zap) were not affected. Reason: ${esc(surface.error || "unknown")}.</div>`;
+    return;
+  }
+
+  const summary = surface.attack_surface_summary || {};
+  const telemetry = surface.telemetry || {};
+  const endpoints = surface.endpoints || [];
+  const parameters = surface.parameters || [];
+
+  const metrics = `
+    <div class="row"><span class="k">Status</span><span class="pill ${surfaceStatusClass(surface.status)}">${esc((surface.status || "unknown").toUpperCase())}</span></div>
+    <div class="surface-metrics">
+      <div class="surface-metric"><div class="surface-metric-label">Endpoints</div><div class="surface-metric-value">${esc(summary.endpoint_count ?? 0)}</div></div>
+      <div class="surface-metric"><div class="surface-metric-label">Parameters</div><div class="surface-metric-value">${esc(summary.parameter_count ?? 0)}</div></div>
+      <div class="surface-metric"><div class="surface-metric-label">Forms</div><div class="surface-metric-value">${esc(summary.form_count ?? 0)}</div></div>
+      <div class="surface-metric"><div class="surface-metric-label">API Endpoints</div><div class="surface-metric-value">${esc(summary.api_endpoint_count ?? 0)}</div></div>
+    </div>
+    <div class="surface-note">
+      Pages requested: ${esc(telemetry.pages_requested ?? 0)} ·
+      JS files inspected: ${esc(telemetry.javascript_files_inspected ?? 0)} ·
+      OpenAPI docs found: ${esc(telemetry.openapi_documents_found ?? 0)} ·
+      Out-of-scope rejected: ${esc(telemetry.out_of_scope_links_rejected ?? 0)} ·
+      Duplicates prevented: ${esc(telemetry.duplicates_prevented ?? 0)} ·
+      Parse errors: ${esc(telemetry.parse_errors ?? 0)} ·
+      Runtime: ${telemetry.runtime_seconds !== undefined ? esc(telemetry.runtime_seconds.toFixed(2)) + "s" : "—"} ·
+      Budget exhausted: ${telemetry.budget_exhausted ? "yes (bounded, partial coverage)" : "no"}
+    </div>
+    <div class="surface-note">This discovers same-origin attack surface only -- it is not a claim of complete application coverage. See the module docstring in core.bug_bounty_crawler for exact bounds.</div>`;
+
+  let endpointSection = '<div class="surface-subsection-title">Discovered Endpoints</div><div class="empty">No endpoints discovered.</div>';
+  if (endpoints.length) {
+    const shown = endpoints.slice(0, MAX_SURFACE_ROWS_DISPLAYED);
+    const rows = shown.map(e => {
+      const paramCount = parameters.filter(p => p.endpoint_id === e.endpoint_id).length;
+      return `<tr>
+        <td>${esc(e.method)}</td>
+        <td>${esc(e.path)}</td>
+        <td>${esc(paramCount)}</td>
+        <td>${esc(e.source)}</td>
+        <td>${esc(e.depth)}</td>
+        <td>${e.fetched ? esc(e.status_code ?? "—") : "not fetched"}</td>
+      </tr>`;
+    }).join("");
+    const note = endpoints.length > MAX_SURFACE_ROWS_DISPLAYED
+      ? `<div class="surface-note">Showing ${MAX_SURFACE_ROWS_DISPLAYED} of ${esc(endpoints.length)} discovered endpoints.</div>` : "";
+    endpointSection = `
+      <div class="surface-subsection-title">Discovered Endpoints</div>
+      <table><thead><tr><th>Method</th><th>Path</th><th>Params</th><th>Source</th><th>Depth</th><th>Status</th></tr></thead>
+      <tbody>${rows}</tbody></table>${note}`;
+  }
+
+  let paramSection = '<div class="surface-subsection-title">Discovered Parameters</div><div class="empty">No parameters discovered.</div>';
+  if (parameters.length) {
+    const endpointById = {};
+    for (const e of endpoints) endpointById[e.endpoint_id] = e;
+    const shown = parameters.slice(0, MAX_SURFACE_ROWS_DISPLAYED);
+    const rows = shown.map(p => {
+      const ep = endpointById[p.endpoint_id];
+      return `<tr>
+        <td>${esc(p.name)}</td>
+        <td>${esc(p.location)}</td>
+        <td>${ep ? esc(ep.path) : "—"}</td>
+        <td>${esc((p.sources || []).join(", "))}</td>
+      </tr>`;
+    }).join("");
+    const note = parameters.length > MAX_SURFACE_ROWS_DISPLAYED
+      ? `<div class="surface-note">Showing ${MAX_SURFACE_ROWS_DISPLAYED} of ${esc(parameters.length)} discovered parameters.</div>` : "";
+    paramSection = `
+      <div class="surface-subsection-title">Discovered Parameters</div>
+      <table><thead><tr><th>Name</th><th>Location</th><th>Endpoint</th><th>Source</th></tr></thead>
+      <tbody>${rows}</tbody></table>${note}`;
+  }
+
+  body.innerHTML = metrics + endpointSection + paramSection;
+}
+
+// All values rendered below come directly from the /api/runs/{id}/evaluation
+// response -- this function never computes TP/FP/FN/TN/precision/recall/F1
+// itself, and never hardcodes a result value; it only formats what the
+// backend (core.bug_bounty_juice_shop_evaluation, backed by the real
+// core.benchmark_evaluation engine) already returned.
+function pct(value) { return (value === null || value === undefined) ? "N/A" : Math.round(value * 100) + "%"; }
+function outcomeClass(outcome) { return (outcome === "TP" || outcome === "TN") ? "good" : "bad"; }
+function toolStatusClass(status) {
+  if (status === "completed") return "good";
+  if (status === "timeout") return "warn";
+  if (!status) return "na";
+  return "na";
+}
+
+function renderEvaluation(evaluation) {
+  const body = el("evaluation-body");
+  if (!evaluation || evaluation.evaluation_state === "run_incomplete") {
+    body.innerHTML = '<div class="empty">No benchmark evaluation available for this run.</div>';
+    return;
+  }
+  if (evaluation.evaluation_state === "not_evaluated") {
+    body.innerHTML = `<div class="eval-not-evaluated">NOT_EVALUATED — ${esc(evaluation.reason || "This run's target has no known Juice Shop benchmark ground truth.")}</div>`;
+    return;
+  }
+
+  const metrics = `
+    <div class="eval-metrics">
+      <div class="eval-metric"><div class="eval-metric-label">Precision</div><div class="eval-metric-value">${pct(evaluation.precision)}</div></div>
+      <div class="eval-metric"><div class="eval-metric-label">Recall</div><div class="eval-metric-value">${pct(evaluation.recall)}</div></div>
+      <div class="eval-metric"><div class="eval-metric-label">F1</div><div class="eval-metric-value">${pct(evaluation.f1)}</div></div>
+      <div class="eval-metric"><div class="eval-metric-label">Supported Benchmark Accuracy</div><div class="eval-metric-value">${pct(evaluation.supported_benchmark_accuracy)}</div></div>
+    </div>
+    <div class="eval-qualifier">Fixed supported benchmark: ${esc(evaluation.supported_total_count)} predefined cases on the validated OWASP Juice Shop image. This is not overall ThreatTrace accuracy.</div>
+    <div class="eval-tpfntn">
+      <span class="pill good">TP ${esc(evaluation.true_positive_count)}</span>
+      <span class="pill bad">FP ${esc(evaluation.false_positive_count)}</span>
+      <span class="pill bad">FN ${esc(evaluation.false_negative_count)}</span>
+      <span class="pill good">TN ${esc(evaluation.true_negative_count)}</span>
+    </div>`;
+
+  const caseRows = (evaluation.case_results || []).map(c => `
+    <tr>
+      <td>${esc(c.case_id)}</td>
+      <td>${c.expected_detection ? "Positive" : "Negative"}</td>
+      <td>${c.matched ? "Detected" : "Not detected"}</td>
+      <td><span class="pill ${outcomeClass(c.outcome)}">${esc(c.outcome)}</span></td>
+      <td>${esc(c.matched_title || "—")}</td>
+      <td>${esc((c.matched_source_tools || []).join(", ") || "—")}</td>
+    </tr>`).join("");
+  const unmatchedCount = (evaluation.unmatched_findings || []).length;
+  const excludedCount = (evaluation.structurally_excluded_findings || []).length;
+  const caseSection = `
+    <div class="eval-subsection-title">Supported Juice Shop Benchmark Cases</div>
+    <table><thead><tr><th>Case</th><th>Expected</th><th>Observed</th><th>Result</th><th>Matched Finding</th><th>Source</th></tr></thead>
+    <tbody>${caseRows}</tbody></table>
+    <div class="eval-note">${esc(unmatchedCount)} other real finding(s) observed outside these ${esc(evaluation.supported_total_count)} supported cases (not scored)${excludedCount ? `; ${esc(excludedCount)} could not be structurally submitted to the evaluator (see limitations)` : ""}.</div>`;
+
+  const corr = evaluation.correlation_quality || {};
+  const correlationSection = `
+    <div class="eval-subsection-title">Correlation Quality</div>
+    <div class="eval-note">Detection accuracy and cross-tool correlation are evaluated separately.</div>
+    <div class="row"><span class="k">Canonical Findings</span><span>${esc(corr.canonical_finding_count)}</span></div>
+    <div class="row"><span class="k">Multi-Tool Corroborated</span><span>${esc(corr.multi_tool_corroborated_count)}</span></div>
+    <div class="row"><span class="k">Duplicate Evidence Prevented</span><span>${esc(corr.duplicate_evidence_count)}</span></div>`;
+
+  const toolExec = evaluation.tool_execution || {};
+  const toolRows = ["http_assessor", "nmap", "nuclei", "zap"].map(id => {
+    const t = toolExec[id] || {};
+    const contributed = (t.canonical_findings_contributed || 0) + (t.informational_contributed || 0);
+    return `<div class="row"><span class="k">${esc(id)}</span><span class="pill ${toolStatusClass(t.status)}">${esc((t.status || "unknown").toUpperCase())} · ${esc(contributed)} contributed</span></div>`;
+  }).join("");
+  const toolSection = `<div class="eval-subsection-title">Tool Contribution</div>${toolRows}`;
+
+  const limitationsSection = `
+    <div class="eval-subsection-title">Limitations</div>
+    <ul class="eval-limitations">${(evaluation.limitations || []).map(l => `<li>${esc(l)}</li>`).join("")}</ul>`;
+
+  const digest = evaluation.target_digest || "";
+  const targetSection = `
+    <div class="eval-subsection-title">Target Identity</div>
+    <div class="eval-target">
+      <div class="row"><span class="k">Target</span><span>${esc(evaluation.target_identity)}</span></div>
+      <div class="row"><span class="k">Image digest</span><span class="eval-digest" title="${esc(digest)}">${esc(digest.slice(0, 19))}…</span></div>
+      <div class="row"><span class="k">Run ID</span><span>${esc(evaluation.run_id)}</span></div>
+    </div>`;
+
+  body.innerHTML = metrics + caseSection + correlationSection + toolSection + limitationsSection + targetSection;
+}
+
+async function loadEvaluation(runId) {
+  if (!runId) { renderEvaluation(null); return; }
+  try {
+    renderEvaluation(await api(`/api/runs/${runId}/evaluation`));
+  } catch (e) { renderEvaluation(null); }
 }
 
 let lastTi = null;
@@ -394,6 +661,9 @@ async function refreshSelectedRun() {
     renderTools(run);
     renderFindings(run);
     renderDetection(run);
+    renderAttackSurface(run);
+    if (TERMINAL.has(run.status)) loadEvaluation(currentRunId);
+    else renderEvaluation(null);
   } catch (e) { /* run may have been evicted; ignore */ }
 }
 
@@ -414,7 +684,7 @@ async function selectRun(runId) {
   el("feed-body").innerHTML = '<div class="empty">Loading…</div>';
   el("governor-body").innerHTML = '<div class="empty">No Governor evaluation yet.</div>';
   if (!runId) {
-    renderStatus(null); renderPipeline(null); renderTools(null); renderFindings(null); renderDetection(null); renderTi(null);
+    renderStatus(null); renderPipeline(null); renderTools(null); renderFindings(null); renderDetection(null); renderTi(null); renderEvaluation(null); renderAttackSurface(null);
     return;
   }
   await refreshSelectedRun();
@@ -474,11 +744,12 @@ async function loadSystemInfo() {
   try {
     const sys = await api("/api/system");
     systemToolReadiness = sys.tools || {};
+    renderReadiness(sys.categories || []);
     renderTools(currentRunId ? await api(`/api/runs/${currentRunId}`).catch(() => null) : null);
-  } catch (e) { /* backend unreachable; health badge already reflects this */ }
+  } catch (e) { renderReadiness(null); /* backend unreachable; health badge already reflects this */ }
 }
 
-renderStatus(null); renderPipeline(null); renderTools(null); renderFindings(null); renderDetection(null); renderTi(null);
+renderStatus(null); renderPipeline(null); renderTools(null); renderFindings(null); renderDetection(null); renderTi(null); renderAttackSurface(null);
 checkHealth();
 loadSystemInfo();
 refreshRunList();

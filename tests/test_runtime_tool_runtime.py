@@ -176,9 +176,31 @@ class TestDocker:
 
 
 class TestZap:
-    def test_024_docker_not_ready_is_runtime_unavailable(self):
-        result = check_zap(docker_state={"tool_id": "docker", "state": "missing", "version": None, "detail": ""})
+    def test_024_docker_not_ready_falls_back_to_direct_api_probe(self):
+        # No Docker CLI visibility (e.g. inside a self-hosted container
+        # deployment with no Docker socket mounted) -- this is expected
+        # and normal, not itself a failure; readiness now depends purely
+        # on whether the API actually answers.
+        def _broken_http_get(url, *, timeout):
+            raise OSError("connection refused")
+
+        result = check_zap(
+            docker_state={"tool_id": "docker", "state": "missing", "version": None, "detail": ""},
+            which_func=_which({}), http_get=_broken_http_get,
+        )
         assert result["state"] == "runtime_unavailable"
+
+    def test_024b_docker_not_ready_but_api_reachable_is_ready(self):
+        # The container-mode case this fallback exists for: no Docker
+        # visibility from this process, but the configured ZAP API URL
+        # (e.g. via ZAP_API_URL=http://zap:8080) genuinely answers.
+        http_get = lambda url, *, timeout: '{"version": "2.15.0"}'
+        result = check_zap(
+            docker_state={"tool_id": "docker", "state": "missing", "version": None, "detail": ""},
+            which_func=_which({}), http_get=http_get,
+        )
+        assert result["state"] == "ready"
+        assert result["version"] == "2.15.0"
 
     def test_025_docker_ready_container_not_running_is_container_available(self):
         which = _which({"docker": "/usr/bin/docker"})
@@ -214,8 +236,39 @@ class TestZap:
         assert result["state"] == "runtime_unavailable"
 
     def test_028_computes_own_docker_state_when_not_supplied(self):
-        result = check_zap(which_func=_which({}), runner=_runner({}))
+        def _broken_http_get(url, *, timeout):
+            raise OSError("connection refused")
+
+        result = check_zap(which_func=_which({}), runner=_runner({}), http_get=_broken_http_get)
         assert result["state"] == "runtime_unavailable"
+
+    def test_028b_env_var_selects_docker_dns_target(self):
+        http_get_calls = []
+
+        def _http_get(url, *, timeout):
+            http_get_calls.append(url)
+            return '{"version": "2.17.0"}'
+
+        result = check_zap(
+            docker_state={"tool_id": "docker", "state": "missing", "version": None, "detail": ""},
+            which_func=_which({}), http_get=_http_get, env={"ZAP_API_URL": "http://zap:8080"},
+        )
+        assert result["state"] == "ready"
+        assert http_get_calls == ["http://zap:8080/JSON/core/view/version/"]
+
+    def test_028c_explicit_api_host_port_still_takes_priority(self):
+        http_get_calls = []
+
+        def _http_get(url, *, timeout):
+            http_get_calls.append(url)
+            return '{"version": "2.17.0"}'
+
+        result = check_zap(
+            docker_state={"tool_id": "docker", "state": "missing", "version": None, "detail": ""},
+            which_func=_which({}), http_get=_http_get, api_host="explicit-host", api_port=9999,
+            env={"ZAP_API_URL": "http://zap:8080"},
+        )
+        assert http_get_calls == ["http://explicit-host:9999/JSON/core/view/version/"]
 
 
 class TestBurpDast:
@@ -247,8 +300,11 @@ class TestBurpDast:
 
 class TestEvaluateToolReadiness:
     def test_033_aggregates_every_tool(self):
+        def _broken_http_get(url, *, timeout):
+            raise OSError("connection refused")
+
         report = evaluate_tool_readiness(
-            which_func=_which({}), runner=_runner({}), env={}, platform_name="Linux",
+            which_func=_which({}), runner=_runner({}), http_get=_broken_http_get, env={}, platform_name="Linux",
         )
         assert set(report["tools"]) == {
             "http_assessor", "nmap", "nuclei", "nuclei_templates", "docker", "zap", "burp_dast",

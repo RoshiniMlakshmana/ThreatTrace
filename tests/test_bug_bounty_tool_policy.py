@@ -66,18 +66,19 @@ def _tool_request(**overrides):
 
 
 class TestToolCatalogSanity:
-    def test_001_exactly_seven_tool_ids(self):
+    def test_001_exactly_eight_tool_ids(self):
         assert TOOL_IDS == {
-            "http_assessor", "nmap", "nuclei", "zap", "burp_dast",
+            "http_assessor", "crawler", "nmap", "nuclei", "zap", "burp_dast",
             "authenticated_testing", "controlled_validation",
         }
 
-    def test_002_five_tools_implemented(self):
+    def test_002_six_tools_implemented(self):
         # http_assessor/nmap/nuclei (Block 15G-B) plus zap/burp_dast
-        # (Block 15G-CD) have real adapters; authenticated_testing/
-        # controlled_validation remain declared-but-not-yet-built.
+        # (Block 15G-CD) plus crawler (Step 2 attack-surface discovery)
+        # have real adapters; authenticated_testing/controlled_validation
+        # remain declared-but-not-yet-built.
         for tool_id, entry in TOOL_CATALOG.items():
-            expected = tool_id in {"http_assessor", "nmap", "nuclei", "zap", "burp_dast"}
+            expected = tool_id in {"http_assessor", "crawler", "nmap", "nuclei", "zap", "burp_dast"}
             assert entry["implemented"] is expected, tool_id
 
     def test_003_catalog_entries_have_required_fields(self):
@@ -96,11 +97,13 @@ class TestToolCatalogSanity:
         assert TOOL_CATALOG["http_assessor"]["requires_human_approval"] is False
 
     def test_006_profile_ceilings_match_specification(self):
-        assert PROFILE_TOOL_CEILING["passive"] == {"http_assessor"}
-        assert PROFILE_TOOL_CEILING["recon"] == {"http_assessor", "nmap"}
-        assert PROFILE_TOOL_CEILING["safe_dast"] == {"http_assessor", "nmap", "nuclei", "zap", "burp_dast"}
+        assert PROFILE_TOOL_CEILING["passive"] == {"http_assessor", "crawler"}
+        assert PROFILE_TOOL_CEILING["recon"] == {"http_assessor", "crawler", "nmap"}
+        assert PROFILE_TOOL_CEILING["safe_dast"] == {
+            "http_assessor", "crawler", "nmap", "nuclei", "zap", "burp_dast",
+        }
         assert PROFILE_TOOL_CEILING["authenticated"] == {
-            "http_assessor", "nmap", "nuclei", "zap", "burp_dast", "authenticated_testing",
+            "http_assessor", "crawler", "nmap", "nuclei", "zap", "burp_dast", "authenticated_testing",
         }
         assert PROFILE_TOOL_CEILING["controlled_validation"] == TOOL_IDS
 
@@ -494,11 +497,12 @@ class TestScope:
 
 
 class TestAdapterAvailability:
-    # http_assessor/nmap/nuclei (Block 15G-B) and zap/burp_dast (Block
-    # 15G-CD) all have real adapters now; only authenticated_testing and
-    # controlled_validation remain declared-but-not-yet-built.
+    # http_assessor/nmap/nuclei (Block 15G-B), zap/burp_dast (Block
+    # 15G-CD), and crawler (Step 2) all have real adapters now; only
+    # authenticated_testing and controlled_validation remain
+    # declared-but-not-yet-built.
     @pytest.mark.parametrize(
-        "tool_id", sorted(TOOL_IDS - {"http_assessor", "nmap", "nuclei", "zap", "burp_dast"}),
+        "tool_id", sorted(TOOL_IDS - {"http_assessor", "crawler", "nmap", "nuclei", "zap", "burp_dast"}),
     )
     def test_066_unimplemented_tools_report_adapter_unavailable(self, tool_id):
         permissions = _permissions(

@@ -103,3 +103,74 @@ class TestHonestStates:
         lowered = dashboard_html.lower()
         assert "authenticated user" not in lowered
         assert "logged in as" not in lowered
+
+
+class TestAttackSurfaceSection:
+    """Step 2: core.bug_bounty_crawler's run.attack_surface data,
+    rendered by renderAttackSurface(run) -- values must always come
+    from the real API response, never be hardcoded, and honest empty/
+    partial/failed states must be present."""
+
+    def test_018_section_heading_present(self, dashboard_html):
+        assert "K. Attack Surface Discovery" in dashboard_html
+
+    def test_019_no_active_discovery_empty_state(self, dashboard_html):
+        assert "No discovery data for this run." in dashboard_html
+
+    def test_020_render_function_reads_run_attack_surface(self, dashboard_html):
+        assert "run.attack_surface" in dashboard_html
+        assert "function renderAttackSurface(run)" in dashboard_html
+
+    def test_021_wired_into_refresh_and_reset_paths(self, dashboard_html):
+        assert dashboard_html.count("renderAttackSurface(") >= 4
+
+    def test_022_status_states_covered(self, dashboard_html):
+        for status in ('"completed"', '"partial"', '"failed"'):
+            assert status in dashboard_html
+
+    def test_023_failed_state_never_treated_as_empty_success(self, dashboard_html):
+        assert 'surface.status === "failed"' in dashboard_html
+
+    def test_024_metrics_come_from_summary_object_not_literals(self, dashboard_html):
+        assert "summary.endpoint_count" in dashboard_html
+        assert "summary.parameter_count" in dashboard_html
+        assert "summary.form_count" in dashboard_html
+        assert "summary.api_endpoint_count" in dashboard_html
+
+    def test_025_no_hardcoded_endpoint_counts(self, dashboard_html):
+        import re
+        # A hardcoded metric would look like a literal number assigned
+        # directly instead of read from the surface/summary object.
+        assert not re.search(r"endpoint_count[\"']?\s*:\s*\d", dashboard_html)
+        assert not re.search(r"parameter_count[\"']?\s*:\s*\d", dashboard_html)
+
+    def test_026_no_juice_shop_route_hardcoding(self, dashboard_html):
+        for forbidden in ("/rest/products/search", "/api/BasketItems", "juice-shop", "juiceShop"):
+            assert forbidden not in dashboard_html
+
+    def test_027_display_is_bounded_not_unbounded_dump(self, dashboard_html):
+        assert "MAX_SURFACE_ROWS_DISPLAYED" in dashboard_html
+        assert "endpoints.slice(0, MAX_SURFACE_ROWS_DISPLAYED)" in dashboard_html
+        assert "Showing" in dashboard_html and "discovered endpoints" in dashboard_html
+
+    def test_028_endpoint_and_parameter_tables_use_esc(self, dashboard_html):
+        # Every endpoint/parameter table cell must be escaped, exactly
+        # like the existing findings/evaluation tables -- untrusted
+        # target-derived path/parameter strings must never be injected
+        # into the DOM unescaped.
+        assert "esc(e.method)" in dashboard_html
+        assert "esc(e.path)" in dashboard_html
+        assert "esc(p.name)" in dashboard_html
+        assert "esc(p.location)" in dashboard_html
+
+    def test_029_parameter_values_never_rendered(self, dashboard_html):
+        # Only parameter name/location/source/endpoint are ever shown --
+        # never a captured value (which could be a sensitive query
+        # value like a search term or session-like token).
+        assert "p.value" not in dashboard_html
+
+    def test_030_budget_exhausted_honestly_labeled_partial(self, dashboard_html):
+        assert "bounded, partial coverage" in dashboard_html
+
+    def test_031_not_a_complete_coverage_claim(self, dashboard_html):
+        assert "not a claim of complete application coverage" in dashboard_html

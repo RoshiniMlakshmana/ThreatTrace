@@ -318,6 +318,30 @@ def check_docker(*, which_func: WhichFunc = real_which, runner: CommandRunner = 
 # ---------------------------------------------------------------------------
 
 
+ZAP_API_URL_ENV_VAR = "ZAP_API_URL"
+
+
+def _resolve_zap_api_target(*, api_host: str | None, api_port: int | None, env: Any) -> tuple[str, int]:
+    """Resolve the ZAP daemon's own API host/port. An explicit
+    `api_host`/`api_port` argument always wins (preserving this
+    function's own pre-existing test/caller contract); otherwise
+    `ZAP_API_URL_ENV_VAR` is read fresh (never cached), matching
+    `adapters.bug_bounty_zap._resolve_zap_api_target`'s own resolution
+    exactly -- this is deliberately a second, independent copy (this
+    project's established convention), not an import, but the two must
+    agree on the same env var name and fallback so a readiness check
+    and the real adapter call always target the same real endpoint."""
+    if api_host is not None or api_port is not None:
+        return api_host or ZAP_API_HOST, api_port or ZAP_API_PORT
+    active_env = env if env is not None else os.environ
+    configured = (active_env.get(ZAP_API_URL_ENV_VAR) or "").strip()
+    if configured:
+        parsed = urlsplit(configured)
+        if parsed.scheme == "http" and parsed.hostname:
+            return parsed.hostname, parsed.port or ZAP_API_PORT
+    return ZAP_API_HOST, ZAP_API_PORT
+
+
 def check_zap(
     *,
     docker_state: dict[str, Any] | None = None,
@@ -325,48 +349,72 @@ def check_zap(
     runner: CommandRunner = real_run,
     http_get: HttpGetFunc | None = None,
     container_name: str = ZAP_CONTAINER_NAME,
-    api_host: str = ZAP_API_HOST,
-    api_port: int = ZAP_API_PORT,
+    api_host: str | None = None,
+    api_port: int | None = None,
+    env: Any = None,
 ) -> dict[str, Any]:
-    """Detect whether an approved local ZAP container is running and
-    its REST API is answering. Never starts, stops, or modifies a
-    container itself -- see `runtime.bootstrap.start_demo` for the
-    explicit, analyst-invoked start action. `docker_state` may be
-    supplied to avoid re-running the Docker check when the caller
-    already has one (see `evaluate_tool_readiness`)."""
-    active_docker_state = docker_state if docker_state is not None else check_docker(which_func=which_func, runner=runner)
-    if active_docker_state["state"] != "ready":
-        return {
-            "tool_id": "zap", "state": "runtime_unavailable", "version": None,
-            "detail": "Docker is required to run the ZAP container and is not ready.",
-        }
+    """Detect whether ZAP's REST API is reachable and answering.
 
-    docker_path = which_func("docker")
-    inspect_result = runner(
-        [docker_path, "ps", "--filter", f"name=^{container_name}$", "--filter", "status=running", "--format", "{{.Names}}"],
-        timeout=DEFAULT_COMMAND_TIMEOUT_SECONDS,
-    )
-    running = bool((inspect_result.get("stdout") or "").strip())
-    if not running:
-        return {
-            "tool_id": "zap", "state": "container_available", "version": None,
-            "detail": f"Docker is ready; the '{container_name}' container is not currently running. "
-                      f"Start it via 'python -m runtime.bootstrap start-demo'.",
-        }
+    Two deployment topologies are both real and both supported:
+
+    1. **Host-native**: this process runs on the host, Docker CLI is
+       visible, and ZAP runs in its own container. Here this function
+       first checks (via `docker ps`) whether the named container is
+       actually running before probing the API -- an unreachable API
+       with no visible container is reported as `container_available`
+       (Docker itself is fine; the container just isn't started), not
+       `runtime_unavailable`.
+    2. **Self-hosted Docker deployment**: this process itself runs
+       inside a container with no Docker socket/CLI visibility at all
+       (this project deliberately never mounts one -- see
+       `docs/docker-self-hosted-deployment.md`). Here `which_func("docker")`
+       finds nothing, so this function skips the container-existence
+       pre-check entirely and goes straight to the real HTTP API probe
+       against `ZAP_API_URL_ENV_VAR` (or the fixed `127.0.0.1:8080`
+       default) -- the API answering at all *is* the readiness signal
+       when there is no other way to observe the container.
+
+    Never starts, stops, or modifies a container itself -- see
+    `runtime.bootstrap.start_demo` for the explicit, analyst-invoked
+    start action. `docker_state` may be supplied to avoid re-running the
+    Docker check when the caller already has one (see
+    `evaluate_tool_readiness`)."""
+    resolved_host, resolved_port = _resolve_zap_api_target(api_host=api_host, api_port=api_port, env=env)
+
+    active_docker_state = docker_state if docker_state is not None else check_docker(which_func=which_func, runner=runner)
+    docker_path = which_func("docker") if active_docker_state["state"] == "ready" else None
+
+    if docker_path is not None:
+        inspect_result = runner(
+            [docker_path, "ps", "--filter", f"name=^{container_name}$", "--filter", "status=running", "--format", "{{.Names}}"],
+            timeout=DEFAULT_COMMAND_TIMEOUT_SECONDS,
+        )
+        running = bool((inspect_result.get("stdout") or "").strip())
+        if not running:
+            return {
+                "tool_id": "zap", "state": "container_available", "version": None,
+                "detail": f"Docker is ready; the '{container_name}' container is not currently running. "
+                          f"Start it via 'python -m runtime.bootstrap start-demo'.",
+            }
+        # Container confirmed running via Docker visibility -- fall through to the API check below.
 
     active_http_get = http_get if http_get is not None else real_http_get
     try:
-        body = active_http_get(f"http://{api_host}:{api_port}/JSON/core/view/version/", timeout=DEFAULT_HTTP_TIMEOUT_SECONDS)
+        body = active_http_get(f"http://{resolved_host}:{resolved_port}/JSON/core/view/version/", timeout=DEFAULT_HTTP_TIMEOUT_SECONDS)
         version = json.loads(body).get("version")
     except Exception:  # noqa: BLE001 -- any probe failure is honestly reported, never raised
-        return {
-            "tool_id": "zap", "state": "runtime_unavailable", "version": None,
-            "detail": f"'{container_name}' is running but its API did not respond on {api_host}:{api_port}.",
-        }
+        if docker_path is None:
+            detail = (
+                f"ZAP API did not respond at {resolved_host}:{resolved_port}. No local Docker visibility from "
+                f"this process (expected inside a self-hosted container deployment) -- this is the only signal available."
+            )
+        else:
+            detail = f"'{container_name}' is running but its API did not respond on {resolved_host}:{resolved_port}."
+        return {"tool_id": "zap", "state": "runtime_unavailable", "version": None, "detail": detail}
 
     return {
         "tool_id": "zap", "state": "ready", "version": version,
-        "detail": f"'{container_name}' running; API verified at {api_host}:{api_port}.",
+        "detail": f"API verified at {resolved_host}:{resolved_port}.",
     }
 
 
@@ -451,7 +499,7 @@ def evaluate_tool_readiness(
         "nuclei": check_nuclei(which_func=which_func, runner=runner),
         "nuclei_templates": check_nuclei_templates(templates_dir=templates_dir, env=env),
         "docker": docker_result,
-        "zap": check_zap(docker_state=docker_result, which_func=which_func, runner=runner, http_get=http_get),
+        "zap": check_zap(docker_state=docker_result, which_func=which_func, runner=runner, http_get=http_get, env=env),
         "burp_dast": check_burp_dast(env=env, http_get=http_get),
         "authenticated_testing": check_authenticated_testing(),
         "controlled_validation": check_controlled_validation(),

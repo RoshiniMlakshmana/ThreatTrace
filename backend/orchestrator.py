@@ -59,13 +59,15 @@ from urllib.parse import urlsplit
 
 from adapters.bug_bounty_http import BugBountyHttpTransport
 from backend.event_bus import EventBus
-from backend.models import TERMINAL_STATUSES, validate_local_only_target
+from backend.models import TERMINAL_STATUSES, resolve_execution_target, validate_local_only_target
 from backend.run_store import RunStore
 from core.bug_bounty_assessment import BugBountyAssessmentError, run_bug_bounty_assessment
+from core.bug_bounty_crawler import BugBountyCrawlerError, run_bug_bounty_crawl
 from core.bug_bounty_evidence_normalization import BugBountyEvidenceNormalizationError, normalize_bug_bounty_evidence
 from core.bug_bounty_final_report import BugBountyFinalReportError, build_final_bug_bounty_report
 from core.bug_bounty_finding_correlation import BugBountyFindingCorrelationError, correlate_bug_bounty_evidence
 from core.bug_bounty_scope import BugBountyScopeError, create_bug_bounty_scope
+from core.bug_bounty_tool_execution import BugBountyToolExecutionError, execute_bug_bounty_tool
 from core.bug_bounty_tool_policy import BugBountyToolPolicyError, evaluate_tool_permission
 from core.detection_engineering_report import DetectionEngineeringReportError, build_detection_engineering_report
 from core.detection_planner import DetectionPlannerError, validate_detection_plan
@@ -124,8 +126,86 @@ def _stop_cancelled(*, run_store: RunStore, run_id: str, emit: _Emitter, stage: 
 # ---------------------------------------------------------------------------
 
 
-def _default_bug_bounty_permissions(*, target: str) -> dict[str, Any]:
-    parsed = urlsplit(target)
+# The fixed default Bug Bounty tool plan -- every deployment (host-native
+# or self-hosted Docker) requests the same five tools; each one's real
+# availability (adapter binary/daemon present or not) is decided honestly,
+# per tool, by Policy + the real adapter -- never assumed here. Order is
+# significant only for display/execution order, never for authorization.
+# "crawler" (Step 2: Attack-Surface Discovery) runs immediately after
+# http_assessor, reusing the exact same scope + transport instance --
+# it never scans anything itself; it only builds and persists the
+# attack-surface inventory (endpoints/parameters) that a later,
+# dedicated step may eventually wire into nmap/nuclei/zap. It never
+# contributes to source_results (never normalized/correlated into a
+# finding, never scored by the benchmark) -- discovery data and
+# vulnerability findings are deliberately kept as separate concerns.
+DEFAULT_BUG_BOUNTY_TOOL_PLAN = ("http_assessor", "crawler", "nmap", "nuclei", "zap")
+
+# Matches adapters.bug_bounty_{nmap,nuclei,zap}'s own hardcoded
+# `max_output_bytes` safety ceiling (1 MiB) -- see each adapter's own
+# `_validate_execution_config`. Exceeding it raises INVALID_EXECUTION_CONFIG
+# at the adapter boundary, so this value must never be raised above it.
+_EXECUTION_CONFIG = {"execution_config_version": "1", "process_timeout_seconds": 60, "max_output_bytes": 1_048_576}
+
+# Nuclei gets its own, separately-justified runtime budget (Nuclei
+# Reliability Step 1, revised in Step 1B, revised again in Step 1C).
+# nmap/zap keep the shared 60s config above unchanged. Step 1C added
+# exposures_medium (Step 1B's exposures phase, but at medium severity
+# only -- measured ~66.24s real, the single most expensive phase) and
+# technology_directed (small, tag-only, ~29 templates when applicable)
+# for "valuable medium coverage" + live technology-aware selection --
+# see adapters/bug_bounty_nuclei.py's own module docstring for the full
+# per-phase timing derivation. Sum of all five QUICK phase budgets is
+# 210s (25+100+55+20+10); 200s here keeps real, measured margin over
+# the actually-needed real total (~118s across every applicable phase
+# on this project's own authorized target) while staying under the
+# adapter's own MAX_PROCESS_TIMEOUT_SECONDS (230s) hard ceiling. This
+# is a real, disclosed UX tradeoff versus Step 1B's 60s -- a full Bug
+# Bounty run now typically takes ~2 minutes when Nuclei's medium tier
+# genuinely runs, not ~40s, in exchange for the wider coverage.
+_NUCLEI_EXECUTION_CONFIG = {"execution_config_version": "1", "process_timeout_seconds": 200, "max_output_bytes": 1_048_576}
+
+
+# Nuclei Reliability Step 1C: closed, deterministic technology-name
+# vocabulary this module knows how to recognize in http_assessor's own
+# already-produced evidence text -- kept in sync with (a small subset
+# of) adapters.bug_bounty_nuclei's own _TECHNOLOGY_TAG_MAP keys, but
+# never imported from it (this project's established "each module owns
+# its own copy of a shape it shares in spirit with another module"
+# convention) -- a name detected here that adapter's own map doesn't
+# recognize simply contributes no extra tags there, never an error.
+_KNOWN_TECHNOLOGY_SIGNATURES = ("express", "nodejs", "node.js", "angular")
+
+
+def _detect_technologies_from_http_assessor(findings: Any) -> list[str]:
+    """Deterministic, closed technology detection reusing ONLY
+    http_assessor's own already-produced `information_disclosure`
+    findings text (`reproduction_summary`, e.g. "server header
+    disclosed: Express") -- never a new header-capture code path, never
+    a raw-header contract change to core.bug_bounty_assessment, never
+    inference beyond a fixed, reviewed substring vocabulary.
+
+    Returns a sorted list of recognized technology names (possibly
+    empty -- most targets, including this project's own authorized
+    Juice Shop target, do not disclose a recognized `Server`/
+    `X-Powered-By` value at all, and this function returns `[]` for
+    them, never a guess).
+    """
+    if not isinstance(findings, list):
+        return []
+    detected: set[str] = set()
+    for finding in findings:
+        if not isinstance(finding, dict) or finding.get("vulnerability_class") != "information_disclosure":
+            continue
+        text = str(finding.get("reproduction_summary") or "").lower()
+        for signature in _KNOWN_TECHNOLOGY_SIGNATURES:
+            if signature in text:
+                detected.add(signature)
+    return sorted(detected)
+
+
+def _default_bug_bounty_permissions(*, execution_target: str) -> dict[str, Any]:
+    parsed = urlsplit(execution_target)
     port = parsed.port or 80
     return {
         "permission_version": "1",
@@ -134,12 +214,37 @@ def _default_bug_bounty_permissions(*, target: str) -> dict[str, Any]:
         "allowed_ports": [port],
         "allowed_paths": ["/"],
         "excluded_paths": [],
-        "testing_profile": "passive",
-        "allowed_tools": ["http_assessor"],
+        "testing_profile": "safe_dast",
+        "allowed_tools": list(DEFAULT_BUG_BOUNTY_TOOL_PLAN),
         "authenticated_testing_allowed": False,
         "controlled_validation_allowed": False,
         "max_requests": 12,
         "human_approval_state": "approved",
+    }
+
+
+def _tool_request_target(*, tool_id: str, execution_target: str) -> str:
+    """Nmap's own adapter requires a bare host (never a URL); every
+    other tool in the default plan requires a full http(s) URL -- see
+    `adapters.bug_bounty_nmap._validate_scan_target` vs.
+    `adapters.bug_bounty_nuclei`/`bug_bounty_zap`'s own equivalents."""
+    if tool_id == "nmap":
+        return urlsplit(execution_target).hostname or execution_target
+    return execution_target
+
+
+def _build_tool_request(*, run_id: str, tool_id: str, execution_target: str, port: int) -> dict[str, Any]:
+    return {
+        "request_version": "1",
+        "request_id": f"REQ-{run_id}-{tool_id}",
+        "tool_id": tool_id,
+        "purpose": f"Bounded Bug Bounty assessment via ThreatTrace Live Platform backend ({tool_id})",
+        "target": _tool_request_target(tool_id=tool_id, execution_target=execution_target),
+        "ports": [port] if tool_id in ("http_assessor", "nmap") else [],
+        "paths": ["/"] if tool_id != "nmap" else [],
+        "testing_mode": "safe_dast",
+        "authentication_requested": False,
+        "controlled_validation_requested": False,
     }
 
 
@@ -151,35 +256,60 @@ def run_bug_bounty_workflow(
     event_bus: EventBus,
     clock: Callable[[], str] | None = None,
     transport: Any = None,
+    env: Any = None,
+    execute_tool: Callable[..., dict[str, Any]] = execute_bug_bounty_tool,
 ) -> None:
     """Run one real, bounded, local-only Bug Bounty assessment against
     `target` (already validated by `backend.models.
     validate_local_only_target` -- this function re-validates it anyway,
     defense in depth) through the existing Tool Policy -> Governor ->
-    `http_assessor` -> Evidence Normalization -> Correlation -> Final
-    Report chain, publishing an event at every stage.
+    `http_assessor`/`nmap`/`nuclei`/`zap` -> Evidence Normalization ->
+    Correlation -> Final Report chain, publishing an event at every
+    stage.
+
+    `target` is the *display* target (what a user/browser submits --
+    e.g. `http://localhost:3000/`). `backend.models.
+    resolve_execution_target` maps it to the real *execution* target
+    this function actually connects to -- a no-op on host-native
+    deployments, or the configured Docker Compose service address
+    (`http://juice-shop:3000`) on the self-hosted Docker deployment,
+    but only for that one fixed, immutable alias (see that function's
+    own docstring). Every tool this function requests is attempted
+    honestly: an unavailable adapter (missing binary, unreachable
+    daemon) is reported via `tool_failed`, never silently skipped or
+    fabricated as executed.
 
     `transport` defaults to a real `adapters.bug_bounty_http.
     BugBountyHttpTransport()` when not supplied; tests inject a fake
     object satisfying `core.bug_bounty_assessment`'s own minimal
     `request(*, url, method, headers=None)` protocol instead, exactly
     like that module's own established injected-transport pattern.
+    `execute_tool` defaults to the real `core.bug_bounty_tool_execution.
+    execute_bug_bounty_tool` (used for `nmap`/`nuclei`/`zap`) and is
+    injectable the same way, so tests never perform real subprocess/
+    network I/O for those three tools either. `env` is injectable for
+    the same reason `backend.models.resolve_execution_target` itself
+    accepts one -- defaults to the real process environment.
 
     Intended to be called from a background thread by `backend.app`,
     never from the asyncio event loop directly (it performs real
-    blocking network I/O via `adapters.bug_bounty_http` by default).
+    blocking network I/O by default).
     """
     active_clock = clock or _default_clock
     emit = _Emitter(run_id=run_id, event_bus=event_bus, clock=active_clock)
 
     try:
         target = validate_local_only_target(target)
+        execution_target = resolve_execution_target(display_target=target, env=env)
 
         run_store.transition(
             run_id=run_id, new_status="planning", current_stage="planning", started_at=active_clock(),
             target_summary=target,
         )
-        emit("run_started", "intake", "orchestrator", f"Bug Bounty run started against {target}", {"target": target})
+        target_payload = {"target": target}
+        if execution_target != target:
+            target_payload["execution_target"] = execution_target
+        emit("run_started", "intake", "orchestrator", f"Bug Bounty run started against {target}", target_payload)
 
         if _is_cancelled(run_store=run_store, run_id=run_id):
             _stop_cancelled(run_store=run_store, run_id=run_id, emit=emit, stage="planning", clock=active_clock)
@@ -189,42 +319,41 @@ def run_bug_bounty_workflow(
             "planner_started", "planning", "orchestrator",
             "Using a fixed local default assessment plan -- the backend performs no live LLM call.",
         )
-        tool_request = {
-            "request_version": "1",
-            "request_id": f"REQ-{run_id}-01",
-            "tool_id": "http_assessor",
-            "purpose": "Bounded passive Bug Bounty assessment via ThreatTrace Live Platform backend",
-            "target": target,
-            "ports": [urlsplit(target).port or 80],
-            "paths": ["/"],
-            "testing_mode": "passive",
-            "authentication_requested": False,
-            "controlled_validation_requested": False,
+        port = urlsplit(execution_target).port or 80
+        tool_requests = {
+            tool_id: _build_tool_request(run_id=run_id, tool_id=tool_id, execution_target=execution_target, port=port)
+            for tool_id in DEFAULT_BUG_BOUNTY_TOOL_PLAN
         }
         emit(
             "planner_completed", "planning", "orchestrator",
-            "Plan accepted: 1 tool request (http_assessor, passive).", {"tool_count": 1},
+            f"Plan accepted: {len(tool_requests)} tool request(s) ({', '.join(DEFAULT_BUG_BOUNTY_TOOL_PLAN)}).",
+            {"tool_count": len(tool_requests)},
         )
-        run_store.update_fields(run_id=run_id, requested_tools=["http_assessor"])
+        run_store.update_fields(run_id=run_id, requested_tools=list(DEFAULT_BUG_BOUNTY_TOOL_PLAN))
 
         run_store.transition(run_id=run_id, new_status="awaiting_policy", current_stage="tool_policy")
-        permissions = _default_bug_bounty_permissions(target=target)
-        policy_result = evaluate_tool_permission(permissions=permissions, tool_request=tool_request)
-        emit(
-            "tool_policy_evaluated", "tool_policy", "bug_bounty_tool_policy",
-            f"http_assessor execution_permitted={policy_result['execution_permitted']}",
-            {"execution_permitted": policy_result["execution_permitted"], "reason_codes": policy_result["reason_codes"]},
-        )
+        permissions = _default_bug_bounty_permissions(execution_target=execution_target)
 
-        if not policy_result["execution_permitted"]:
+        policy_results: dict[str, dict[str, Any]] = {}
+        for tool_id in DEFAULT_BUG_BOUNTY_TOOL_PLAN:
+            policy_result = evaluate_tool_permission(permissions=permissions, tool_request=tool_requests[tool_id])
+            policy_results[tool_id] = policy_result
+            emit(
+                "tool_policy_evaluated", "tool_policy", "bug_bounty_tool_policy",
+                f"{tool_id} execution_permitted={policy_result['execution_permitted']}",
+                {"tool_id": tool_id, "execution_permitted": policy_result["execution_permitted"], "reason_codes": policy_result["reason_codes"]},
+            )
+
+        permitted_tools = [tool_id for tool_id in DEFAULT_BUG_BOUNTY_TOOL_PLAN if policy_results[tool_id]["execution_permitted"]]
+        if not permitted_tools:
             run_store.transition(
                 run_id=run_id, new_status="blocked", current_stage="tool_policy", completed_at=active_clock(),
-                limitations=[f"Tool policy denied http_assessor: {', '.join(policy_result['reason_codes'])}"],
+                limitations=["Tool policy denied every requested tool."],
             )
-            emit("run_blocked", "tool_policy", "bug_bounty_tool_policy", "Blocked: tool policy denied execution.")
+            emit("run_blocked", "tool_policy", "bug_bounty_tool_policy", "Blocked: tool policy denied every requested tool.")
             return
 
-        run_store.update_fields(run_id=run_id, permitted_tools=["http_assessor"])
+        run_store.update_fields(run_id=run_id, permitted_tools=permitted_tools)
 
         run_store.transition(run_id=run_id, new_status="awaiting_governor", current_stage="governor")
         # `execution_requested` is honestly `False` here: per
@@ -287,37 +416,155 @@ def run_bug_bounty_workflow(
             return
 
         run_store.transition(run_id=run_id, new_status="running", current_stage="tool_execution")
-        emit("tool_started", "tool_execution", "bug_bounty_assessment", f"Running http_assessor against {target}")
 
-        scope = create_bug_bounty_scope(
-            target=target, target_type="web_application", allowed_origins=[permissions["target_origin"]],
-            allowed_paths=["/"], excluded_paths=[], testing_profile="passive",
-        )
         assessment_started_at = active_clock()
-        active_transport = transport if transport is not None else BugBountyHttpTransport()
-        assessment_result = run_bug_bounty_assessment(scope=scope, transport=active_transport)
-        assessment_completed_at = active_clock()
+        source_results: list[dict[str, Any]] = []
+        executed_tools: list[str] = []
+        detected_technologies: list[str] = []
 
-        emit(
-            "tool_completed", "tool_execution", "bug_bounty_assessment",
-            f"http_assessor completed: {len(assessment_result['findings'])} findings, "
-            f"{assessment_result['network_requests_performed']} requests.",
-            {
-                "findings_count": len(assessment_result["findings"]),
-                "network_requests_performed": assessment_result["network_requests_performed"],
-                "assessment_performed": assessment_result["assessment_performed"],
-            },
-        )
-        emit(
-            "http_assessment_completed", "tool_execution", "bug_bounty_assessment",
-            "HTTP assessment stage complete.", {"observed_evidence": assessment_result["observed_evidence"]},
-        )
-        run_store.update_fields(run_id=run_id, executed_tools=["http_assessor"])
+        needs_scope = "http_assessor" in permitted_tools or "crawler" in permitted_tools
+        scope = None
+        active_transport = transport if transport is not None else BugBountyHttpTransport()
+        if needs_scope:
+            scope = create_bug_bounty_scope(
+                target=execution_target, target_type="web_application", allowed_origins=[permissions["target_origin"]],
+                allowed_paths=["/"], excluded_paths=[], testing_profile="safe_active",
+            )
+
+        if "http_assessor" in permitted_tools:
+            emit("tool_started", "tool_execution", "bug_bounty_assessment", f"Running http_assessor against {execution_target}")
+            assessment_result = run_bug_bounty_assessment(scope=scope, transport=active_transport)
+            detected_technologies = _detect_technologies_from_http_assessor(assessment_result["findings"])
+
+            emit(
+                "tool_completed", "tool_execution", "bug_bounty_assessment",
+                f"http_assessor completed: {len(assessment_result['findings'])} findings, "
+                f"{assessment_result['network_requests_performed']} requests.",
+                {
+                    "findings_count": len(assessment_result["findings"]),
+                    "network_requests_performed": assessment_result["network_requests_performed"],
+                    "assessment_performed": assessment_result["assessment_performed"],
+                },
+            )
+            emit(
+                "http_assessment_completed", "tool_execution", "bug_bounty_assessment",
+                "HTTP assessment stage complete.", {"observed_evidence": assessment_result["observed_evidence"]},
+            )
+            source_results.append({"source_tool": "http_assessor", "result": assessment_result})
+            executed_tools.append("http_assessor")
+
+        if "crawler" in permitted_tools:
+            emit("tool_started", "tool_execution", "bug_bounty_crawler", f"Running crawler against {execution_target}")
+            try:
+                crawl_result = run_bug_bounty_crawl(scope=scope, transport=active_transport)
+            except Exception as exc:  # noqa: BLE001 -- a crawler failure must never abort tools that can
+                # still run safely (nmap/nuclei/zap need neither the crawler nor its output this step) --
+                # this is the one deliberate exception to this function's usual "let it propagate to the
+                # top-level failure boundary" pattern, matching this project's established principle that
+                # a bounded, best-effort discovery layer must degrade honestly, never take down a run that
+                # doesn't actually depend on it.
+                sanitized = _sanitize_error(exc)
+                run_store.update_fields(
+                    run_id=run_id,
+                    attack_surface={"attack_surface_version": "1", "status": "failed", "target": execution_target, "error": sanitized},
+                )
+                emit(
+                    "tool_failed", "tool_execution", "bug_bounty_crawler",
+                    f"crawler did not complete: {sanitized}.", {"tool_id": "crawler", "reason": sanitized},
+                )
+            else:
+                surface = crawl_result["attack_surface_summary"]
+                telemetry = crawl_result["telemetry"]
+                # "partial" (not "completed") when a real bound was actually hit -- the crawl produced
+                # real, honest, bounded results, but genuinely did not exhaust its own discovery queue;
+                # never silently reported the same as an unbounded, naturally-finished crawl.
+                status = "partial" if telemetry["budget_exhausted"] else "completed"
+                run_store.update_fields(
+                    run_id=run_id,
+                    attack_surface={
+                        "attack_surface_version": "1",
+                        "status": status,
+                        "target": crawl_result["target"],
+                        "endpoints": crawl_result["endpoints"],
+                        "parameters": crawl_result["parameters"],
+                        "attack_surface_summary": surface,
+                        "telemetry": telemetry,
+                        "observed_evidence": crawl_result["observed_evidence"],
+                    },
+                )
+                emit(
+                    "tool_completed", "tool_execution", "bug_bounty_crawler",
+                    f"crawler {status}: {surface['endpoint_count']} endpoint(s), {surface['parameter_count']} parameter(s) discovered.",
+                    {
+                        "status": status,
+                        "endpoint_count": surface["endpoint_count"],
+                        "parameter_count": surface["parameter_count"],
+                        "form_count": surface["form_count"],
+                        "api_endpoint_count": surface["api_endpoint_count"],
+                        "pages_requested": telemetry["pages_requested"],
+                        "budget_exhausted": telemetry["budget_exhausted"],
+                        "runtime_seconds": telemetry["runtime_seconds"],
+                    },
+                )
+                executed_tools.append("crawler")
+
+        for tool_id in ("nmap", "nuclei", "zap"):
+            if tool_id not in permitted_tools:
+                continue
+            emit("tool_started", "tool_execution", "bug_bounty_assessment", f"Running {tool_id} against {execution_target}")
+            execution_result = execute_tool(
+                permissions=permissions, tool_request=tool_requests[tool_id], governor_result=governor_result,
+                execution_config=_NUCLEI_EXECUTION_CONFIG if tool_id == "nuclei" else _EXECUTION_CONFIG,
+                detected_technologies=detected_technologies,
+            )
+            tool_result = execution_result["tool_result"]
+            if tool_result is not None:
+                source_results.append({"source_tool": tool_id, "result": tool_result})
+
+            if execution_result["execution_performed"]:
+                executed_tools.append(tool_id)
+                tool_completed_payload = {
+                    "tool_id": tool_id, "status": tool_result.get("status"),
+                    "observation_count": len(tool_result.get("observations", [])),
+                }
+                if tool_id == "nuclei":
+                    # Nuclei Reliability Step 1B: surface phase telemetry
+                    # into the event stream -- this data previously
+                    # existed only in the transient tool_result and was
+                    # invisible to any downstream consumer (dashboard,
+                    # logs) once execution moved past this point.
+                    # phases_attempted excludes skipped_not_applicable
+                    # entries (e.g. ssl on a plain-HTTP target) -- a
+                    # deliberately-skipped phase was never attempted and
+                    # must never be counted as an incomplete one.
+                    phases = tool_result.get("phases") or []
+                    attempted_phases = [p for p in phases if p.get("status") != "skipped_not_applicable"]
+                    tool_completed_payload.update({
+                        "profile": tool_result.get("profile_name"),
+                        "phases_attempted": len(attempted_phases),
+                        "phases_completed": sum(1 for p in attempted_phases if p.get("status") == "completed"),
+                        "duration": tool_result.get("runtime_duration_seconds"),
+                        "partial_results": tool_result.get("partial_results"),
+                    })
+                emit(
+                    "tool_completed", "tool_execution", "bug_bounty_assessment",
+                    f"{tool_id} completed: status={tool_result.get('status')}, "
+                    f"{len(tool_result.get('observations', []))} observation(s).",
+                    tool_completed_payload,
+                )
+            else:
+                reason = execution_result["execution_blocked_reason"] or (tool_result.get("status") if tool_result else "unknown")
+                emit(
+                    "tool_failed", "tool_execution", "bug_bounty_assessment",
+                    f"{tool_id} did not execute: {reason}.", {"tool_id": tool_id, "reason": str(reason)},
+                )
+
+        run_store.update_fields(run_id=run_id, executed_tools=executed_tools)
+        assessment_completed_at = active_clock()
 
         run_store.transition(run_id=run_id, new_status="normalizing", current_stage="normalization")
         evidence_records = normalize_bug_bounty_evidence(
-            source_results=[{"source_tool": "http_assessor", "result": assessment_result}],
-            scope_reference=permissions["target_origin"], observed_at=active_clock(),
+            source_results=source_results, scope_reference=permissions["target_origin"], observed_at=active_clock(),
         )
         emit(
             "evidence_normalized", "normalization", "bug_bounty_evidence_normalization",
@@ -332,12 +579,13 @@ def run_bug_bounty_workflow(
             {"total_groups": correlation_result["total_groups"], "duplicate_evidence_count": correlation_result["duplicate_evidence_count"]},
         )
 
+        tools_unavailable = [tool_id for tool_id in permitted_tools if tool_id not in executed_tools]
         report = build_final_bug_bounty_report(
             correlation_result=correlation_result, evidence_records=evidence_records, target=target,
-            scope=permissions["target_origin"], testing_profile="passive",
+            scope=permissions["target_origin"], testing_profile="safe_active",
             assessment_started_at=assessment_started_at, assessment_completed_at=assessment_completed_at,
-            tools_requested=["http_assessor"], tools_permitted=["http_assessor"], tools_executed=["http_assessor"],
-            tools_unavailable=[],
+            tools_requested=list(DEFAULT_BUG_BOUNTY_TOOL_PLAN), tools_permitted=permitted_tools,
+            tools_executed=executed_tools, tools_unavailable=tools_unavailable,
         )
         for finding in report["canonical_findings"]:
             emit(
@@ -360,7 +608,8 @@ def run_bug_bounty_workflow(
 
     except (
         BugBountyScopeError, BugBountyToolPolicyError, SecurityGovernorError, BugBountyAssessmentError,
-        BugBountyEvidenceNormalizationError, BugBountyFindingCorrelationError, BugBountyFinalReportError,
+        BugBountyCrawlerError, BugBountyToolExecutionError, BugBountyEvidenceNormalizationError,
+        BugBountyFindingCorrelationError, BugBountyFinalReportError,
     ) as exc:
         _fail_run(run_store=run_store, emit=emit, run_id=run_id, exc=exc, stage="tool_execution", clock=active_clock)
     except Exception as exc:  # noqa: BLE001 -- last-resort honest failure boundary, never a silent crash

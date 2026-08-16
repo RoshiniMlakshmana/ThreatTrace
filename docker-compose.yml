@@ -1,50 +1,107 @@
-# ThreatTrace local demo dependencies (Block 15L-16).
+# ThreatTrace self-hosted Docker runtime.
 #
-# This file exists only to make the authorized local Bug Bounty demo
-# target reproducible. It deliberately does NOT containerize:
-#
-#   - the ThreatTrace backend (`python -m backend.app`) -- it is a
-#     plain local Python process with no complex runtime dependency;
-#     containerizing it would add operational complexity for no real
-#     reproducibility benefit ("do not containerize merely for
-#     appearance");
-#   - Nmap -- on Windows this project targets, Nmap/Npcap require a
-#     host-level, administrator-performed install regardless, so a
-#     container would not remove that requirement;
-#   - Nuclei -- kept a simple user-local binary; containerizing it would
-#     complicate the already-validated `adapters.bug_bounty_nuclei`
-#     process-execution boundary for no real gain.
-#
-# Every published port below binds to 127.0.0.1 ONLY. This is
-# deliberate and load-bearing -- see runtime/bootstrap.py's own
-# docstring for why a bare "host:container" port mapping (which Docker
-# would bind to every host interface) is never used anywhere in this
-# project's tooling.
+# One command brings up the full local demonstration stack -- the
+# ThreatTrace backend/dashboard (with Nmap and Nuclei baked into its own
+# image), a local ZAP daemon, and the authorized Juice Shop demo target --
+# all on an isolated Docker network. A user only needs Docker (and
+# Compose) installed; no host installation of Python, Nmap, Npcap, Nuclei,
+# or ZAP is required for this deployment path.
 #
 # Usage:
-#   docker compose up -d                      # Juice Shop only (default)
-#   docker compose --profile zap up -d        # Juice Shop + ZAP
-#   docker compose down                       # stop and remove both
+#   docker compose up -d --build   # start the full stack
+#   docker compose ps              # check container/health status
+#   docker compose logs -f threattrace
+#   docker compose down            # stop and remove everything
 #
-# `python -m runtime.bootstrap start-demo [--with-zap]` performs the
-# equivalent of the above via individual `docker run`/`docker start`
-# calls (so it works even without Compose installed) -- this file is an
-# alternative, not a replacement, for that CLI.
+# See docs/docker-self-hosted-deployment.md for the full architecture,
+# port map, health-check behavior, demo-target-alias model, and security
+# boundaries (isolated network, no privileged containers, no Docker
+# socket mounted, no public bind).
+#
+# Every published host port below binds to 127.0.0.1 ONLY -- never a bare
+# "host:container" mapping, which Docker would bind to every host
+# interface. This is deliberate and load-bearing; see
+# `runtime/bootstrap.py`'s own docstring for the same rule applied to its
+# individual `docker run` invocations.
+
+networks:
+  threattrace-net:
+    name: threattrace-net
+    driver: bridge
 
 services:
+  threattrace:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: threattrace-backend
+    networks:
+      - threattrace-net
+    ports:
+      - "127.0.0.1:8420:8420"
+    environment:
+      THREATTRACE_MODE: demo
+      THREATTRACE_DEMO_TARGET: "http://juice-shop:3000"
+      ZAP_API_URL: "http://zap:8080"
+      # Bind the container's own 0.0.0.0 so Docker's port-publish mechanism
+      # can forward host traffic to it at all -- external reachability is
+      # still governed entirely by the host port publish spec below
+      # (127.0.0.1:8420:8420), which stays loopback-only. See backend/app.py's
+      # module docstring for why binding the container's 127.0.0.1 would be
+      # unreachable from the host despite looking "more restrictive."
+      THREATTRACE_BIND_HOST: "0.0.0.0"
+    depends_on:
+      zap:
+        condition: service_healthy
+      juice-shop:
+        condition: service_healthy
+    restart: unless-stopped
+    # No privileged mode, no host networking, no Docker socket mount --
+    # the backend never needs to introspect or control other containers;
+    # it only ever reaches zap/juice-shop over the network above.
+
   juice-shop:
     image: bkimminich/juice-shop:latest
     container_name: threattrace-juice-shop
+    networks:
+      - threattrace-net
     ports:
       - "127.0.0.1:3000:3000"
     restart: unless-stopped
+    healthcheck:
+      # The juice-shop image's node binary lives at /nodejs/bin/node and is
+      # NOT on PATH (PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:
+      # /sbin:/bin) -- a bare "node" CMD fails every check with "executable
+      # file not found in $PATH" even though the app itself is healthy.
+      test: ["CMD", "/nodejs/bin/node", "-e", "require('http').get('http://localhost:3000/', r => process.exit(r.statusCode < 500 ? 0 : 1)).on('error', () => process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 15s
 
   zap:
     image: zaproxy/zap-stable:latest
     container_name: threattrace-zap
-    command: ["zap.sh", "-daemon", "-host", "0.0.0.0", "-port", "8080", "-config", "api.disablekey=true"]
+    # api.addrs.addr.name/.regex widen ZAP's own API allowlist beyond
+    # loopback -- by default ZAP rejects API requests that don't originate
+    # from 127.0.0.1, which would reject the threattrace-backend sibling
+    # container even though it's on the same private threattrace-net
+    # bridge network. This does not expose the API beyond that isolated
+    # network + the loopback-only host port publish below.
+    command: [
+      "zap.sh", "-daemon", "-host", "0.0.0.0", "-port", "8080",
+      "-config", "api.disablekey=true",
+      "-config", "api.addrs.addr.name=.*",
+      "-config", "api.addrs.addr.regex=true",
+    ]
+    networks:
+      - threattrace-net
     ports:
       - "127.0.0.1:8080:8080"
     restart: unless-stopped
-    profiles:
-      - zap
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://localhost:8080/JSON/core/view/version/"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s

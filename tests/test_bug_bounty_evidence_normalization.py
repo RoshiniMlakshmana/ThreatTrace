@@ -196,6 +196,14 @@ class TestNmapNormalization:
         records = normalize_bug_bounty_evidence(source_results=[_entry("nmap", _nmap_result())], scope_reference=_SCOPE, observed_at=_OBSERVED_AT)
         assert records[0]["source_reference"] == "nmap_xml_sha256:" + "b" * 64
 
+    def test_009b_non_url_observation_path_stays_null(self):
+        # Nmap has no URL concept at all -- "genuinely unknown" must stay
+        # None, never coerced to "/" the way a real HTTP(S) URL's empty
+        # path is. This is the contract the bare-origin URL fix below is
+        # deliberately scoped to never touch.
+        records = normalize_bug_bounty_evidence(source_results=[_entry("nmap", _nmap_result())], scope_reference=_SCOPE, observed_at=_OBSERVED_AT)
+        assert records[0]["path"] is None
+
 
 # ---------------------------------------------------------------------------
 # Nuclei normalization
@@ -232,6 +240,54 @@ class TestNucleiNormalization:
     def test_013_confidence_always_none_nuclei_has_no_concept(self):
         records = normalize_bug_bounty_evidence(source_results=[_entry("nuclei", _nuclei_result())], scope_reference=_SCOPE, observed_at=_OBSERVED_AT)
         assert records[0]["confidence"] is None
+
+    def test_013b_ambiguous_cwe_200_falls_back_to_generic_nuclei_class(self):
+        # The fixture's own CWE-200 is deliberately ambiguous upstream
+        # (shared by information_disclosure/exposed_metadata) -- must
+        # never be guessed, must fall through to the Nuclei-specific
+        # generic fallback (never blank, never the DAST fallback name).
+        records = normalize_bug_bounty_evidence(source_results=[_entry("nuclei", _nuclei_result())], scope_reference=_SCOPE, observed_at=_OBSERVED_AT)
+        assert records[0]["vulnerability_class"] == "nuclei_template_match"
+
+    def test_013c_unmapped_cwe_falls_back_to_generic_never_blank(self):
+        result = _nuclei_result()
+        result["observations"][0]["classification"]["cwe_id"] = ["CWE-79"]
+        records = normalize_bug_bounty_evidence(source_results=[_entry("nuclei", result)], scope_reference=_SCOPE, observed_at=_OBSERVED_AT)
+        assert records[0]["vulnerability_class"] == "nuclei_template_match"
+
+    def test_013d_closed_mapped_cwe_yields_real_class(self):
+        result = _nuclei_result()
+        result["observations"][0]["classification"]["cwe_id"] = ["CWE-693"]
+        records = normalize_bug_bounty_evidence(source_results=[_entry("nuclei", result)], scope_reference=_SCOPE, observed_at=_OBSERVED_AT)
+        assert records[0]["vulnerability_class"] == "security_header_misconfiguration"
+
+    def test_013e_no_cwe_at_all_falls_back_to_generic(self):
+        result = _nuclei_result()
+        result["observations"][0]["classification"] = None
+        records = normalize_bug_bounty_evidence(source_results=[_entry("nuclei", result)], scope_reference=_SCOPE, observed_at=_OBSERVED_AT)
+        assert records[0]["vulnerability_class"] == "nuclei_template_match"
+
+    def test_013f_cve_preserved_even_when_vulnerability_class_is_generic(self):
+        # A missing closed-mapping decision must never cause real CVE
+        # evidence to be dropped.
+        records = normalize_bug_bounty_evidence(source_results=[_entry("nuclei", _nuclei_result())], scope_reference=_SCOPE, observed_at=_OBSERVED_AT)
+        assert records[0]["cve"] == ["CVE-2021-1234"]
+        assert records[0]["vulnerability_class"] == "nuclei_template_match"
+
+    def test_013g_generic_fallback_never_collides_with_real_capability(self):
+        from core.bug_bounty_findings import VULNERABILITY_CLASSES
+        from core.juice_shop_ground_truth import DETECTOR_CAPABILITIES
+
+        assert "nuclei_template_match" not in VULNERABILITY_CLASSES
+        assert "nuclei_template_match" not in DETECTOR_CAPABILITIES
+
+    def test_013h_bare_origin_nuclei_target_path_normalizes_to_root(self):
+        # Confirms Nuclei benefits from the same _split_url fix as
+        # ZAP/Burp -- it shares the same helper, never a separate copy.
+        result = _nuclei_result()
+        result["observations"][0]["target"] = "http://localhost:3000"
+        records = normalize_bug_bounty_evidence(source_results=[_entry("nuclei", result)], scope_reference=_SCOPE, observed_at=_OBSERVED_AT)
+        assert records[0]["path"] == "/"
 
 
 # ---------------------------------------------------------------------------
@@ -270,6 +326,130 @@ class TestZapNormalization:
         result["observations"][0]["sanitized_evidence"] = "some excerpt"
         records = normalize_bug_bounty_evidence(source_results=[_entry("zap", result)], scope_reference=_SCOPE, observed_at=_OBSERVED_AT)
         assert records[0]["sanitized_evidence"] == "some excerpt"
+
+
+# ---------------------------------------------------------------------------
+# Bare-origin URL path normalization (real defect: adapters/bug_bounty_zap.py
+# reports site-wide alerts against a bare origin like "http://juice-shop:3000"
+# with no trailing slash; the pre-fix _split_url turned that into path=None,
+# which then broke both correlation's fingerprint match against an
+# equivalent http_assessor "/" record and evaluate_benchmark's own
+# non-blank affected_path requirement).
+# ---------------------------------------------------------------------------
+
+
+class TestDastPathNormalization:
+    def test_017b_bare_origin_url_normalizes_to_root_path(self):
+        result = _zap_result()
+        result["observations"][0]["url"] = "http://juice-shop:3000"
+        result["observations"][0]["path"] = None  # matches the real adapter's own output for this case
+        records = normalize_bug_bounty_evidence(source_results=[_entry("zap", result)], scope_reference=_SCOPE, observed_at=_OBSERVED_AT)
+        assert records[0]["path"] == "/"
+
+    def test_017c_trailing_slash_url_stays_root_path(self):
+        result = _zap_result()
+        result["observations"][0]["url"] = "http://juice-shop:3000/"
+        result["observations"][0]["path"] = None
+        records = normalize_bug_bounty_evidence(source_results=[_entry("zap", result)], scope_reference=_SCOPE, observed_at=_OBSERVED_AT)
+        assert records[0]["path"] == "/"
+
+    def test_017d_real_path_segment_unchanged(self):
+        result = _zap_result()
+        result["observations"][0]["url"] = "http://juice-shop:3000/api"
+        result["observations"][0]["path"] = None
+        records = normalize_bug_bounty_evidence(source_results=[_entry("zap", result)], scope_reference=_SCOPE, observed_at=_OBSERVED_AT)
+        assert records[0]["path"] == "/api"
+
+    def test_017e_explicit_path_still_takes_priority_over_derived(self):
+        result = _zap_result()
+        result["observations"][0]["url"] = "http://juice-shop:3000"
+        result["observations"][0]["path"] = "/explicit"
+        records = normalize_bug_bounty_evidence(source_results=[_entry("zap", result)], scope_reference=_SCOPE, observed_at=_OBSERVED_AT)
+        assert records[0]["path"] == "/explicit"
+
+    def test_017f_no_url_at_all_stays_null_not_forced_to_root(self):
+        result = _zap_result()
+        result["observations"][0]["url"] = None
+        result["observations"][0]["path"] = None
+        records = normalize_bug_bounty_evidence(source_results=[_entry("zap", result)], scope_reference=_SCOPE, observed_at=_OBSERVED_AT)
+        assert records[0]["path"] is None
+
+    def test_017g_burp_bare_origin_also_fixed_shared_normalizer(self):
+        result = _burp_result()
+        result["observations"][0]["url"] = "http://juice-shop:3000"
+        result["observations"][0]["path"] = None
+        records = normalize_bug_bounty_evidence(source_results=[_entry("burp_dast", result)], scope_reference=_SCOPE, observed_at=_OBSERVED_AT)
+        assert records[0]["path"] == "/"
+
+
+# ---------------------------------------------------------------------------
+# DAST vulnerability_class -- closed CWE-based mapping, never blank/null,
+# never inferred from title text, never a fallback that can accidentally
+# satisfy a benchmark case.
+# ---------------------------------------------------------------------------
+
+
+class TestDastVulnerabilityClass:
+    def test_017h_csp_cwe_maps_to_security_header_misconfiguration(self):
+        result = _zap_result()  # fixture already carries cwe="CWE-693"
+        records = normalize_bug_bounty_evidence(source_results=[_entry("zap", result)], scope_reference=_SCOPE, observed_at=_OBSERVED_AT)
+        assert records[0]["vulnerability_class"] == "security_header_misconfiguration"
+
+    def test_017i_cors_cwe_maps_to_cors_misconfiguration(self):
+        result = _zap_result()
+        result["observations"][0]["cwe"] = "CWE-942"
+        records = normalize_bug_bounty_evidence(source_results=[_entry("zap", result)], scope_reference=_SCOPE, observed_at=_OBSERVED_AT)
+        assert records[0]["vulnerability_class"] == "cors_misconfiguration"
+
+    def test_017j_unmapped_cwe_falls_back_to_generic_dast_observation(self):
+        # Real example: ZAP's "Cross-Domain Misconfiguration" carries
+        # CWE-264 (generic access control), not CWE-942 -- a genuinely
+        # different, broader classification. Must not be force-mapped.
+        result = _zap_result()
+        result["observations"][0]["cwe"] = "CWE-264"
+        records = normalize_bug_bounty_evidence(source_results=[_entry("zap", result)], scope_reference=_SCOPE, observed_at=_OBSERVED_AT)
+        assert records[0]["vulnerability_class"] == "dast_observation"
+
+    def test_017k_ambiguous_cwe_200_falls_back_to_generic_not_guessed(self):
+        # CWE-200 maps to two distinct classes upstream
+        # (information_disclosure / exposed_metadata) -- reversing it
+        # would require guessing which one a bare DAST alert means.
+        result = _zap_result()
+        result["observations"][0]["cwe"] = "CWE-200"
+        records = normalize_bug_bounty_evidence(source_results=[_entry("zap", result)], scope_reference=_SCOPE, observed_at=_OBSERVED_AT)
+        assert records[0]["vulnerability_class"] == "dast_observation"
+
+    def test_017l_no_cwe_at_all_falls_back_to_generic(self):
+        result = _zap_result()
+        result["observations"][0]["cwe"] = None
+        records = normalize_bug_bounty_evidence(source_results=[_entry("zap", result)], scope_reference=_SCOPE, observed_at=_OBSERVED_AT)
+        assert records[0]["vulnerability_class"] == "dast_observation"
+
+    def test_017m_vulnerability_class_never_blank_across_burp_too(self):
+        result = _burp_result()
+        result["observations"][0]["cwe"] = "CWE-79"  # not in the closed map
+        records = normalize_bug_bounty_evidence(source_results=[_entry("burp_dast", result)], scope_reference=_SCOPE, observed_at=_OBSERVED_AT)
+        assert records[0]["vulnerability_class"] == "dast_observation"
+
+    def test_017n_generic_fallback_never_collides_with_a_real_detector_capability(self):
+        # The generic value must never accidentally satisfy
+        # evaluate_benchmark's vulnerability_class == detector_capability
+        # match rule -- verified directly against the real, live vocabularies.
+        from core.bug_bounty_findings import VULNERABILITY_CLASSES
+        from core.juice_shop_ground_truth import DETECTOR_CAPABILITIES
+
+        assert "dast_observation" not in VULNERABILITY_CLASSES
+        assert "dast_observation" not in DETECTOR_CAPABILITIES
+
+    def test_017o_title_text_never_used_to_infer_class(self):
+        # A title that reads exactly like a supported category, paired
+        # with an unmapped CWE, must still fall through to the generic
+        # class -- never pattern-matched from the title string.
+        result = _zap_result()
+        result["observations"][0]["title"] = "Cross-Origin Resource Sharing Misconfiguration"
+        result["observations"][0]["cwe"] = "CWE-264"
+        records = normalize_bug_bounty_evidence(source_results=[_entry("zap", result)], scope_reference=_SCOPE, observed_at=_OBSERVED_AT)
+        assert records[0]["vulnerability_class"] == "dast_observation"
 
 
 # ---------------------------------------------------------------------------

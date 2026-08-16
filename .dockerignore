@@ -1,0 +1,36 @@
+# Keep the Docker build context small and avoid ever copying anything
+# sensitive, generated, or third-party into the ThreatTrace image.
+
+.git/
+.github/
+.claude/
+.pytest_cache/
+__pycache__/
+*.pyc
+.venv/
+venv/
+env/
+
+tests/
+docs/
+references/
+supabase/
+mcp/
+tools/
+evidence/
+output/
+artifacts/
+scripts/
+
+.env
+.env.*
+!.env.example
+.mcp.json
+
+*.log
+logs/
+*.md
+!README.md
+
+docker-compose.yml
+Dockerfile

@@ -195,22 +195,39 @@ Investigation-loop commands (the platform's newer Bug Bounty/Detection/live-plat
 | `authenticated_testing` | Declared, not implemented | `not_implemented` |
 | `controlled_validation` | Declared, not implemented | `not_implemented` |
 
-Run `python -m runtime.bootstrap check` for a live readiness report — see [Quickstart](#quickstart).
+Run `curl http://127.0.0.1:8420/api/system` (Docker) or `python -m runtime.bootstrap check` (host-native) for a live readiness report — see [Quickstart](#quickstart).
 
-## Installation
+## Quickstart
 
-ThreatTrace requires **Python 3.10+**. Developed and validated on **Windows**; see [Cross-Platform Status](#cross-platform-status).
+The default, recommended way to run ThreatTrace is **Docker** — no host installation of Python, Nmap, Npcap, Nuclei, or ZAP required, on any platform.
 
-### Windows PowerShell
-
-```powershell
-py -m pip install -r requirements.txt
-```
-
-### macOS or Linux
+**Prerequisites:** [Docker](https://docs.docker.com/get-docker/) (with Compose v2) and Git. Nothing else.
 
 ```bash
-python3 -m pip install -r requirements.txt
+git clone <repo-url>
+cd Threattrace
+docker compose up -d --build
+```
+
+Then open **http://127.0.0.1:8420** — the dashboard should immediately show System Readiness with Backend/Governor/HTTP Assessor/Nmap/Nuclei/ZAP/Threat Intelligence/Detection Engineering all `READY` (Burp DAST shown separately, under Optional Integrations). Click **New Bug Bounty Run** to scan the bundled local [Juice Shop](#juice-shop-demo) demo target, and watch the live event feed, Governor decisions, and canonical findings populate.
+
+```bash
+docker compose ps       # container + health status
+docker compose logs -f threattrace
+docker compose down     # stop and remove everything
+```
+
+Full architecture, port map, the demo-target-alias model, and production-deployment guidance: [docs/docker-self-hosted-deployment.md](docs/docker-self-hosted-deployment.md).
+
+### Advanced: host-native development
+
+Running the backend directly under a local Python interpreter (rather than in Docker) is still supported, and is the more convenient path if you're actively editing ThreatTrace's own source. It requires **Python 3.10+** (developed and validated on **Windows**; see [Cross-Platform Status](#cross-platform-status)) and, for Nmap/Nuclei/ZAP, either host installs or the demo Docker containers described below.
+
+```powershell
+py -m pip install -r requirements.txt        # Windows PowerShell
+```
+```bash
+python3 -m pip install -r requirements.txt   # macOS / Linux
 ```
 
 `requirements.txt` declares `mcp>=1.28,<2` (used by `mcp/hayabusa_server.py` and by the `backend/` package's transitively-included `starlette`/`uvicorn`). No proprietary tool (Nmap, Nuclei, Burp) is installed by this step — see [Supported Tools](#supported-tools) and `python -m runtime.bootstrap check`.
@@ -222,19 +239,19 @@ Optional, tool-specific setup:
 3. Copy `.env.example` to `.env` and fill in real values only for the optional variables you actually need (e.g. a configured Burp runtime). **Never commit `.env`.**
 4. Apply `supabase/schema.sql` to your own Supabase project manually, if using the investigation loop.
 
-## Quickstart
+Host-native quickstart:
 
 1. Clone the repository.
 2. Create a Python 3.10+ environment and `pip install -r requirements.txt`.
 3. Run the readiness check: `python -m runtime.bootstrap check`.
-4. Start demo dependencies: `python -m runtime.bootstrap start-demo --with-zap` (or `docker compose --profile zap up -d`).
+4. Start demo dependencies: `python -m runtime.bootstrap start-demo --with-zap`.
 5. Start the backend: `python -m backend.app` (binds `127.0.0.1:8420` only).
 6. Open the live dashboard: `http://127.0.0.1:8420/`.
 7. Run the local Juice Shop demo from the dashboard, or `curl -X POST http://127.0.0.1:8420/api/runs/bug-bounty -d '{"target":"http://localhost:3000/"}'`.
 8. Inspect the live event feed, canonical findings, and (for a Detection run) the rule candidates — always `NOT_DEPLOYED`.
 9. Stop demo dependencies: `python -m runtime.bootstrap stop-demo`.
 
-Full step-by-step detail, including how to exercise the Governor and Detection Engineering paths explicitly, is in [docs/demo-runbook.md](docs/demo-runbook.md).
+Don't run both the Docker stack and a host-native backend against port `8420` at the same time. Full step-by-step detail, including how to exercise the Governor and Detection Engineering paths explicitly, is in [docs/demo-runbook.md](docs/demo-runbook.md).
 
 ## Juice Shop Demo
 

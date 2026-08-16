@@ -301,3 +301,124 @@ class TestStructuralValidation:
         correlation_result = correlate_bug_bounty_evidence(evidence_records=[record])
         with pytest.raises(BugBountyFinalReportError):
             build_final_bug_bounty_report(correlation_result=correlation_result, evidence_records=[], **_base_kwargs())
+
+
+# ---------------------------------------------------------------------------
+# End-to-end benchmark compatibility: real normalize -> correlate ->
+# final report -> evaluate_benchmark, using the real ZAP/Burp DAST path
+# fix and vulnerability_class fix together (Step 6 of the Docker Juice
+# Shop accuracy exercise). The objective this checkpoint is structural
+# validity of every canonical vulnerability finding, never a better
+# benchmark score.
+# ---------------------------------------------------------------------------
+
+
+class TestBenchmarkStructuralCompatibility:
+    @staticmethod
+    def _zap_only_source_results():
+        from core.bug_bounty_evidence_normalization import normalize_bug_bounty_evidence
+
+        zap_result = {
+            "tool_result_version": "1", "tool_id": "zap", "request_id": "REQ-1", "target": "http://juice-shop:3000",
+            "status": "completed", "capability": "passive_only",
+            "observations": [
+                {
+                    "tool_id": "zap", "observation_type": "dast_observation", "rule_id": "10038",
+                    "title": "Content Security Policy (CSP) Header Not Set", "risk": "Medium", "confidence": "High",
+                    "url": "http://juice-shop:3000", "path": None, "parameter": None, "method": "GET",
+                    "cwe": "CWE-693", "owasp_category": None, "evidence_reference": "zap_alert_sha256:" + "7" * 64,
+                    "sanitized_evidence": None,
+                },
+                {
+                    "tool_id": "zap", "observation_type": "dast_observation", "rule_id": "10098",
+                    "title": "Cross-Domain Misconfiguration", "risk": "Medium", "confidence": "Medium",
+                    "url": "http://juice-shop:3000", "path": None, "parameter": None, "method": "GET",
+                    "cwe": "CWE-264", "owasp_category": None, "evidence_reference": "zap_alert_sha256:" + "8" * 64,
+                    "sanitized_evidence": "Access-Control-Allow-Origin: *",
+                },
+                {
+                    "tool_id": "zap", "observation_type": "dast_observation", "rule_id": "10096",
+                    "title": "Timestamp Disclosure - Unix", "risk": "Low", "confidence": "Low",
+                    "url": "http://juice-shop:3000", "path": None, "parameter": None, "method": "GET",
+                    "cwe": "CWE-497", "owasp_category": None, "evidence_reference": "zap_alert_sha256:" + "9" * 64,
+                    "sanitized_evidence": "1666666667",
+                },
+            ],
+            "execution_performed": True,
+        }
+        return normalize_bug_bounty_evidence(
+            source_results=[{"source_tool": "zap", "result": zap_result}],
+            scope_reference="http://juice-shop:3000", observed_at="2026-08-15T00:00:00Z",
+        )
+
+    def test_032_every_real_zap_canonical_finding_is_benchmark_structurally_valid(self):
+        # Real, unmodified evaluate_benchmark() and build_baseline_ground_truth()
+        # -- the exact defect from Step 5 (INVALID_FINDING: vulnerability_class
+        # must be a non-blank string) must no longer occur for any of these
+        # three real ZAP finding shapes, none of which had a closed CWE
+        # mapping other than the CSP one.
+        from core.benchmark_evaluation import evaluate_benchmark
+        from core.juice_shop_ground_truth import build_baseline_ground_truth
+
+        records = self._zap_only_source_results()
+        correlation_result = correlate_bug_bounty_evidence(evidence_records=records)
+        report = build_final_bug_bounty_report(
+            correlation_result=correlation_result, evidence_records=records, **_base_kwargs(),
+        )
+        canonical_findings = report["canonical_findings"]
+        assert len(canonical_findings) == 3  # CWE-693, CWE-264, CWE-497 -- three distinct categories, no merge
+
+        benchmark_findings = [
+            {
+                "finding_id": cf["finding_id"],
+                "vulnerability_class": cf["vulnerability_class"],
+                "affected_path": cf["path"],
+                "title": cf["title"],
+                "technical_severity": cf["technical_severity"],
+                "evidence": [
+                    {"observation": obs.get("sanitized_evidence") or obs.get("title"), "evidence_digest": digest}
+                    for digest, obs in zip(cf["evidence_digests"], cf["tool_observations"])
+                ],
+            }
+            for cf in canonical_findings
+        ]
+        # This must not raise -- every finding is structurally valid input.
+        # None of these three zap-only findings actually matches a ground
+        # truth case here: JS-CSP-MISSING's match_hint requires the exact
+        # hyphenated "Content-Security-Policy" substring (the real HTTP
+        # header name, as http_assessor's own evidence text says it) --
+        # ZAP's title uses spaces ("Content Security Policy (CSP) ..."),
+        # so it never satisfies match_hint on its own. This is a separate,
+        # genuine limitation of match_hint tuning, not something Step 6
+        # was asked to fix -- the objective here is structural validity,
+        # not a better benchmark score. All three become valid unmatched
+        # findings, never a false positive, never a raised error.
+        result = evaluate_benchmark(ground_truth=build_baseline_ground_truth(), findings=benchmark_findings)
+        assert result["true_positive_count"] == 0
+        assert result["false_positive_count"] == 0
+        assert result["unmatched_finding_count"] == 3
+
+    def test_033_generic_fallback_findings_land_in_unmatched_not_false_positive(self):
+        from core.benchmark_evaluation import evaluate_benchmark
+        from core.juice_shop_ground_truth import build_baseline_ground_truth
+
+        records = self._zap_only_source_results()
+        correlation_result = correlate_bug_bounty_evidence(evidence_records=records)
+        report = build_final_bug_bounty_report(
+            correlation_result=correlation_result, evidence_records=records, **_base_kwargs(),
+        )
+        generic_findings = [cf for cf in report["canonical_findings"] if cf["vulnerability_class"] == "dast_observation"]
+        assert len(generic_findings) == 2  # Cross-Domain Misconfiguration, Timestamp Disclosure
+
+        benchmark_findings = [
+            {
+                "finding_id": cf["finding_id"], "vulnerability_class": cf["vulnerability_class"],
+                "affected_path": cf["path"], "title": cf["title"], "technical_severity": cf["technical_severity"],
+                "evidence": [{"observation": cf["title"], "evidence_digest": cf["evidence_digests"][0]}],
+            }
+            for cf in generic_findings
+        ]
+        result = evaluate_benchmark(ground_truth=build_baseline_ground_truth(), findings=benchmark_findings)
+        assert result["true_positive_count"] == 0
+        assert result["false_positive_count"] == 0
+        assert result["unmatched_finding_count"] == 2

@@ -331,6 +331,84 @@ class TestClosedAdapterRegistry:
             execution_module._ADAPTER_REGISTRY["metasploit"] = lambda **kw: None
 
 
+class TestDetectedTechnologiesForwarding:
+    """Nuclei Reliability Step 1C: detected_technologies is forwarded,
+    unmodified, only to whichever adapter wrapper accepts it -- every
+    other adapter accepts and ignores it. Real call-site tracking, not
+    just a signature check.
+    """
+
+    def test_020_forwarded_to_nuclei_adapter(self, monkeypatch):
+        import core.bug_bounty_tool_execution as execution_module
+        captured = {}
+
+        def fake_nuclei(*, target, request_id, execution_config, detected_technologies=None):
+            captured["detected_technologies"] = detected_technologies
+            return {
+                "tool_result_version": "3", "tool_id": "nuclei", "request_id": request_id, "target": target,
+                "status": "completed", "observations": [], "evidence_references": [],
+                "network_requests_performed": None, "output_truncated": False, "error_detail": None,
+                "execution_performed": True, "partial_results": False, "runtime_duration_seconds": 1.0,
+                "profile_name": "quick_phased_v2", "nuclei_version": None, "templates_selected_count": None,
+                "stderr_summary": None, "phases": [],
+            }
+
+        monkeypatch.setattr(execution_module, "run_nuclei_scan", fake_nuclei)
+        permissions = _permissions(testing_profile="safe_dast", allowed_tools=["nuclei"])
+        request = _tool_request(tool_id="nuclei", testing_mode="safe_dast", target="http://localhost:3000/", ports=[], paths=["/"])
+        execute_bug_bounty_tool(
+            permissions=permissions, tool_request=request, governor_result=_governor_result(),
+            execution_config=_execution_config(), detected_technologies=["express"],
+        )
+        assert captured["detected_technologies"] == ["express"]
+
+    def test_021_defaults_to_none_when_caller_omits_it(self, monkeypatch):
+        import core.bug_bounty_tool_execution as execution_module
+        captured = {}
+
+        def fake_nuclei(*, target, request_id, execution_config, detected_technologies=None):
+            captured["detected_technologies"] = detected_technologies
+            return {
+                "tool_result_version": "3", "tool_id": "nuclei", "request_id": request_id, "target": target,
+                "status": "completed", "observations": [], "evidence_references": [],
+                "network_requests_performed": None, "output_truncated": False, "error_detail": None,
+                "execution_performed": True, "partial_results": False, "runtime_duration_seconds": 1.0,
+                "profile_name": "quick_phased_v2", "nuclei_version": None, "templates_selected_count": None,
+                "stderr_summary": None, "phases": [],
+            }
+
+        monkeypatch.setattr(execution_module, "run_nuclei_scan", fake_nuclei)
+        permissions = _permissions(testing_profile="safe_dast", allowed_tools=["nuclei"])
+        request = _tool_request(tool_id="nuclei", testing_mode="safe_dast", target="http://localhost:3000/", ports=[], paths=["/"])
+        execute_bug_bounty_tool(
+            permissions=permissions, tool_request=request, governor_result=_governor_result(),
+            execution_config=_execution_config(),
+        )
+        assert captured["detected_technologies"] is None
+
+    def test_022_nmap_adapter_ignores_it_without_error(self, monkeypatch):
+        import core.bug_bounty_tool_execution as execution_module
+        called = {"value": False}
+
+        def fake_nmap(*, target, ports, request_id, execution_config):
+            called["value"] = True
+            return {
+                "tool_result_version": "1", "tool_id": "nmap", "request_id": request_id, "target": target,
+                "status": "completed", "observations": [], "evidence_references": [],
+                "execution_performed": True,
+            }
+
+        monkeypatch.setattr(execution_module, "run_nmap_scan", fake_nmap)
+        permissions = _permissions(testing_profile="safe_dast", allowed_tools=["nmap"])
+        request = _tool_request(tool_id="nmap", testing_mode="safe_dast", target="localhost", ports=[3000], paths=[])
+        result = execute_bug_bounty_tool(
+            permissions=permissions, tool_request=request, governor_result=_governor_result(),
+            execution_config=_execution_config(), detected_technologies=["express"],
+        )
+        assert called["value"] is True
+        assert result["execution_permitted"] is True
+
+
 # ---------------------------------------------------------------------------
 # Adapter-level rejection (structural request violates an adapter's own
 # additional scope rules, e.g. too many ports)

@@ -7,6 +7,8 @@ from __future__ import annotations
 import pytest
 
 from backend.models import (
+    DEMO_TARGET_DISPLAY_ALIAS,
+    DEMO_TARGET_ENV_VAR,
     RUN_STATUSES,
     TERMINAL_STATUSES,
     EventModelError,
@@ -14,6 +16,7 @@ from backend.models import (
     apply_run_transition,
     build_event,
     build_run,
+    resolve_execution_target,
     validate_local_only_target,
 )
 
@@ -189,3 +192,54 @@ class TestValidateLocalOnlyTarget:
     def test_023_rejects_everything_else(self, target):
         with pytest.raises(RunModelError, match="INVALID_TARGET"):
             validate_local_only_target(target)
+
+
+class TestResolveExecutionTarget:
+    """Docker self-hosted deployment: the demo-target alias mechanism.
+
+    resolve_execution_target is strictly additive and only ever runs
+    after validate_local_only_target has already accepted the caller's
+    display target -- it never widens what a caller may submit, it only
+    optionally redirects one exact, pre-approved alias to a
+    Docker-internal execution target.
+    """
+
+    def test_024_no_op_when_env_unset(self):
+        result = resolve_execution_target(display_target="http://localhost:3000/", env={})
+        assert result == "http://localhost:3000/"
+
+    def test_025_maps_exact_alias_when_configured(self):
+        env = {DEMO_TARGET_ENV_VAR: "http://juice-shop:3000"}
+        result = resolve_execution_target(display_target=DEMO_TARGET_DISPLAY_ALIAS, env=env)
+        assert result == "http://juice-shop:3000"
+
+    def test_026_tolerates_trailing_slash_mismatch(self):
+        env = {DEMO_TARGET_ENV_VAR: "http://juice-shop:3000"}
+        result = resolve_execution_target(display_target="http://localhost:3000", env=env)
+        assert result == "http://juice-shop:3000"
+
+    @pytest.mark.parametrize("display_target", [
+        "http://localhost:3001/",
+        "http://localhost:3000/admin",
+        "https://localhost:3000/",
+        "http://127.0.0.1:3000/",
+        "http://juice-shop:3000/",
+        "http://evil.example.com/",
+    ])
+    def test_027_never_maps_any_other_hostname_or_variant(self, display_target):
+        env = {DEMO_TARGET_ENV_VAR: "http://juice-shop:3000"}
+        result = resolve_execution_target(display_target=display_target, env=env)
+        assert result == display_target
+
+    def test_028_blank_env_value_is_no_op(self):
+        env = {DEMO_TARGET_ENV_VAR: "   "}
+        result = resolve_execution_target(display_target=DEMO_TARGET_DISPLAY_ALIAS, env=env)
+        assert result == DEMO_TARGET_DISPLAY_ALIAS
+
+    def test_029_does_not_weaken_validate_local_only_target(self):
+        # Even with the demo alias configured, the execution target
+        # itself (a Docker-network hostname) must still be rejected as
+        # a *display* target -- only the orchestrator's internal
+        # resolve_execution_target call is permitted to see it.
+        with pytest.raises(RunModelError, match="INVALID_TARGET"):
+            validate_local_only_target("http://juice-shop:3000")

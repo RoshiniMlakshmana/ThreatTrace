@@ -54,6 +54,7 @@ public symbols (plus its fixed vocabulary constants).
 from __future__ import annotations
 
 import json
+import os
 from collections.abc import Mapping
 from typing import Any
 from urllib.parse import urlsplit
@@ -132,6 +133,7 @@ SOURCE_COMPONENTS = frozenset({
     "bug_bounty_tool_policy",
     "security_governor",
     "bug_bounty_assessment",
+    "bug_bounty_crawler",
     "bug_bounty_evidence_normalization",
     "bug_bounty_finding_correlation",
     "bug_bounty_final_report",
@@ -169,6 +171,7 @@ _RUN_FIELD_DEFAULTS: dict[str, Any] = {
     "error_summary": None,
     "cancellation_requested": False,
     "report": None,
+    "attack_surface": None,
 }
 
 _RUN_MUTABLE_FIELDS = frozenset(_RUN_FIELD_DEFAULTS) | {"status", "current_stage", "started_at", "completed_at"}
@@ -480,3 +483,49 @@ def validate_local_only_target(target: Any) -> str:
         )
 
     return target.strip()
+
+
+# ---------------------------------------------------------------------------
+# Demo target alias (self-hosted Docker deployment)
+# ---------------------------------------------------------------------------
+
+DEMO_TARGET_ENV_VAR = "THREATTRACE_DEMO_TARGET"
+DEMO_TARGET_DISPLAY_ALIAS = "http://localhost:3000/"
+
+
+def resolve_execution_target(*, display_target: str, env: Any = None) -> str:
+    """Map the one fixed, hardcoded demo alias (`http://localhost:3000/`
+    -- what a browser/user submits) to the real internal execution
+    target the self-hosted Docker deployment actually needs to reach
+    (`http://juice-shop:3000`, the Docker Compose service name),
+    **only** when the operator has explicitly configured
+    `THREATTRACE_DEMO_TARGET`. Performs no I/O -- pure string
+    comparison.
+
+    This function must only ever be called on a `display_target` that
+    has *already* passed `validate_local_only_target` -- it never
+    performs that check itself, and never weakens it. It is a strictly
+    *narrower*, additive mapping on top of that already-enforced
+    boundary: it recognizes exactly one fixed alias string, never an
+    arbitrary hostname, and never a caller-supplied mapping. A
+    `display_target` of any other shape (including any other
+    `localhost` port) passes through unchanged.
+
+    Absent `THREATTRACE_DEMO_TARGET` (the default -- host-native
+    deployment, no Docker-network translation needed), this function is
+    a pure no-op: it always returns `display_target` unchanged. This is
+    the mechanism `docker-compose.yml`'s `threattrace` service uses
+    (`THREATTRACE_DEMO_TARGET: "http://juice-shop:3000"`) to let a user
+    open the dashboard, submit the familiar `http://localhost:3000/`
+    they can also open directly in a browser, and have the backend
+    actually reach the demo target by its real Docker DNS service name
+    -- see `docs/docker-self-hosted-deployment.md` for the full
+    display-target-vs-execution-target model.
+    """
+    active_env = env if env is not None else os.environ
+    configured = (active_env.get(DEMO_TARGET_ENV_VAR) or "").strip()
+    if not configured:
+        return display_target
+    if display_target.rstrip("/") != DEMO_TARGET_DISPLAY_ALIAS.rstrip("/"):
+        return display_target
+    return configured

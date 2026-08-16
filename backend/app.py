@@ -2,12 +2,24 @@
 
 ## Local-only, by construction
 
-`main()` binds uvicorn to `127.0.0.1` only -- never `0.0.0.0`, never a
-LAN-reachable interface. There is no cloud tunnel, no reverse proxy
-configuration, and no authentication of any kind anywhere in this
-module. This is a **local development/research interface**, never a
-production-authenticated control plane -- every response this module
-returns is honest about that (see `GET /api/health`).
+`main()` binds uvicorn to `127.0.0.1` by default -- never `0.0.0.0`,
+never a LAN-reachable interface -- unless the deployment operator
+explicitly overrides it via `THREATTRACE_BIND_HOST` (never inferred
+from a request; this is a fixed, deployment-time setting, exactly like
+`THREATTRACE_DEMO_TARGET`/`ZAP_API_URL`). The self-hosted Docker
+runtime is the one deployment that legitimately needs this: uvicorn
+must bind the *container's* `0.0.0.0` for Docker's own port-publish
+mechanism to forward traffic to it at all (a process bound to a
+container's own `127.0.0.1` is unreachable from outside that
+container's network namespace, including from the host). External
+reachability is still governed entirely by `docker-compose.yml`'s host
+port publish spec, which stays `127.0.0.1:8420:8420` -- loopback-only
+on the host, regardless of what the container binds internally. There
+is no cloud tunnel, no reverse proxy configuration, and no
+authentication of any kind anywhere in this module. This is a **local
+development/research interface**, never a production-authenticated
+control plane -- every response this module returns is honest about
+that (see `GET /api/health`).
 
 ## Route handlers are thin -- all logic lives in the modules they call
 
@@ -51,8 +63,8 @@ directly on the asyncio event loop this module serves requests from.
 from __future__ import annotations
 
 import json
+import os
 import queue
-import shutil
 import threading
 import traceback
 from datetime import datetime, timezone
@@ -70,10 +82,16 @@ from backend.event_bus import EventBus, EventBusError
 from backend.models import TERMINAL_STATUSES, RunModelError, validate_local_only_target
 from backend.orchestrator import TRIGGER_SOURCES, run_bug_bounty_workflow, run_detection_workflow
 from backend.run_store import RunStore, RunStoreError, is_valid_run_id
+from core.bug_bounty_juice_shop_evaluation import evaluate_bug_bounty_run_against_juice_shop_benchmark
+from runtime.tool_runtime import evaluate_tool_readiness
 
 BACKEND_VERSION = "1"
-BIND_HOST = "127.0.0.1"
-BIND_PORT = 8420
+
+# Deployment-time only -- never derived from a request. Defaults preserve
+# the loopback-only safety property; the self-hosted Docker runtime is the
+# only place these are overridden (see module docstring).
+BIND_HOST = os.environ.get("THREATTRACE_BIND_HOST", "127.0.0.1")
+BIND_PORT = int(os.environ.get("THREATTRACE_BIND_PORT", "8420"))
 
 MAX_REQUEST_BODY_BYTES = 65536
 
@@ -167,23 +185,82 @@ async def health(request: Request) -> Response:
     })
 
 
+def _always_ready(*, tool_id: str, label: str, detail: str) -> dict[str, Any]:
+    return {"id": tool_id, "label": label, "state": "ready", "version": None, "required": True, "detail": detail}
+
+
 @_api_route
 async def system_info(request: Request) -> Response:
+    readiness = evaluate_tool_readiness()
+    tools = readiness["tools"]
+
+    def _scanner_item(tool_id: str, label: str, *, required: bool) -> dict[str, Any]:
+        result = tools[tool_id]
+        return {
+            "id": tool_id, "label": label, "state": result["state"], "version": result.get("version"),
+            "required": required, "detail": result["detail"],
+        }
+
+    categories = [
+        {
+            "category": "core_services", "label": "Core Services",
+            "items": [
+                _always_ready(tool_id="backend", label="ThreatTrace Backend", detail="Process running."),
+                _always_ready(tool_id="governor", label="Security Governor", detail="core.security_governor -- deterministic, no external dependency."),
+            ],
+        },
+        {
+            "category": "scanners", "label": "Scanners",
+            "items": [
+                _scanner_item("http_assessor", "HTTP Assessor", required=True),
+                _scanner_item("nmap", "Nmap", required=True),
+                _scanner_item("nuclei", "Nuclei", required=True),
+                _scanner_item("zap", "ZAP", required=True),
+            ],
+        },
+        {
+            "category": "intelligence", "label": "Intelligence",
+            "items": [
+                _always_ready(tool_id="threat_intel", label="Threat Intelligence", detail="CISA KEV / NVD / EPSS ingestion -- queried live per use, no persistent dependency."),
+            ],
+        },
+        {
+            "category": "detection", "label": "Detection",
+            "items": [
+                _always_ready(tool_id="detection_engineering", label="Detection Engineering", detail="Deterministic core -- no external dependency."),
+            ],
+        },
+        {
+            "category": "optional_integrations", "label": "Optional Integrations",
+            "items": [
+                _scanner_item("burp_dast", "Burp DAST", required=False),
+                {
+                    "id": "authenticated_testing", "label": "Authenticated Testing", "required": False,
+                    "state": tools["authenticated_testing"]["state"], "version": None,
+                    "detail": tools["authenticated_testing"]["detail"],
+                },
+                {
+                    "id": "controlled_validation", "label": "Controlled Validation", "required": False,
+                    "state": tools["controlled_validation"]["state"], "version": None,
+                    "detail": tools["controlled_validation"]["detail"],
+                },
+            ],
+        },
+    ]
+
     return JSONResponse({
         "system_version": "1",
         "bind": f"{BIND_HOST}:{BIND_PORT}",
-        "tools": {
-            "http_assessor": "available",
-            "nmap": "available" if shutil.which("nmap") else "not_installed",
-            "nuclei": "available" if shutil.which("nuclei") else "not_installed",
-            "zap": "not_configured",
-            "burp_dast": "not_configured",
-        },
+        "categories": categories,
+        # Flat map retained for simple consumers -- the exact same states
+        # `runtime.tool_runtime.evaluate_tool_readiness` computed above,
+        # never a separate/weaker check.
+        "tools": {tool_id: result["state"] for tool_id, result in tools.items()},
         "active_bug_bounty_run_id": _run_store.active_bug_bounty_run_id(),
         "limitations": [
             "local development/research interface -- not a production-authenticated control plane",
             "run history is in-memory only and is lost on backend restart",
-            "zap/burp_dast readiness is never probed automatically -- reported not_configured until a run exercises them",
+            "authenticated_testing/controlled_validation are declared, not implemented -- shown under Optional Integrations, never as a failed core service",
         ],
     })
 
@@ -303,6 +380,15 @@ async def get_report(request: Request) -> Response:
 
 
 @_api_route
+async def get_evaluation(request: Request) -> Response:
+    run_id = _require_valid_run_id(request.path_params["run_id"])
+    run = _get_run_or_404(run_id)
+    events = _event_bus.get_events(run_id=run_id, since_sequence=0)
+    evaluation = evaluate_bug_bounty_run_against_juice_shop_benchmark(run=run, events=events)
+    return JSONResponse(evaluation)
+
+
+@_api_route
 async def cancel_run(request: Request) -> Response:
     run_id = _require_valid_run_id(request.path_params["run_id"])
     run = _get_run_or_404(run_id)
@@ -374,6 +460,7 @@ routes = [
     Route("/api/runs/{run_id}/events", get_events, methods=["GET"]),
     Route("/api/runs/{run_id}/stream", stream_events, methods=["GET"]),
     Route("/api/runs/{run_id}/report", get_report, methods=["GET"]),
+    Route("/api/runs/{run_id}/evaluation", get_evaluation, methods=["GET"]),
     Route("/api/runs/{run_id}/cancel", cancel_run, methods=["POST"]),
 ]
 

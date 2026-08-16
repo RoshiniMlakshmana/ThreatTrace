@@ -48,12 +48,7 @@ python3 -m runtime.bootstrap start-demo --with-zap
 
 This starts the local Juice Shop container (`threattrace-juice-shop`, bound to `127.0.0.1:3000`) and, with `--with-zap`, the local ZAP container (`threattrace-zap`, bound to `127.0.0.1:8080`) if Docker reports it `container_available`. Omit `--with-zap` if you only want the Bug Bounty `http_assessor` path. Add `--dry-run` first if you want to see exactly what would run without executing anything.
 
-Equivalent via Docker Compose:
-
-```bash
-docker compose --profile zap up -d      # Juice Shop + ZAP
-docker compose up -d                    # Juice Shop only
-```
+This is for the **host-native backend path** below, where only the demo dependency containers run in Docker and the ThreatTrace backend itself runs directly under your local Python interpreter. If you'd rather run the *entire* stack — backend, Nmap, Nuclei, ZAP, and Juice Shop — in Docker with one command and no host Python/Nmap/Nuclei install at all, use `docker compose up -d --build` instead and skip straight to opening `http://127.0.0.1:8420`; see [docs/docker-self-hosted-deployment.md](docker-self-hosted-deployment.md). Don't run both paths against port `8420` at the same time.
 
 ## 3. Start the backend
 

@@ -56,11 +56,17 @@ corroboration when every member came from the same underlying tool.
 ## Informational vs. canonical, decided honestly
 
 A group is `is_informational: True` only when **every** member has no
-`technical_severity`, no `vulnerability_class`, no `cwe`, and no `cve`
-(e.g. a bare Nmap open-port observation) -- this module never promotes
-such a group into a canonical security finding merely to populate a
-report; `core.bug_bounty_final_report` is expected to keep these
-separate, per this checkpoint's own requirement.
+`technical_severity`, no `cwe`, and no `cve` (e.g. a bare Nmap open-port
+observation, or a ZAP alert whose own risk is "Informational") -- this
+module never promotes such a group into a canonical security finding
+merely to populate a report; `core.bug_bounty_final_report` is expected
+to keep these separate, per this checkpoint's own requirement.
+`vulnerability_class` is deliberately excluded from this check: `core.
+bug_bounty_evidence_normalization` always populates it for ZAP/Burp DAST
+observations (a closed CWE mapping, or an explicit generic placeholder
+when no mapping applies), so its presence alone no longer distinguishes
+a real finding from a bare observation the way it still does for
+`http_assessor`.
 
 ## No I/O, no execution, ever
 
@@ -243,9 +249,19 @@ def _build_group(members_unordered: list[Mapping[str, Any]]) -> dict[str, Any]:
     base_confidence = _highest(confidences, _CONFIDENCE_ORDER)
     aggregated_confidence = _bump_one_level(base_confidence, _CONFIDENCE_ORDER) if multi_tool_corroborated else base_confidence
 
+    # `vulnerability_class` is deliberately NOT one of these signals.
+    # core.bug_bounty_evidence_normalization always populates it for
+    # ZAP/Burp DAST observations now (a closed CWE mapping, or an
+    # explicit generic placeholder when no defensible mapping exists) --
+    # so its mere presence no longer indicates the source tool asserted
+    # anything beyond "this was a DAST-shaped observation." technical
+    # _severity/cwe/cve remain the only fields a tool sets specifically
+    # because it is reporting a real condition, never as a structural
+    # formality -- Nmap's bare port-open observation and ZAP's own
+    # informational-risk alerts (e.g. "Modern Web Application") both
+    # correctly stay informational under this check.
     is_informational = all(
-        not record.get("technical_severity") and not record.get("vulnerability_class")
-        and not record.get("cwe") and not record.get("cve")
+        not record.get("technical_severity") and not record.get("cwe") and not record.get("cve")
         for record in members
     )
 

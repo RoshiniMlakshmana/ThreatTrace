@@ -14,9 +14,13 @@ from adapters.bug_bounty_zap import (
     MAX_PROCESS_TIMEOUT_SECONDS,
     MAX_SPIDER_URLS,
     STATUS_VALUES,
+    ZAP_API_HOST,
+    ZAP_API_PORT,
+    ZAP_API_URL_ENV_VAR,
     BugBountyZapAdapterError,
     _daemon_reachable_url,
     _original_form_url,
+    _resolve_zap_api_target,
     _ZapUnavailable,
     run_zap_scan,
 )
@@ -400,3 +404,44 @@ class TestDaemonHostAliasRouting:
         run_zap_scan(target="http://localhost:3000/", request_id="REQ-1", execution_config=_execution_config())
         access_url_calls = [call for call in calls if call[0] == "/JSON/core/action/accessUrl/"]
         assert access_url_calls[0][1]["url"] == "http://host.docker.internal:3000/"
+
+
+# ---------------------------------------------------------------------------
+# ZAP_API_URL -- where the daemon's own control API is reached (self-hosted
+# Docker runtime: the internal Compose service name "zap", not 127.0.0.1).
+# ---------------------------------------------------------------------------
+
+
+class TestZapApiTargetResolution:
+    def test_040_defaults_when_env_unset(self, monkeypatch):
+        monkeypatch.delenv(ZAP_API_URL_ENV_VAR, raising=False)
+        assert _resolve_zap_api_target() == (ZAP_API_HOST, ZAP_API_PORT)
+
+    def test_041_defaults_when_env_blank(self, monkeypatch):
+        monkeypatch.setenv(ZAP_API_URL_ENV_VAR, "   ")
+        assert _resolve_zap_api_target() == (ZAP_API_HOST, ZAP_API_PORT)
+
+    def test_042_uses_configured_docker_service_name(self, monkeypatch):
+        monkeypatch.setenv(ZAP_API_URL_ENV_VAR, "http://zap:8080")
+        assert _resolve_zap_api_target() == ("zap", 8080)
+
+    def test_043_uses_configured_port_when_given(self, monkeypatch):
+        monkeypatch.setenv(ZAP_API_URL_ENV_VAR, "http://zap:9999")
+        assert _resolve_zap_api_target() == ("zap", 9999)
+
+    def test_044_defaults_port_when_omitted(self, monkeypatch):
+        monkeypatch.setenv(ZAP_API_URL_ENV_VAR, "http://zap")
+        assert _resolve_zap_api_target() == ("zap", ZAP_API_PORT)
+
+    @pytest.mark.parametrize("bad_value", [
+        "not-a-url", "https://zap:8080", "ftp://zap:8080", "zap:8080",
+    ])
+    def test_045_falls_back_to_default_on_unparseable_or_wrong_scheme(self, monkeypatch, bad_value):
+        monkeypatch.setenv(ZAP_API_URL_ENV_VAR, bad_value)
+        assert _resolve_zap_api_target() == (ZAP_API_HOST, ZAP_API_PORT)
+
+    def test_046_resolved_fresh_each_call_not_cached_at_import(self, monkeypatch):
+        monkeypatch.delenv(ZAP_API_URL_ENV_VAR, raising=False)
+        assert _resolve_zap_api_target() == (ZAP_API_HOST, ZAP_API_PORT)
+        monkeypatch.setenv(ZAP_API_URL_ENV_VAR, "http://zap:8080")
+        assert _resolve_zap_api_target() == ("zap", 8080)

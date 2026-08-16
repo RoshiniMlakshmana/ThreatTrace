@@ -51,10 +51,29 @@ class TestHealthAndSystem:
     def test_002_system_reports_tool_readiness(self, client):
         r = client.get("/api/system")
         assert r.status_code == 200
-        tools = r.json()["tools"]
-        assert tools["http_assessor"] == "available"
-        assert tools["zap"] == "not_configured"
+        body = r.json()
+        tools = body["tools"]
+        assert tools["http_assessor"] == "ready"
         assert tools["burp_dast"] == "not_configured"
+        assert tools["zap"] in (
+            "ready", "container_available", "runtime_unavailable",
+        )  # real, environment-dependent -- never fabricated
+
+    def test_002b_system_categories_present_and_optional_never_shows_as_failed(self, client):
+        r = client.get("/api/system")
+        categories = {c["category"]: c for c in r.json()["categories"]}
+        assert set(categories) == {"core_services", "scanners", "intelligence", "detection", "optional_integrations"}
+
+        optional_ids = {item["id"]: item for item in categories["optional_integrations"]["items"]}
+        assert set(optional_ids) == {"burp_dast", "authenticated_testing", "controlled_validation"}
+        for item in optional_ids.values():
+            assert item["required"] is False
+            assert item["state"] != "failed"
+
+        for item in categories["scanners"]["items"]:
+            assert item["required"] is True
+        for item in categories["core_services"]["items"]:
+            assert item["state"] == "ready"
 
     def test_003_system_never_exposes_env_vars(self, client):
         r = client.get("/api/system")
@@ -158,7 +177,11 @@ class TestBugBountyRunLifecycle:
         assert status == "completed"
         run = client.get(f"/api/runs/{run_id}").json()
         assert run["governor_decisions"][0]["decision"] == "allow"
-        assert run["executed_tools"] == ["http_assessor"]
+        # http_assessor is pure Python and always executes; nmap/nuclei/zap
+        # each honestly execute or not depending on real, environment-specific
+        # availability -- this integration test never hardcodes that.
+        assert "http_assessor" in run["executed_tools"]
+        assert run["requested_tools"] == ["http_assessor", "crawler", "nmap", "nuclei", "zap"]
 
     def test_013_events_endpoint_returns_ordered_events(self, client):
         run_id, _ = self._create_and_wait(client)
@@ -221,3 +244,202 @@ class TestBugBountyRunLifecycle:
         assert r.status_code == 200
         assert "text/html" in r.headers["content-type"]
         assert "ThreatTrace Live Platform" in r.text
+
+
+# ---------------------------------------------------------------------------
+# GET /api/runs/{run_id}/evaluation -- Step 7 of the Docker Juice Shop
+# accuracy exercise. Every run/report/event fixture below is injected
+# directly into an isolated RunStore/EventBus -- no real scan is ever
+# triggered to produce test data (matching this file's own established
+# _isolated_backend_state pattern for TestBugBountyRunLifecycle).
+# ---------------------------------------------------------------------------
+
+
+def _canonical_finding(**overrides):
+    finding = {
+        "finding_id": "CF-csp", "title": "Missing Content-Security-Policy header",
+        "vulnerability_class": "security_header_misconfiguration", "cwe": "CWE-693",
+        "path": "/", "technical_severity": "medium", "tools_used": ["http_assessor"],
+        "evidence_digests": ["sha256:" + "1" * 64],
+        "tool_observations": [{
+            "source_tool": "http_assessor", "title": "Missing Content-Security-Policy header",
+            "sanitized_evidence": "Response did not include a Content-Security-Policy header.",
+        }],
+    }
+    finding.update(overrides)
+    return finding
+
+
+def _report(**overrides):
+    report = {
+        "canonical_findings": [_canonical_finding()],
+        "informational_observations": [],
+        "tools_requested": ["http_assessor", "nmap", "nuclei", "zap"],
+        "tools_permitted": ["http_assessor", "nmap", "nuclei", "zap"],
+        "tools_executed": ["http_assessor", "nmap", "nuclei", "zap"],
+        "correlation_summary": {"multi_tool_corroborated_count": 0, "duplicate_evidence_count": 0},
+    }
+    report.update(overrides)
+    return report
+
+
+class TestEvaluationEndpoint:
+    @pytest.fixture(autouse=True)
+    def _isolated_backend_state(self, monkeypatch):
+        from backend.event_bus import EventBus
+        from backend.run_store import RunStore
+
+        monkeypatch.setattr(backend_app, "_run_store", RunStore())
+        monkeypatch.setattr(backend_app, "_event_bus", EventBus())
+
+    def _create_completed_juice_shop_run(self, *, report=None, target_summary="http://localhost:3000/"):
+        run = backend_app._run_store.create_run(run_type="bug_bounty", created_at="2026-08-15T00:00:00Z")
+        backend_app._run_store.transition(
+            run_id=run["run_id"], new_status="completed", completed_at="2026-08-15T00:05:00Z",
+            target_summary=target_summary, report=report if report is not None else _report(),
+        )
+        backend_app._event_bus.publish(
+            run_id=run["run_id"], event_type="tool_completed", timestamp="2026-08-15T00:01:00Z",
+            stage="tool_execution", source_component="bug_bounty_assessment",
+            summary="http_assessor completed: 5 findings, 6 requests.",
+            sanitized_payload={"findings_count": 5, "network_requests_performed": 6, "assessment_performed": True},
+        )
+        backend_app._event_bus.publish(
+            run_id=run["run_id"], event_type="tool_completed", timestamp="2026-08-15T00:02:00Z",
+            stage="tool_execution", source_component="bug_bounty_assessment",
+            summary="nuclei completed: status=timeout, 0 observation(s).",
+            sanitized_payload={"tool_id": "nuclei", "status": "timeout", "observation_count": 0},
+        )
+        return run["run_id"]
+
+    def test_035_unknown_run_404(self, client):
+        r = client.get("/api/runs/RUN-" + "0" * 32 + "/evaluation")
+        assert r.status_code == 404
+        assert r.json()["error_code"] == "RUN_NOT_FOUND"
+
+    def test_036_completed_juice_shop_run_is_evaluated(self, client):
+        run_id = self._create_completed_juice_shop_run()
+        r = client.get(f"/api/runs/{run_id}/evaluation")
+        assert r.status_code == 200
+        body = r.json()
+        assert body["evaluation_state"] == "evaluated"
+        assert body["run_id"] == run_id
+
+    def test_037_tp_fp_fn_tn_and_metrics_present(self, client):
+        run_id = self._create_completed_juice_shop_run()
+        body = client.get(f"/api/runs/{run_id}/evaluation").json()
+        assert body["true_positive_count"] == 1
+        assert body["false_positive_count"] == 0
+        assert body["true_negative_count"] == 4
+        assert body["precision"] == 1.0
+        assert "supported_benchmark_accuracy" in body
+        assert "overall_accuracy" not in body
+
+    def test_038_case_results_present(self, client):
+        run_id = self._create_completed_juice_shop_run()
+        body = client.get(f"/api/runs/{run_id}/evaluation").json()
+        assert len(body["case_results"]) == 9
+
+    def test_039_non_juice_shop_target_not_evaluated(self, client):
+        run_id = self._create_completed_juice_shop_run(target_summary="http://example.com/")
+        r = client.get(f"/api/runs/{run_id}/evaluation")
+        assert r.status_code == 200
+        assert r.json()["evaluation_state"] == "not_evaluated"
+
+    def test_040_incomplete_run_appropriate_state(self, client):
+        run = backend_app._run_store.create_run(run_type="bug_bounty", created_at="2026-08-15T00:00:00Z")
+        backend_app._run_store.update_fields(run_id=run["run_id"], target_summary="http://localhost:3000/")
+        r = client.get(f"/api/runs/{run['run_id']}/evaluation")
+        assert r.status_code == 200
+        assert r.json()["evaluation_state"] == "run_incomplete"
+
+    def test_041_detection_run_not_evaluated(self, client):
+        run = backend_app._run_store.create_run(run_type="detection", created_at="2026-08-15T00:00:00Z")
+        backend_app._run_store.transition(run_id=run["run_id"], new_status="completed", completed_at="2026-08-15T00:05:00Z")
+        r = client.get(f"/api/runs/{run['run_id']}/evaluation")
+        assert r.json()["evaluation_state"] == "not_evaluated"
+
+    def test_042_no_scanner_or_network_call_evaluation_is_pure(self, client, monkeypatch):
+        # The evaluation endpoint must never trigger real tool execution
+        # -- patch execute_bug_bounty_tool to explode if ever called from
+        # this code path, then confirm the request still succeeds.
+        def _explode(*args, **kwargs):
+            raise AssertionError("evaluation endpoint must never execute a tool")
+
+        monkeypatch.setattr("core.bug_bounty_tool_execution.execute_bug_bounty_tool", _explode)
+        run_id = self._create_completed_juice_shop_run()
+        r = client.get(f"/api/runs/{run_id}/evaluation")
+        assert r.status_code == 200
+        assert r.json()["evaluation_state"] == "evaluated"
+
+    def test_043_nuclei_timeout_shown_as_timeout(self, client):
+        run_id = self._create_completed_juice_shop_run()
+        body = client.get(f"/api/runs/{run_id}/evaluation").json()
+        assert body["tool_execution"]["nuclei"]["status"] == "timeout"
+
+    def test_044_limitations_visible_in_response(self, client):
+        run_id = self._create_completed_juice_shop_run()
+        body = client.get(f"/api/runs/{run_id}/evaluation").json()
+        assert len(body["limitations"]) >= 5
+
+
+# ---------------------------------------------------------------------------
+# Dashboard rendering of the Accuracy & Evaluation section -- static
+# content assertions only (no browser/JS execution harness exists in this
+# project, matching test_020_dashboard_root_serves_html's own level of
+# coverage). These confirm the section exists, the empty/limitations
+# text is real markup (not a tooltip-only attribute), and -- critically
+# -- that no numeric benchmark result (5/0/0/4/100%) is hardcoded into
+# the page's own HTML/JS source, since every displayed value must
+# originate from the /api/runs/{id}/evaluation response at render time.
+# ---------------------------------------------------------------------------
+
+
+class TestDashboardEvaluationSection:
+    def test_045_evaluation_card_present(self, client):
+        r = client.get("/")
+        assert "evaluation-body" in r.text
+        assert "Accuracy" in r.text and "Evaluation" in r.text
+
+    def test_046_empty_state_text_present_not_zeros(self, client):
+        r = client.get("/")
+        assert "No benchmark evaluation available for this run." in r.text
+
+    def test_047_qualifier_sentence_present(self, client):
+        r = client.get("/")
+        assert "This is not overall ThreatTrace accuracy." in r.text
+
+    def test_048_limitations_rendered_as_visible_list_not_tooltip_only(self, client):
+        r = client.get("/")
+        assert "eval-limitations" in r.text
+        assert "<ul" in r.text
+
+    def test_049_renders_values_from_api_response_not_hardcoded(self, client):
+        # The page source must reference the real field names it reads
+        # from the API response object, never a fixed literal result.
+        r = client.get("/")
+        for field in ("evaluation.precision", "evaluation.recall", "evaluation.f1", "evaluation.supported_benchmark_accuracy", "evaluation.true_positive_count"):
+            assert field in r.text
+
+    def test_050_no_hardcoded_benchmark_result_values_in_page_source(self, client):
+        r = client.get("/")
+        # These are the real Step 6 numbers -- if any of them appear as a
+        # bare literal token near the evaluation script (rather than
+        # being read off the `evaluation` object), that's a hardcoded
+        # presentation value, which this dashboard must never contain.
+        assert "TP 5" not in r.text
+        assert "FP 0" not in r.text
+        assert "100%</div>" not in r.text
+        assert "supported_benchmark_accuracy: 1" not in r.text
+        assert "supported_benchmark_accuracy = 1" not in r.text
+
+    def test_051_case_ids_are_data_driven_not_individually_hardcoded_rows(self, client):
+        # The 9 case IDs must come from the API's case_results array via
+        # a template/map, never nine individually authored <tr> rows.
+        r = client.get("/")
+        assert "case_results" in r.text
+        assert "JS-CSP-MISSING" not in r.text  # never literally typed into the page
+
+    def test_052_tool_status_never_labeled_failed_benchmark(self, client):
+        r = client.get("/")
+        assert "FAILED BENCHMARK" not in r.text.upper().replace("_", " ")

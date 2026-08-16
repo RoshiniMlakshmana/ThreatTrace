@@ -366,6 +366,274 @@ class TestEvidencePreservationAndContract:
 
 
 # ---------------------------------------------------------------------------
+# End-to-end: real normalize_bug_bounty_evidence() output, not hand-built
+# _record() fixtures -- this is the layer that actually caught the real
+# defect (test_003 above already asserted correlation's own merge logic
+# was correct using an overly-generous hand-built zap record with
+# path="/"; it never exercised the real adapter's bare-origin-URL shape,
+# which is what normalization actually receives).
+# ---------------------------------------------------------------------------
+
+
+class TestRealNormalizationIntegration:
+    @staticmethod
+    def _http_csp_result():
+        return {
+            "assessment_version": "1", "target": "http://juice-shop:3000/", "testing_profile": "safe_active",
+            "findings": [{
+                "finding_id": "BB15A-http-csp", "target": "http://juice-shop:3000/", "affected_path": "/",
+                "affected_parameter": None, "title": "Missing Content-Security-Policy header",
+                "finding_status": "validated", "vulnerability_class": "security_header_misconfiguration",
+                "owasp_category": "A05:2021 Security Misconfiguration", "cwe": "CWE-693",
+                "technical_severity": "medium", "confidence": "high",
+                "evidence": [{
+                    "method": "GET", "scoped_url": "http://juice-shop:3000/", "status_code": 200,
+                    "observation": "Response did not include a Content-Security-Policy header.",
+                    "evidence_digest": "sha256:" + "1" * 64,
+                }],
+                "validation": {"method": "deterministic_header_presence_check", "confirmed": True},
+            }],
+        }
+
+    @staticmethod
+    def _zap_csp_result():
+        # Shaped exactly like the real adapters/bug_bounty_zap.py output
+        # for a site-wide alert: url has no trailing slash, path is
+        # already None (the adapter's own urlsplit(...).path or None),
+        # vulnerability_class absent entirely.
+        return {
+            "tool_result_version": "1", "tool_id": "zap", "request_id": "REQ-1", "target": "http://juice-shop:3000",
+            "status": "completed", "capability": "passive_only",
+            "observations": [{
+                "tool_id": "zap", "observation_type": "dast_observation", "rule_id": "10038",
+                "title": "Content Security Policy (CSP) Header Not Set", "risk": "Medium", "confidence": "High",
+                "url": "http://juice-shop:3000", "path": None, "parameter": None, "method": "GET",
+                "cwe": "CWE-693", "owasp_category": None, "evidence_reference": "zap_alert_sha256:" + "2" * 64,
+                "sanitized_evidence": None,
+            }],
+            "execution_performed": True,
+        }
+
+    def test_031_real_http_and_zap_csp_output_correlates_into_one_group(self):
+        from core.bug_bounty_evidence_normalization import normalize_bug_bounty_evidence
+
+        records = normalize_bug_bounty_evidence(
+            source_results=[
+                {"source_tool": "http_assessor", "result": self._http_csp_result()},
+                {"source_tool": "zap", "result": self._zap_csp_result()},
+            ],
+            scope_reference="http://juice-shop:3000", observed_at="2026-08-15T00:00:00Z",
+        )
+        assert len(records) == 2
+        result = correlate_bug_bounty_evidence(evidence_records=records)
+        assert result["total_groups"] == 1
+        group = result["groups"][0]
+        assert group["multi_tool_corroborated"] is True
+        assert set(group["source_tools"]) == {"http_assessor", "zap"}
+
+    def test_032_both_tools_evidence_preserved_after_real_merge(self):
+        from core.bug_bounty_evidence_normalization import normalize_bug_bounty_evidence
+
+        records = normalize_bug_bounty_evidence(
+            source_results=[
+                {"source_tool": "http_assessor", "result": self._http_csp_result()},
+                {"source_tool": "zap", "result": self._zap_csp_result()},
+            ],
+            scope_reference="http://juice-shop:3000", observed_at="2026-08-15T00:00:00Z",
+        )
+        result = correlate_bug_bounty_evidence(evidence_records=records)
+        group = result["groups"][0]
+        assert len(group["member_evidence_ids"]) == 2
+        # Neither tool's own evidence_id was dropped in the merge.
+        real_ids = {r["evidence_id"] for r in records}
+        assert set(group["member_evidence_ids"]) == real_ids
+
+    def test_033_real_cors_pair_correctly_stays_separate_different_cwe(self):
+        # http_assessor's own CORS finding uses CWE-942; ZAP's real
+        # "Cross-Domain Misconfiguration" alert uses CWE-264 -- a
+        # genuinely different, broader classification. Structured
+        # evidence does not establish equivalence, so this must NOT
+        # merge, even after the path fix removes the other obstacle.
+        from core.bug_bounty_evidence_normalization import normalize_bug_bounty_evidence
+
+        http_cors_result = {
+            "assessment_version": "1", "target": "http://juice-shop:3000/", "testing_profile": "safe_active",
+            "findings": [{
+                "finding_id": "BB15A-http-cors", "target": "http://juice-shop:3000/", "affected_path": "/",
+                "affected_parameter": None, "title": "Notable CORS response headers observed",
+                "finding_status": "validated", "vulnerability_class": "cors_misconfiguration",
+                "owasp_category": "A05:2021 Security Misconfiguration", "cwe": "CWE-942",
+                "technical_severity": "low", "confidence": "medium",
+                "evidence": [{
+                    "method": "OPTIONS", "scoped_url": "http://juice-shop:3000/", "status_code": 200,
+                    "observation": "Access-Control-Allow-Origin: *", "evidence_digest": "sha256:" + "3" * 64,
+                }],
+                "validation": {"method": "deterministic_header_presence_check", "confirmed": False},
+            }],
+        }
+        zap_cross_domain_result = {
+            "tool_result_version": "1", "tool_id": "zap", "request_id": "REQ-1", "target": "http://juice-shop:3000",
+            "status": "completed", "capability": "passive_only",
+            "observations": [{
+                "tool_id": "zap", "observation_type": "dast_observation", "rule_id": "10098",
+                "title": "Cross-Domain Misconfiguration", "risk": "Medium", "confidence": "Medium",
+                "url": "http://juice-shop:3000", "path": None, "parameter": None, "method": "GET",
+                "cwe": "CWE-264", "owasp_category": None, "evidence_reference": "zap_alert_sha256:" + "4" * 64,
+                "sanitized_evidence": "Access-Control-Allow-Origin: *",
+            }],
+            "execution_performed": True,
+        }
+        records = normalize_bug_bounty_evidence(
+            source_results=[
+                {"source_tool": "http_assessor", "result": http_cors_result},
+                {"source_tool": "zap", "result": zap_cross_domain_result},
+            ],
+            scope_reference="http://juice-shop:3000", observed_at="2026-08-15T00:00:00Z",
+        )
+        result = correlate_bug_bounty_evidence(evidence_records=records)
+        # Different CWE (CWE-942 vs CWE-264) -> different category ->
+        # different fingerprint, even though path now matches on both.
+        assert result["total_groups"] == 2
+        assert result["groups"][0]["multi_tool_corroborated"] is False
+        assert result["groups"][1]["multi_tool_corroborated"] is False
+
+    def test_034_real_nmap_and_zap_informational_observations_stay_informational(self):
+        # Regression guard for the fix: an informational observation
+        # (no cwe/vulnerability_class/severity) must not accidentally
+        # gain one of the two new fixed fields and get promoted into a
+        # vulnerability finding.
+        from core.bug_bounty_evidence_normalization import normalize_bug_bounty_evidence
+
+        nmap_result = {
+            "tool_result_version": "1", "tool_id": "nmap", "request_id": "REQ-1", "target": "juice-shop",
+            "status": "completed",
+            "observations": [{"type": "service", "port": 3000, "protocol": "tcp", "state": "open", "service": "ppp", "product": None, "version": None}],
+            "evidence_references": ["nmap_xml_sha256:" + "5" * 64],
+            "execution_performed": True,
+        }
+        zap_modern_webapp_result = {
+            "tool_result_version": "1", "tool_id": "zap", "request_id": "REQ-1", "target": "http://juice-shop:3000",
+            "status": "completed", "capability": "passive_only",
+            "observations": [{
+                "tool_id": "zap", "observation_type": "dast_observation", "rule_id": "10109",
+                "title": "Modern Web Application", "risk": "Informational", "confidence": "Medium",
+                "url": "http://juice-shop:3000", "path": None, "parameter": None, "method": "GET",
+                "cwe": None, "owasp_category": None, "evidence_reference": "zap_alert_sha256:" + "6" * 64,
+                "sanitized_evidence": None,
+            }],
+            "execution_performed": True,
+        }
+        records = normalize_bug_bounty_evidence(
+            source_results=[
+                {"source_tool": "nmap", "result": nmap_result},
+                {"source_tool": "zap", "result": zap_modern_webapp_result},
+            ],
+            scope_reference="http://juice-shop:3000", observed_at="2026-08-15T00:00:00Z",
+        )
+        # The generic "dast_observation" fallback must not have been
+        # applied here in a way that fabricates a severity -- it's still
+        # informational because technical_severity/cwe/cve stay unset.
+        zap_record = next(r for r in records if r["source_tool"] == "zap")
+        assert zap_record["vulnerability_class"] == "dast_observation"
+        result = correlate_bug_bounty_evidence(evidence_records=records)
+        for group in result["groups"]:
+            assert group["is_informational"] is True
+
+    def test_035_same_cve_from_nuclei_and_nmap_merges_despite_differing_path(self):
+        # A shared CVE is a stronger signal than the fingerprint (host/
+        # port/path/category) -- real nuclei-shaped + nmap-shaped raw
+        # results, run through the real normalizer, confirm this holds
+        # for a genuinely cross-tool CVE match (Nuclei Reliability Step 1
+        # regression coverage, not a hand-built fixture).
+        from core.bug_bounty_evidence_normalization import normalize_bug_bounty_evidence
+
+        nuclei_result = {
+            "tool_result_version": "2", "tool_id": "nuclei", "request_id": "REQ-1", "target": "http://juice-shop:3000",
+            "status": "completed",
+            "observations": [{
+                "type": "known_pattern_match", "template_id": "CVE-2023-9999", "title": "Vulnerable Component",
+                "severity": "high", "target": "http://juice-shop:3000/app",
+                "matcher": "version-match", "classification": {"cve_id": ["CVE-2023-9999"], "cwe_id": None},
+            }],
+            "evidence_references": ["nuclei_jsonl_sha256:" + "a" * 64], "execution_performed": True,
+        }
+        nmap_result = {
+            "tool_result_version": "1", "tool_id": "nmap", "request_id": "REQ-1", "target": "juice-shop",
+            "status": "completed",
+            "observations": [{"type": "service", "port": 8080, "protocol": "tcp", "state": "open", "service": "http", "product": "widget-server", "version": "1.2"}],
+            "evidence_references": ["nmap_xml_sha256:" + "b" * 64], "execution_performed": True,
+        }
+        records = normalize_bug_bounty_evidence(
+            source_results=[
+                {"source_tool": "nuclei", "result": nuclei_result},
+                {"source_tool": "nmap", "result": nmap_result},
+            ],
+            scope_reference="http://juice-shop:3000", observed_at="2026-08-15T00:00:00Z",
+        )
+        # Force the CVE onto the nmap-shaped record too, the way a real
+        # future correlation-input enrichment might supply it -- nmap's
+        # own normalizer never sets `cve` itself, confirming this test
+        # is exercising the correlation-level CVE-merge rule, not
+        # accidentally relying on normalization inventing a CVE for nmap.
+        assert records[1]["cve"] == []
+        records[1] = dict(records[1], cve=["CVE-2023-9999"])
+        result = correlate_bug_bounty_evidence(evidence_records=records)
+        assert result["total_groups"] == 1
+        assert result["groups"][0]["cve"] == ["CVE-2023-9999"]
+
+    def test_036_unrelated_nuclei_findings_stay_distinct(self):
+        from core.bug_bounty_evidence_normalization import normalize_bug_bounty_evidence
+
+        nuclei_result = {
+            "tool_result_version": "2", "tool_id": "nuclei", "request_id": "REQ-1", "target": "http://juice-shop:3000",
+            "status": "completed",
+            "observations": [
+                {
+                    "type": "known_pattern_match", "template_id": "exposed-env-file", "title": "Exposed .env File",
+                    "severity": "high", "target": "http://juice-shop:3000/.env", "matcher": "status-200",
+                    "classification": None,
+                },
+                {
+                    "type": "known_pattern_match", "template_id": "exposed-git-config", "title": "Exposed .git/config",
+                    "severity": "medium", "target": "http://juice-shop:3000/.git/config", "matcher": "status-200",
+                    "classification": None,
+                },
+            ],
+            "evidence_references": ["nuclei_jsonl_sha256:" + "c" * 64], "execution_performed": True,
+        }
+        records = normalize_bug_bounty_evidence(
+            source_results=[{"source_tool": "nuclei", "result": nuclei_result}],
+            scope_reference="http://juice-shop:3000", observed_at="2026-08-15T00:00:00Z",
+        )
+        result = correlate_bug_bounty_evidence(evidence_records=records)
+        # Different paths, no shared CVE, both fall back to the same
+        # generic vulnerability_class -- but the fingerprint's path
+        # component still keeps them genuinely separate.
+        assert result["total_groups"] == 2
+
+    def test_037_duplicate_exact_nuclei_output_collapses(self):
+        from core.bug_bounty_evidence_normalization import normalize_bug_bounty_evidence
+
+        one_observation = {
+            "type": "known_pattern_match", "template_id": "exposed-env-file", "title": "Exposed .env File",
+            "severity": "high", "target": "http://juice-shop:3000/.env", "matcher": "status-200", "classification": None,
+        }
+        nuclei_result = {
+            "tool_result_version": "2", "tool_id": "nuclei", "request_id": "REQ-1", "target": "http://juice-shop:3000",
+            "status": "completed",
+            "observations": [dict(one_observation), dict(one_observation)],  # identical, duplicated
+            "evidence_references": ["nuclei_jsonl_sha256:" + "d" * 64], "execution_performed": True,
+        }
+        records = normalize_bug_bounty_evidence(
+            source_results=[{"source_tool": "nuclei", "result": nuclei_result}],
+            scope_reference="http://juice-shop:3000", observed_at="2026-08-15T00:00:00Z",
+        )
+        result = correlate_bug_bounty_evidence(evidence_records=records)
+        assert result["duplicate_evidence_count"] == 1
+        assert result["total_groups"] == 1
+
+
+# ---------------------------------------------------------------------------
 # Structural validation
 # ---------------------------------------------------------------------------
 

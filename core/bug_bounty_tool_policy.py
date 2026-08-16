@@ -67,6 +67,7 @@ REQUEST_VERSION = "1"
 
 TOOL_IDS = frozenset({
     "http_assessor",
+    "crawler",
     "nmap",
     "nuclei",
     "zap",
@@ -124,6 +125,17 @@ _TOOL_CATALOG_ENTRIES: tuple[dict[str, Any], ...] = (
         "supports_authentication": False, "state_changing_capability": False,
     },
     {
+        # Step 2 (Attack-Surface Discovery): bounded same-origin
+        # crawler/endpoint/parameter discovery -- see
+        # core.bug_bounty_crawler. Same risk category as http_assessor
+        # (bounded GET-only discovery requests, never a form submission,
+        # never a state-changing request) -- never authenticated, never
+        # a controlled-validation capability.
+        "tool_id": "crawler", "category": "passive_web", "risk_level": "low",
+        "implemented": True, "requires_human_approval": False,
+        "supports_authentication": False, "state_changing_capability": False,
+    },
+    {
         "tool_id": "nmap", "category": "network_recon", "risk_level": "low",
         "implemented": True, "requires_human_approval": False,
         "supports_authentication": False, "state_changing_capability": False,
@@ -162,12 +174,14 @@ TOOL_CATALOG: Mapping[str, Mapping[str, Any]] = MappingProxyType({
 # Fixed profile ceilings -- the maximum tool set a permission contract
 # under that profile could ever permit. Never a grant by itself.
 PROFILE_TOOL_CEILING: Mapping[str, frozenset[str]] = MappingProxyType({
-    "passive": frozenset({"http_assessor"}),
-    "recon": frozenset({"http_assessor", "nmap"}),
-    "safe_dast": frozenset({"http_assessor", "nmap", "nuclei", "zap", "burp_dast"}),
-    "authenticated": frozenset({"http_assessor", "nmap", "nuclei", "zap", "burp_dast", "authenticated_testing"}),
+    "passive": frozenset({"http_assessor", "crawler"}),
+    "recon": frozenset({"http_assessor", "crawler", "nmap"}),
+    "safe_dast": frozenset({"http_assessor", "crawler", "nmap", "nuclei", "zap", "burp_dast"}),
+    "authenticated": frozenset({
+        "http_assessor", "crawler", "nmap", "nuclei", "zap", "burp_dast", "authenticated_testing",
+    }),
     "controlled_validation": frozenset({
-        "http_assessor", "nmap", "nuclei", "zap", "burp_dast",
+        "http_assessor", "crawler", "nmap", "nuclei", "zap", "burp_dast",
         "authenticated_testing", "controlled_validation",
     }),
 })

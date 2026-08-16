@@ -175,7 +175,9 @@ def _validate_execution_config_shape(value: Any) -> Mapping[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-def _run_nmap_adapter(*, tool_request: Mapping[str, Any], execution_config: Mapping[str, Any]) -> dict[str, Any]:
+def _run_nmap_adapter(
+    *, tool_request: Mapping[str, Any], execution_config: Mapping[str, Any], detected_technologies: Any = None,
+) -> dict[str, Any]:
     return run_nmap_scan(
         target=tool_request["target"],
         ports=tool_request["ports"],
@@ -184,15 +186,20 @@ def _run_nmap_adapter(*, tool_request: Mapping[str, Any], execution_config: Mapp
     )
 
 
-def _run_nuclei_adapter(*, tool_request: Mapping[str, Any], execution_config: Mapping[str, Any]) -> dict[str, Any]:
+def _run_nuclei_adapter(
+    *, tool_request: Mapping[str, Any], execution_config: Mapping[str, Any], detected_technologies: Any = None,
+) -> dict[str, Any]:
     return run_nuclei_scan(
         target=tool_request["target"],
         request_id=tool_request["request_id"],
         execution_config=execution_config,
+        detected_technologies=detected_technologies,
     )
 
 
-def _run_zap_adapter(*, tool_request: Mapping[str, Any], execution_config: Mapping[str, Any]) -> dict[str, Any]:
+def _run_zap_adapter(
+    *, tool_request: Mapping[str, Any], execution_config: Mapping[str, Any], detected_technologies: Any = None,
+) -> dict[str, Any]:
     return run_zap_scan(
         target=tool_request["target"],
         request_id=tool_request["request_id"],
@@ -200,7 +207,9 @@ def _run_zap_adapter(*, tool_request: Mapping[str, Any], execution_config: Mappi
     )
 
 
-def _run_burp_adapter(*, tool_request: Mapping[str, Any], execution_config: Mapping[str, Any]) -> dict[str, Any]:
+def _run_burp_adapter(
+    *, tool_request: Mapping[str, Any], execution_config: Mapping[str, Any], detected_technologies: Any = None,
+) -> dict[str, Any]:
     return run_burp_scan(
         target=tool_request["target"],
         request_id=tool_request["request_id"],
@@ -243,14 +252,15 @@ def _blocked_result(
 
 def execute_bug_bounty_tool(
     *, permissions: Any, tool_request: Any, governor_result: Any, execution_config: Any,
+    detected_technologies: Any = None,
 ) -> dict[str, Any]:
     """The single execution boundary for the Bug Bounty Nmap/Nuclei
     adapters. Re-evaluates the real tool permission policy itself, then
     requires an already-computed, genuinely `allow`ing Security Governor
     result, before ever selecting an adapter from the closed registry.
 
-    All four parameters are required and keyword-only. `permissions` and
-    `tool_request` are passed through, unmodified, to
+    The first four parameters are required and keyword-only. `permissions`
+    and `tool_request` are passed through, unmodified, to
     `core.bug_bounty_tool_policy.evaluate_tool_permission` -- this
     function never trusts a caller-supplied boolean claiming permission.
     `governor_result` must be a mapping shaped exactly like
@@ -260,6 +270,17 @@ def execute_bug_bounty_tool(
     `process_timeout_seconds`, `max_output_bytes` -- deep ceiling
     enforcement for the latter two happens inside whichever adapter is
     ultimately selected.
+
+    `detected_technologies` (Nuclei Reliability Step 1C) is optional,
+    defaults to `None`, and is forwarded, unmodified, only to whichever
+    adapter's own wrapper function accepts it -- today, only
+    `adapters.bug_bounty_nuclei.run_nuclei_scan` reads it (for its own
+    closed, deterministic `select_nuclei_phases` technology-directed
+    phase); every other adapter wrapper accepts and ignores it. This
+    function never derives or interprets the value itself -- the caller
+    (`backend.orchestrator`) is responsible for producing it from
+    already-existing evidence, never from live reconnaissance this
+    module would need to trust blindly.
 
     Returns a new dict containing exactly `tool_execution_version`,
     `request_id`, `tool_id`, `execution_permitted`,
@@ -325,7 +346,10 @@ def execute_bug_bounty_tool(
         )
 
     try:
-        tool_result = adapter_callable(tool_request=tool_request, execution_config=validated_config)
+        tool_result = adapter_callable(
+            tool_request=tool_request, execution_config=validated_config,
+            detected_technologies=detected_technologies,
+        )
     except _ADAPTER_ERRORS:
         return _blocked_result(
             request_id=request_id, tool_id=tool_id, reason="ADAPTER_REJECTED_REQUEST",

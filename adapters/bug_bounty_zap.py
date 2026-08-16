@@ -99,9 +99,9 @@ raw tool observation, never a canonical ThreatTrace finding --
 are the modules responsible for turning it into one.
 
 `BugBountyZapAdapterError` and `run_zap_scan` are this module's public
-symbols (plus `ZAP_API_HOST`, `ZAP_API_PORT`, `MAX_SPIDER_URLS`,
-`MAX_SPIDER_DEPTH`, `MAX_PROCESS_TIMEOUT_SECONDS`, `MAX_OUTPUT_BYTES`,
-and `TOOL_RESULT_VERSION`).
+symbols (plus `ZAP_API_HOST`, `ZAP_API_PORT`, `ZAP_API_URL_ENV_VAR`,
+`MAX_SPIDER_URLS`, `MAX_SPIDER_DEPTH`, `MAX_PROCESS_TIMEOUT_SECONDS`,
+`MAX_OUTPUT_BYTES`, and `TOOL_RESULT_VERSION`).
 """
 
 from __future__ import annotations
@@ -109,6 +109,7 @@ from __future__ import annotations
 import hashlib
 import http.client
 import json
+import os
 import socket
 import time
 from collections.abc import Mapping
@@ -120,10 +121,40 @@ TOOL_RESULT_VERSION = "1"
 
 # The ZAP daemon this project starts is bound to 127.0.0.1 only, with its
 # API key disabled (-config api.disablekey=true) -- never exposed, never
-# reachable from anywhere but this host. Fixed, never caller-configurable.
+# reachable from anywhere but this host. This is the correct, unchanged
+# default for host-native deployment (the backend runs on the host;
+# ZAP's own container publishes its API to the host's loopback).
+#
+# `ZAP_API_URL_ENV_VAR` exists for exactly one other, also-legitimate
+# topology: the self-hosted Docker deployment, where the backend itself
+# also runs in a container on the same Compose network as ZAP -- there,
+# the backend's own `127.0.0.1` is itself, not the ZAP container, so it
+# must reach ZAP by Docker DNS service name instead (`http://zap:8080`,
+# set as this exact env var in `docker-compose.yml`'s `threattrace`
+# service only). This is a fixed, deployment-time-configured location for
+# the daemon's own API -- never a caller-supplied value, never read per
+# request, and never used to widen what `core.bug_bounty_tool_policy`
+# already authorized for the *scan target* (a completely separate
+# concern from where the ZAP daemon's control API happens to live).
+ZAP_API_URL_ENV_VAR = "ZAP_API_URL"
 ZAP_API_HOST = "127.0.0.1"
 ZAP_API_PORT = 8080
 ZAP_CONNECT_TIMEOUT_SECONDS = 3.0
+
+
+def _resolve_zap_api_target() -> tuple[str, int]:
+    """Resolve the ZAP daemon's own API host/port. Reads
+    `ZAP_API_URL_ENV_VAR` fresh on every call (never cached at import
+    time) so tests can set/unset it deterministically; falls back to the
+    fixed `ZAP_API_HOST`/`ZAP_API_PORT` defaults for any unset, blank, or
+    malformed value -- this function never raises."""
+    configured = os.environ.get(ZAP_API_URL_ENV_VAR, "").strip()
+    if not configured:
+        return ZAP_API_HOST, ZAP_API_PORT
+    parsed = urlsplit(configured)
+    if parsed.scheme != "http" or not parsed.hostname:
+        return ZAP_API_HOST, ZAP_API_PORT
+    return parsed.hostname, parsed.port or ZAP_API_PORT
 
 # Bounded, fixed adapter constants -- never supplied by the planner/LLM.
 MAX_SPIDER_URLS = 5
@@ -269,7 +300,8 @@ class _ZapUnavailable(Exception):
 def _zap_api_call(path: str, params: Mapping[str, str], *, timeout: float) -> Any:
     query = "&".join(f"{key}={quote(str(value), safe='')}" for key, value in params.items())
     full_path = f"{path}?{query}" if query else path
-    connection = http.client.HTTPConnection(ZAP_API_HOST, ZAP_API_PORT, timeout=timeout)
+    api_host, api_port = _resolve_zap_api_target()
+    connection = http.client.HTTPConnection(api_host, api_port, timeout=timeout)
     try:
         connection.request("GET", full_path)
         response = connection.getresponse()
