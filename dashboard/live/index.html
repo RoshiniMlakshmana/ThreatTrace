@@ -105,6 +105,12 @@
 
 <div class="controls">
   <label>Run: <select id="run-select"><option value="">No runs yet</option></select></label>
+  <label>Target Mode:
+    <select id="target-mode">
+      <option value="demo">Demo — OWASP Juice Shop</option>
+      <option value="external">Authorized External Target</option>
+    </select>
+  </label>
   <input id="bb-target" type="text" value="http://localhost:3000/" title="Bug Bounty target (localhost only)">
   <button id="bb-start" title="Fast, bounded: http_assessor/crawler/nmap/nuclei/zap only">New Bug Bounty Run</button>
   <button id="lifecycle-start" title="Slower: Bug Bounty phase, then real Context Prioritization, Security Handoff, Threat Intel/Hunt review, Detection Engineering review, Red Validation fact-check, and Purple remediation for the highest-priority findings">Run Full Security Lifecycle</button>
@@ -113,6 +119,20 @@
   <details>
     <summary>Advanced: submit a Detection run (JSON)</summary>
   </details>
+</div>
+<div class="controls" id="external-target-form" style="display:none">
+  <input id="ext-target" type="text" style="min-width:260px" placeholder="https://security-test.example.com/" title="Authorized External Target URL">
+  <input id="ext-hosts" type="text" placeholder="Allowed host(s), comma-separated" title="scope.hosts">
+  <input id="ext-ports" type="text" placeholder="Allowed port(s), e.g. 443" title="scope.ports">
+  <input id="ext-paths" type="text" value="/" placeholder="Allowed path prefix(es)" title="scope.path_prefixes">
+  <label title="http_assessor is always included"><input type="checkbox" id="ext-tool-http_assessor" checked disabled> HTTP Assessor</label>
+  <label><input type="checkbox" id="ext-tool-httpx" checked> httpx</label>
+  <label><input type="checkbox" id="ext-tool-katana" checked> Katana</label>
+  <label title="Some bug-bounty programs restrict automated scanning -- opt-in only"><input type="checkbox" id="ext-tool-nmap"> Nmap (opt-in)</label>
+  <label><input type="checkbox" id="ext-tool-nuclei"> Nuclei (opt-in)</label>
+  <label><input type="checkbox" id="ext-tool-zap"> ZAP (opt-in)</label>
+  <br>
+  <label style="max-width:640px"><input type="checkbox" id="ext-ack"> I am providing the scope for a system I am authorized to test. <em>(This is an operator assertion only -- ThreatTrace does not verify or establish legal authorization.)</em></label>
 </div>
 <div class="controls" id="detection-form" style="display:none">
   <textarea id="detection-json" rows="6" style="width:100%" placeholder='{"trigger_source":"threat_intelligence","trigger_input":{...},"telemetry_context":{...},"llm_proposal":{...}}'></textarea>
@@ -146,6 +166,11 @@
     <div id="attack-surface-body"><div class="empty">No discovery data for this run.</div></div>
   </section>
 
+  <section class="card" id="card-http-enrichment">
+    <h2>N. HTTP Enrichment (httpx)</h2>
+    <div id="http-enrichment-body" class="empty">No httpx activity on this run.</div>
+  </section>
+
   <section class="card" id="card-governor">
     <h2>E. Security Governor</h2>
     <div id="governor-body" class="empty">No Governor evaluation yet.</div>
@@ -176,9 +201,31 @@
     <div id="detection-body" class="empty">No Detection Engineering activity on this run.</div>
   </section>
 
+  <section class="card wide" id="card-ai-activity">
+    <h2>M. AI Assistance</h2>
+    <div id="ai-activity-body"><div class="empty">No active run.</div></div>
+  </section>
+
   <section class="card wide" id="card-feed">
     <h2>C. Live Event Feed</h2>
     <div id="feed-body" class="feed"><div class="empty">No active run.</div></div>
+  </section>
+
+  <section class="card wide" id="card-architecture">
+    <h2>How ThreatTrace Works</h2>
+    <details>
+      <summary>Expand architecture overview</summary>
+      <div class="safety" style="margin-top:8px">
+        <strong>AI proposes/reasons</strong> &rarr;
+        <strong>Policy checks</strong> &rarr;
+        <strong>Governor authorizes/blocks</strong> &rarr;
+        <strong>Deterministic tools execute</strong> &rarr;
+        <strong>Evidence normalized/correlated</strong> &rarr;
+        <strong>Human reviews</strong>
+        <br><br>
+        AI (when actually invoked -- see the AI Assistance card below for this run) only ever <em>proposes</em>; it never executes a tool or applies a remediation directly. Every proposal is re-checked by deterministic Policy and Governor code before anything real happens, every real tool call goes through a closed, non-LLM-generated argument vector, and every result is normalized/correlated deterministically. A human analyst is the only party who can mark a finding reviewed.
+      </div>
+    </details>
   </section>
 
   <section class="card wide" id="card-safety">
@@ -539,12 +586,26 @@ function renderFindings(run) {
   // parallel real fallback). Reading a nonexistent f.evidence always
   // silently evaluated to 0, which is why this table used to claim
   // "0 evidence item(s)" on findings that plainly had real evidence.
+  // CWE/OWASP/CVE/MITRE ATT&CK below are read only from the finding's
+  // own real fields -- core.bug_bounty_final_report never populates
+  // mitre_attack_mapping (this project has no ATT&CK mapping engine),
+  // so it is always null today; that is shown honestly as "Not mapped
+  // -- insufficient behavioral evidence," never fabricated or forced
+  // onto a config/DAST-style finding.
   let rows = report.canonical_findings.map(f => {
     const sources = Array.isArray(f.tools_used) && f.tools_used.length ? f.tools_used.join(", ") : "unknown";
     const evidenceCount = Array.isArray(f.evidence_sources) ? f.evidence_sources.length
       : (Array.isArray(f.evidence_digests) ? f.evidence_digests.length : null);
     const evidenceText = evidenceCount === null ? "no evidence metadata" : `${evidenceCount} record${evidenceCount === 1 ? "" : "s"}`;
     const reviewState = f.status === "requires_human_review" ? "Awaiting Review" : (f.status || "—");
+    const classification = [
+      f.cwe ? esc(f.cwe) : null,
+      f.owasp_category ? esc(f.owasp_category) : null,
+      (f.cve || []).length ? esc(f.cve.join(", ")) : null,
+    ].filter(Boolean).join(" · ") || "—";
+    const attck = f.mitre_attack_mapping
+      ? esc(JSON.stringify(f.mitre_attack_mapping))
+      : "Not mapped — insufficient behavioral evidence";
     return `
     <tr>
       <td>${esc(f.title || f.finding_id)}</td>
@@ -552,10 +613,12 @@ function renderFindings(run) {
       <td>${esc(f.confidence || "—")}</td>
       <td>${esc(sources)}</td>
       <td>${esc(evidenceText)}</td>
+      <td>${classification}</td>
+      <td>${attck}</td>
       <td>${esc(reviewState)}</td>
     </tr>`;
   }).join("");
-  body.innerHTML = `<table><thead><tr><th>Finding</th><th>Severity</th><th>Confidence</th><th>Sources</th><th>Evidence</th><th>Review State</th></tr></thead><tbody>${rows}</tbody></table>`;
+  body.innerHTML = `<table><thead><tr><th>Finding</th><th>Severity</th><th>Confidence</th><th>Sources</th><th>Evidence</th><th>CWE / OWASP / CVE</th><th>MITRE ATT&amp;CK</th><th>Review State</th></tr></thead><tbody>${rows}</tbody></table>`;
 }
 
 // All values rendered below come directly from the real run.lifecycle
@@ -593,19 +656,42 @@ function renderLifecycle(run) {
     return;
   }
 
+  // Per-cell titles below surface the real "why" behind each outcome --
+  // e.g. Threat Intel's own queried_cve, Threat Hunt's own
+  // missing_telemetry list, Detection's own reason -- exactly the real
+  // fields core.bug_bounty_threat_intel_review / core.bug_bounty_
+  // threat_hunt_review / backend.orchestrator._review_detection_
+  // engineering_for_finding already return; never invented text.
   const rows = results.map(r => {
     const c = r.case || {};
     const reviewCell = c.approval_state === "pending"
       ? `<button class="lifecycle-approve" data-case-id="${esc(c.case_id)}">Approve</button>
          <button class="lifecycle-reject" data-case-id="${esc(c.case_id)}">Reject</button>`
       : `Reviewed &mdash; ${esc((c.approval_state || "—").charAt(0).toUpperCase() + (c.approval_state || "").slice(1))} (${esc(c.approval_reference || "—")})`;
+
+    const ti = r.ti_result || {};
+    const tiTitle = ti.real_query_performed
+      ? `Queried CVE ${ti.queried_cve || "—"} against NVD.`
+      : "No CVE identifier available on this finding -- no external query was performed.";
+
+    const hunt = r.hunt_result || {};
+    const huntTitle = hunt.outcome === "telemetry_gap" && (hunt.missing_telemetry || []).length
+      ? `Missing telemetry: ${hunt.missing_telemetry.join(", ")}.`
+      : (hunt.hunt_hypothesis || "");
+
+    const det = r.detection_result || {};
+    const detTitle = det.reason ? `Reason: ${det.reason}.` : "";
+
+    const red = r.red_validation_result || {};
+    const redTitle = "core.bug_bounty_tool_policy.TOOL_CATALOG['controlled_validation'].implemented is False -- no automated exploit-validation engine exists in this checkpoint.";
+
     return `
     <tr>
       <td>${esc(r.finding_id)}</td>
-      <td>${esc(lifecycleOutcomeLabel(r.ti_result && r.ti_result.outcome))}</td>
-      <td>${esc(lifecycleOutcomeLabel(r.hunt_result && r.hunt_result.outcome))}</td>
-      <td>${esc(lifecycleOutcomeLabel(r.detection_result && r.detection_result.outcome))}</td>
-      <td>${esc(lifecycleOutcomeLabel(r.red_validation_result && r.red_validation_result.outcome))}</td>
+      <td title="${esc(tiTitle)}">${esc(lifecycleOutcomeLabel(ti.outcome))}</td>
+      <td title="${esc(huntTitle)}">${esc(lifecycleOutcomeLabel(hunt.outcome))}</td>
+      <td title="${esc(detTitle)}">${esc(lifecycleOutcomeLabel(det.outcome))}</td>
+      <td title="${esc(redTitle)}">${esc(lifecycleOutcomeLabel(red.outcome))}</td>
       <td>${(r.purple_result && r.purple_result.recommendations || []).map(esc).join("<br>")}</td>
       <td>${reviewCell}</td>
     </tr>`;
@@ -617,6 +703,56 @@ function renderLifecycle(run) {
     <table><thead><tr>
       <th>Finding</th><th>Threat Intel</th><th>Threat Hunt</th><th>Detection</th><th>Red Validation</th><th>Purple Recommendation</th><th>Human Review</th>
     </tr></thead><tbody>${rows}</tbody></table>`;
+}
+
+// Honest, per-run AI participation summary. Every row below is derived
+// from real backend fact, never a guess: the Bug Bounty planner NEVER
+// calls an LLM in this checkpoint (backend.orchestrator's own
+// planner_started event text says so, unconditionally, for every run --
+// see DEFAULT_BUG_BOUNTY_TOOL_PLAN, a fixed Python literal); the
+// Detection planner is only actually invoked, per finding, when a real
+// llm_proposal was supplied AND telemetry was feasible -- distinguished
+// here via detection_result.reason, exactly the same real field
+// core.bug_bounty_orchestrator._review_detection_engineering_for_finding
+// returns (never re-derived or guessed at by this function).
+function renderAiActivity(run) {
+  const body = el("ai-activity-body");
+  if (!run) { body.innerHTML = '<div class="empty">No active run.</div>'; return; }
+
+  const rows = [`
+    <tr>
+      <td>Bug Bounty planner</td>
+      <td>Propose which tools to run</td>
+      <td class="pill na">NO</td>
+      <td>Fixed local default plan -- this backend never calls an LLM to plan a Bug Bounty run.</td>
+      <td>—</td>
+      <td>n/a (no AI output to gate)</td>
+    </tr>`];
+
+  const lifecycle = run.lifecycle;
+  const results = lifecycle && Array.isArray(lifecycle.results) ? lifecycle.results : [];
+  const NO_AI_REASONS = new Set(["telemetry_gap", "no_llm_proposal_supplied"]);
+  for (const r of results) {
+    const dr = r.detection_result;
+    if (!dr) continue;
+    const aiInvoked = !NO_AI_REASONS.has(dr.reason);
+    rows.push(`
+    <tr>
+      <td>Detection planner (${esc(r.finding_id)})</td>
+      <td>Propose a detection rule draft</td>
+      <td class="pill ${aiInvoked ? 'warn' : 'na'}">${aiInvoked ? "YES" : "NO"}</td>
+      <td>${esc(dr.reason || "—")}</td>
+      <td>${aiInvoked ? esc(dr.outcome === "candidate_ready" ? "passed" : "failed") : "n/a (no AI output to validate)"}</td>
+      <td>${esc(dr.rule ? (dr.rule.deployment_state || "NOT_DEPLOYED") : "n/a (no rule produced)")}</td>
+    </tr>`);
+  }
+
+  body.innerHTML = `
+    <table><thead><tr>
+      <th>Component</th><th>Purpose</th><th>AI Invoked?</th><th>Reason / Proposal</th>
+      <th>Deterministic Validation</th><th>Deployment</th>
+    </tr></thead><tbody>${rows.join("")}</tbody></table>
+    <div class="surface-note">AI only ever proposes -- every proposal above is independently, deterministically validated before anything is treated as a candidate; nothing here is ever auto-deployed (deployment_state is always NOT_DEPLOYED in this checkpoint).</div>`;
 }
 
 // Event delegation for the dynamically-generated Approve/Reject
@@ -662,6 +798,30 @@ function surfaceStatusClass(status) {
   return "na";
 }
 
+// Deterministic, closed-vocabulary endpoint explanation -- derived only
+// from the endpoint's own real path/source/fetched fields, never a
+// vulnerability claim. Mirrors the same small set of extension/prefix
+// rules a human reviewer would apply by eye.
+function endpointExplanation(e) {
+  const path = (e.path || "").toLowerCase();
+  if (path === "/") return "Application root";
+  if (path.endsWith(".js")) return "JavaScript application resource";
+  if (path.endsWith(".css")) return "Stylesheet/static resource";
+  if (path.endsWith(".map")) return "Source map (static resource)";
+  if ([".png",".jpg",".jpeg",".gif",".ico",".svg",".webp"].some(ext => path.endsWith(ext))) return "Image/static resource";
+  if (path.startsWith("/api") || path.startsWith("/rest") || path === "/api-docs" || path === "/openapi.json" || path === "/swagger.json") return "Possible API/documentation endpoint";
+  if (path === "/robots.txt" || path === "/sitemap.xml" || path.startsWith("/.well-known/")) return "Site metadata resource";
+  if (e.source === "html_form") return "Form action endpoint (discovery-only, never submitted)";
+  return "Application page";
+}
+
+function endpointDiscoverySourceLabel(source) {
+  return {
+    seed: "starting URL", html_link: "HTML link", html_form: "HTML form", javascript_static: "JavaScript route string",
+    openapi: "OpenAPI document", redirect: "followed redirect", robots: "robots.txt", sitemap: "sitemap.xml", katana: "Katana crawl",
+  }[source] || source;
+}
+
 function renderAttackSurface(run) {
   const body = el("attack-surface-body");
   const surface = run && run.attack_surface;
@@ -679,7 +839,28 @@ function renderAttackSurface(run) {
   const endpoints = surface.endpoints || [];
   const parameters = surface.parameters || [];
 
+  // Human-friendly summary sentence -- every number is computed from
+  // the real endpoints array actually present, never hardcoded.
+  const fetchedCount = endpoints.filter(e => e.fetched).length;
+  const staticCount = endpoints.filter(e => e.is_static_asset).length;
+  const katanaCount = endpoints.filter(e => e.source === "katana").length;
+  const parts = [
+    `ThreatTrace discovered ${endpoints.length} application resource${endpoints.length === 1 ? "" : "s"} in this bounded crawl.`,
+    `${fetchedCount} ${fetchedCount === 1 ? "was" : "were"} fetched successfully, ${staticCount} ${staticCount === 1 ? "was" : "were"} static resource${staticCount === 1 ? "" : "s"} that did not require fetching.`,
+  ];
+  if (katanaCount) parts.push(`${katanaCount} additional resource${katanaCount === 1 ? "" : "s"} came from the Katana discovery crawl.`);
+  const formCount = summary.form_count ?? 0;
+  const paramCount = summary.parameter_count ?? 0;
+  const apiCount = summary.api_endpoint_count ?? 0;
+  if (!formCount && !paramCount && !apiCount) {
+    parts.push("No forms, parameters, or API routes were observed within the configured discovery limits.");
+  } else {
+    parts.push(`${formCount} form(s), ${paramCount} parameter(s), and ${apiCount} possible API route(s) were observed.`);
+  }
+  const humanSummary = `<div class="surface-note">${esc(parts.join(" "))}</div>`;
+
   const metrics = `
+    ${humanSummary}
     <div class="row"><span class="k">Status</span><span class="pill ${surfaceStatusClass(surface.status)}">${esc((surface.status || "unknown").toUpperCase())}</span></div>
     <div class="surface-metrics">
       <div class="surface-metric"><div class="surface-metric-label">Endpoints</div><div class="surface-metric-value">${esc(summary.endpoint_count ?? 0)}</div></div>
@@ -707,9 +888,10 @@ function renderAttackSurface(run) {
       return `<tr>
         <td>${esc(e.method)}</td>
         <td>${esc(e.path)}</td>
+        <td>${esc(endpointExplanation(e))}</td>
+        <td>${esc(endpointDiscoverySourceLabel(e.source))}</td>
         <td>${esc(paramCount)}</td>
-        <td>${esc(e.source)}</td>
-        <td>${esc(e.depth)}</td>
+        <td>${e.fetched ? "yes" : "no"}</td>
         <td>${e.fetched ? esc(e.status_code ?? "—") : "not fetched"}</td>
       </tr>`;
     }).join("");
@@ -717,7 +899,7 @@ function renderAttackSurface(run) {
       ? `<div class="surface-note">Showing ${MAX_SURFACE_ROWS_DISPLAYED} of ${esc(endpoints.length)} discovered endpoints.</div>` : "";
     endpointSection = `
       <div class="surface-subsection-title">Discovered Endpoints</div>
-      <table><thead><tr><th>Method</th><th>Path</th><th>Params</th><th>Source</th><th>Depth</th><th>Status</th></tr></thead>
+      <table><thead><tr><th>Method</th><th>Path</th><th>What it is</th><th>How discovered</th><th>Params</th><th>Fetched?</th><th>HTTP Status</th></tr></thead>
       <tbody>${rows}</tbody></table>${note}`;
   }
 
@@ -744,6 +926,40 @@ function renderAttackSurface(run) {
   }
 
   body.innerHTML = metrics + endpointSection + paramSection;
+}
+
+// All values rendered below come directly from run.http_enrichment (set by
+// backend.orchestrator from a real adapters.bug_bounty_httpx result) --
+// never computed here. httpx metadata (title/technology/server/status) is
+// always presented as observation only, never as a vulnerability claim.
+function httpEnrichmentClassLabel(enrichment) {
+  if (!enrichment) return "Unknown";
+  if (!enrichment.reachable) return "Unreachable";
+  const ct = (enrichment.content_type || "").toLowerCase();
+  if (ct.includes("json")) return "API/documentation candidate";
+  if (enrichment.status_code >= 300 && enrichment.status_code < 400) return "Redirect";
+  return "Live web endpoint";
+}
+
+function renderHttpEnrichment(run) {
+  const body = el("http-enrichment-body");
+  const record = run && run.http_enrichment;
+  if (!record) { body.innerHTML = '<div class="empty">No httpx activity on this run.</div>'; return; }
+  if (record.status !== "completed" || !record.enrichment) {
+    body.innerHTML = `<div class="empty">httpx ${esc(record.status || "did not complete")} for this run.</div>`;
+    return;
+  }
+  const en = record.enrichment;
+  body.innerHTML = `
+    <div class="row"><span class="k">Reachable</span><span>${en.reachable ? "yes" : "no"}</span></div>
+    <div class="row"><span class="k">Classification</span><span>${esc(httpEnrichmentClassLabel(en))}</span></div>
+    <div class="row"><span class="k">HTTP status</span><span>${esc(en.status_code ?? "—")}</span></div>
+    <div class="row"><span class="k">Page title</span><span>${esc(en.title || "—")}</span></div>
+    <div class="row"><span class="k">Content type</span><span>${esc(en.content_type || "—")}</span></div>
+    <div class="row"><span class="k">Server</span><span>${esc(en.server || "—")}</span></div>
+    <div class="row"><span class="k">Technologies (observation only, never a vulnerability claim)</span><span>${(en.technologies || []).length ? esc(en.technologies.join(", ")) : "—"}</span></div>
+    <div class="row"><span class="k">Redirect destination</span><span>${esc(en.redirect_location || "—")}</span></div>
+  `;
 }
 
 // All values rendered below come directly from the /api/runs/{id}/evaluation
@@ -942,7 +1158,9 @@ async function refreshSelectedRun() {
     renderFindings(run);
     renderDetection(run);
     renderAttackSurface(run);
+    renderHttpEnrichment(run);
     renderLifecycle(run);
+    renderAiActivity(run);
     // core.bug_bounty_juice_shop_evaluation.evaluate_bug_bounty_run_against_
     // juice_shop_benchmark (which GET /api/runs/{id}/evaluation calls
     // directly) gates purely on run.report being present -- it does not
@@ -979,7 +1197,7 @@ async function selectRun(runId) {
   el("feed-body").innerHTML = '<div class="empty">Loading…</div>';
   el("governor-body").innerHTML = '<div class="empty">No Governor evaluation yet.</div>';
   if (!runId) {
-    renderStatus(null); renderPipeline(null); renderTools(null); renderFindings(null); renderDetection(null); renderTi(null); renderEvaluation(null); renderAttackSurface(null); renderLifecycle(null);
+    renderStatus(null); renderPipeline(null); renderTools(null); renderFindings(null); renderDetection(null); renderTi(null); renderEvaluation(null); renderAttackSurface(null); renderHttpEnrichment(null); renderLifecycle(null); renderAiActivity(null);
     return;
   }
   // Fetch and replay full event history FIRST so observedEventTypes is
@@ -996,13 +1214,66 @@ async function selectRun(runId) {
 
 el("run-select").addEventListener("change", (e) => selectRun(e.target.value));
 
+// Demo vs Authorized External Target -- toggles which input controls
+// are shown. This is purely a client-side display convenience; the
+// real, authoritative safety boundary is backend.models.
+// validate_authorized_external_target_scope (or validate_local_only_
+// target for Demo Mode), applied server-side regardless of what this
+// dashboard sends.
+el("target-mode").addEventListener("change", () => {
+  const external = el("target-mode").value === "external";
+  el("bb-target").style.display = external ? "none" : "";
+  el("external-target-form").style.display = external ? "flex" : "none";
+});
+
+function _splitList(value) {
+  return value.split(",").map(s => s.trim()).filter(Boolean);
+}
+
+// Builds the real {target, scope, operator_scope_acknowledged} body
+// backend.models.validate_authorized_external_target_scope expects.
+// Returns null (after alerting) if the mandatory acknowledgment
+// checkbox is unchecked -- this is a client-side convenience gate
+// only; the server independently re-enforces the same requirement.
+function _buildExternalTargetBody() {
+  if (!el("ext-ack").checked) {
+    alert("You must check \"I am providing the scope for a system I am authorized to test\" before starting an Authorized External Target run.");
+    return null;
+  }
+  const allowedTools = ["http_assessor"];
+  for (const toolId of ["httpx", "katana", "nmap", "nuclei", "zap"]) {
+    if (el(`ext-tool-${toolId}`).checked) allowedTools.push(toolId);
+  }
+  const ports = _splitList(el("ext-ports").value).map(Number).filter(n => Number.isInteger(n) && n > 0);
+  return {
+    target: el("ext-target").value.trim(),
+    scope: {
+      hosts: _splitList(el("ext-hosts").value),
+      ports: ports.length ? ports : [443],
+      path_prefixes: _splitList(el("ext-paths").value).length ? _splitList(el("ext-paths").value) : ["/"],
+      allowed_tools: allowedTools,
+    },
+    operator_scope_acknowledged: true,
+  };
+}
+
 el("bb-start").addEventListener("click", async () => {
   el("bb-start").disabled = true;
   try {
-    const target = el("bb-target").value.trim();
-    const result = await api("/api/runs/bug-bounty", {
-      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ target }),
-    });
+    const external = el("target-mode").value === "external";
+    let result;
+    if (external) {
+      const body = _buildExternalTargetBody();
+      if (!body) return;
+      result = await api("/api/runs/authorized-target", {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+      });
+    } else {
+      const target = el("bb-target").value.trim();
+      result = await api("/api/runs/bug-bounty", {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ target }),
+      });
+    }
     await refreshRunList();
     el("run-select").value = result.run_id;
     await selectRun(result.run_id);
@@ -1016,9 +1287,11 @@ el("bb-start").addEventListener("click", async () => {
 el("lifecycle-start").addEventListener("click", async () => {
   el("lifecycle-start").disabled = true;
   try {
-    const target = el("bb-target").value.trim();
+    const external = el("target-mode").value === "external";
+    const body = external ? _buildExternalTargetBody() : { target: el("bb-target").value.trim() };
+    if (!body) return;
     const result = await api("/api/runs/security-lifecycle", {
-      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ target }),
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
     });
     await refreshRunList();
     el("run-select").value = result.run_id;
@@ -1065,7 +1338,7 @@ async function loadSystemInfo() {
   } catch (e) { renderReadiness(null); /* backend unreachable; health badge already reflects this */ }
 }
 
-renderStatus(null); renderPipeline(null); renderTools(null); renderFindings(null); renderDetection(null); renderTi(null); renderAttackSurface(null); renderLifecycle(null);
+renderStatus(null); renderPipeline(null); renderTools(null); renderFindings(null); renderDetection(null); renderTi(null); renderAttackSurface(null); renderHttpEnrichment(null); renderLifecycle(null); renderAiActivity(null);
 checkHealth();
 loadSystemInfo();
 refreshRunList();

@@ -38,6 +38,32 @@ adapter resolves the hostname fresh for each connection, exactly like a
 normal HTTP client. This is a known, documented v1 limitation, not a
 claim of rebinding resistance.
 
+## Optional destination-network validation (`allow_private_destinations`)
+
+`BugBountyHttpTransport` defaults to `allow_private_destinations=True`
+-- unchanged, pre-existing behavior, because the trusted local Demo
+Mode target (the `juice-shop` Docker-network alias) is itself a private
+address by construction, and every existing test/caller depends on
+that. The caller (`backend.orchestrator`, for an **Authorized External
+Target** run only) may construct this transport with
+`allow_private_destinations=False`. When `False`, every `request(...)`
+call resolves the target hostname first (`socket.getaddrinfo`, real by
+default, injectable via `resolve_hostname` for tests) and rejects the
+request with `BugBountyHttpError` if any resolved address is loopback,
+link-local (this covers the well-known cloud-metadata address
+`169.254.169.254`), private (RFC1918, and IPv6 unique-local -- this
+also covers metadata addresses assigned from `fd00::/8`), reserved,
+multicast, or unspecified -- before a connection is ever opened. This
+is a real, load-bearing check for the one new capability that can
+reach an operator-supplied arbitrary external hostname; it is
+deliberately **not** applied to the pre-existing `allow_private_destinations=True`
+default path. Like the DNS-rebinding limitation above, this check
+re-resolves per request (including every redirect hop, since each hop
+is its own `request(...)` call) but does not pin the validated address
+for the subsequent connection -- a narrow TOCTOU window between
+validation and connect remains, honestly disclosed here rather than
+overclaimed as eliminated.
+
 ## What "a real request occurred" does and does not mean
 
 A successful call to `BugBountyHttpTransport.request(...)` means one
@@ -84,11 +110,13 @@ prove that.
 from __future__ import annotations
 
 import http.client
+import ipaddress
 import re
+import socket
 import ssl
 import time
 from collections.abc import Mapping
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import urlsplit
 
 USER_AGENT = "ThreatTrace-SafeAssessment/1.0"
@@ -98,6 +126,40 @@ MAX_BODY_BYTES = 65536
 
 _ALLOWED_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 _ALLOWED_SCHEMES = frozenset({"http", "https"})
+
+_DEFAULT_PORT_BY_SCHEME = {"http": 80, "https": 443}
+
+ResolveHostnameFunc = Callable[[str, int], "list[str]"]
+
+
+def _classify_disallowed_ip(ip_obj: "ipaddress.IPv4Address | ipaddress.IPv6Address") -> str | None:
+    """Returns a short classification string for an address this
+    adapter's SSRF check must reject, or `None` if the address is an
+    ordinary public destination. `is_link_local` covers the well-known
+    `169.254.169.254` cloud-metadata address; `is_private` covers
+    RFC1918 IPv4 and IPv6 unique-local (`fc00::/7`, which also covers
+    metadata addresses some cloud providers assign from `fd00::/8`)."""
+    if ip_obj.is_loopback:
+        return "loopback"
+    if ip_obj.is_link_local:
+        return "link_local"
+    if ip_obj.is_private:
+        return "private"
+    if ip_obj.is_reserved:
+        return "reserved"
+    if ip_obj.is_multicast:
+        return "multicast"
+    if ip_obj.is_unspecified:
+        return "unspecified"
+    return None
+
+
+def real_resolve_hostname(hostname: str, port: int) -> list[str]:
+    """Real hostname resolution via the stdlib resolver. Returns every
+    resolved address as a string. Raises `OSError` (the caller converts
+    this to `BugBountyHttpError`) if resolution fails."""
+    infos = socket.getaddrinfo(hostname, port, proto=socket.IPPROTO_TCP)
+    return [sockaddr[0] for _family, _type, _proto, _canonname, sockaddr in infos]
 
 # Never sent, regardless of what a caller supplies -- defense in depth on
 # top of the orchestrator never constructing these itself.
@@ -163,11 +225,15 @@ class BugBountyHttpTransport:
         min_interval: float = MIN_REQUEST_INTERVAL_SECONDS,
         sleep: Any = time.sleep,
         clock: Any = time.monotonic,
+        allow_private_destinations: bool = True,
+        resolve_hostname: ResolveHostnameFunc = real_resolve_hostname,
     ) -> None:
         self._timeout = timeout
         self._min_interval = min_interval
         self._sleep = sleep
         self._clock = clock
+        self._allow_private_destinations = allow_private_destinations
+        self._resolve_hostname = resolve_hostname
         self._last_request_at: float | None = None
 
     def _apply_rate_limit(self) -> None:
@@ -177,6 +243,26 @@ class BugBountyHttpTransport:
             if remaining > 0:
                 self._sleep(remaining)
         self._last_request_at = self._clock()
+
+    def _validate_resolved_destination(self, hostname: str, port: int) -> None:
+        """Rejects a request whose target hostname resolves to a
+        loopback/link-local/private/reserved/multicast/unspecified
+        address -- called only when `allow_private_destinations` is
+        `False` (see module docstring). A resolution failure itself is
+        also treated as a rejection, not silently allowed through."""
+        try:
+            resolved_ips = self._resolve_hostname(hostname, port)
+        except OSError:
+            raise BugBountyHttpError("hostname could not be resolved") from None
+        for raw_ip in resolved_ips:
+            try:
+                ip_obj = ipaddress.ip_address(raw_ip)
+            except ValueError:
+                raise BugBountyHttpError("resolved address could not be parsed") from None
+            if _classify_disallowed_ip(ip_obj) is not None:
+                raise BugBountyHttpError(
+                    "destination resolved to a disallowed private/loopback/link-local/reserved network"
+                )
 
     def request(
         self,
@@ -209,6 +295,9 @@ class BugBountyHttpTransport:
             raise BugBountyHttpError("unsupported URL scheme")
         if not parsed.hostname:
             raise BugBountyHttpError("url must include a hostname")
+
+        if not self._allow_private_destinations:
+            self._validate_resolved_destination(parsed.hostname, parsed.port or _DEFAULT_PORT_BY_SCHEME[parsed.scheme])
 
         self._apply_rate_limit()
 

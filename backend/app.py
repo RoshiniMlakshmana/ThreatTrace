@@ -79,10 +79,11 @@ from starlette.responses import FileResponse, JSONResponse, PlainTextResponse, R
 from starlette.routing import Route
 
 from backend.event_bus import EventBus, EventBusError
-from backend.models import TERMINAL_STATUSES, RunModelError, validate_local_only_target
+from backend.models import TERMINAL_STATUSES, RunModelError, validate_authorized_external_target_scope, validate_local_only_target
 from backend.orchestrator import (
     TRIGGER_SOURCES,
     record_lifecycle_human_review,
+    run_authorized_external_target_workflow,
     run_bug_bounty_workflow,
     run_detection_workflow,
     run_security_lifecycle_workflow,
@@ -216,9 +217,16 @@ async def system_info(request: Request) -> Response:
             ],
         },
         {
-            "category": "scanners", "label": "Scanners",
+            "category": "discovery", "label": "Discovery",
             "items": [
                 _scanner_item("http_assessor", "HTTP Assessor", required=True),
+                _scanner_item("httpx", "httpx", required=True),
+                _scanner_item("katana", "Katana", required=True),
+            ],
+        },
+        {
+            "category": "scanners", "label": "Scanners",
+            "items": [
                 _scanner_item("nmap", "Nmap", required=True),
                 _scanner_item("nuclei", "Nuclei", required=True),
                 _scanner_item("zap", "ZAP", required=True),
@@ -318,16 +326,34 @@ async def create_security_lifecycle_run(request: Request) -> Response:
     Context Prioritization, Security Handoff, Threat Intel/Hunt review,
     Detection Engineering review, a Red Validation fact-check, and a
     Purple remediation recommendation for the highest-priority findings.
-    Remains localhost/demo-target only -- `validate_local_only_target`
-    is the same authoritative check `create_bug_bounty_run` uses, never
-    weakened or bypassed here. Shares the same single-active-offensive-
-    assessment concurrency slot as a plain Bug Bounty run (this run
-    still executes the exact same real nmap/nuclei/zap tools)."""
+    Demo Mode (no `scope` field in the request body) remains
+    localhost/demo-target only -- `validate_local_only_target` is the
+    same authoritative check `create_bug_bounty_run` uses, never
+    weakened or bypassed here. When the caller supplies a `scope` field
+    (and `operator_scope_acknowledged`), this instead runs as an
+    Authorized External Target Full Security Lifecycle run -- see
+    `create_authorized_target_run`'s own docstring for that contract;
+    the same `validate_authorized_external_target_scope` gate applies,
+    never a weaker one. Shares the same single-active-offensive-
+    assessment concurrency slot as a plain Bug Bounty run either way
+    (this run still executes the exact same real nmap/nuclei/zap/httpx/
+    katana tools)."""
     body = await _read_json_body(request)
-    try:
-        target = validate_local_only_target(body.get("target"))
-    except RunModelError as exc:
-        raise _ApiError(400, _error_code_from_message(str(exc)), str(exc))
+    external_scope_bundle: dict[str, Any] | None = None
+    if body.get("scope") is not None:
+        try:
+            external_scope_bundle = validate_authorized_external_target_scope(
+                target=body.get("target"), scope=body.get("scope"),
+                operator_scope_acknowledged=body.get("operator_scope_acknowledged"),
+            )
+        except RunModelError as exc:
+            raise _ApiError(400, _error_code_from_message(str(exc)), str(exc))
+        target = external_scope_bundle["bug_bounty_scope"]["target"]
+    else:
+        try:
+            target = validate_local_only_target(body.get("target"))
+        except RunModelError as exc:
+            raise _ApiError(400, _error_code_from_message(str(exc)), str(exc))
 
     available_telemetry = body.get("available_telemetry")
     if available_telemetry is None:
@@ -350,10 +376,11 @@ async def create_security_lifecycle_run(request: Request) -> Response:
         )
         raise _ApiError(409, "CONCURRENT_RUN_ACTIVE", "Another Bug Bounty run is already active.")
 
+    lifecycle_mode = "full_security_lifecycle_external_target" if external_scope_bundle is not None else "full_security_lifecycle"
     _event_bus.publish(
         run_id=run["run_id"], event_type="run_created", timestamp=_now(), stage="intake",
-        source_component="orchestrator", summary=f"Run created (full_security_lifecycle) for target {target}",
-        sanitized_payload={"target": target, "mode": "full_security_lifecycle"},
+        source_component="orchestrator", summary=f"Run created ({lifecycle_mode}) for target {target}",
+        sanitized_payload={"target": target, "mode": lifecycle_mode},
     )
 
     thread = threading.Thread(
@@ -361,6 +388,69 @@ async def create_security_lifecycle_run(request: Request) -> Response:
         kwargs={
             "run_id": run["run_id"], "target": target, "run_store": _run_store, "event_bus": _event_bus,
             "available_telemetry": available_telemetry, "detection_llm_proposals": detection_llm_proposals,
+            "external_scope_bundle": external_scope_bundle,
+        },
+        daemon=True,
+    )
+    thread.start()
+
+    return JSONResponse({"run_id": run["run_id"], "status": run["status"]}, status_code=202)
+
+
+@_api_route
+async def create_authorized_target_run(request: Request) -> Response:
+    """Starts one real, bounded Bug Bounty assessment against an
+    operator-declared Authorized External Target (Final Pre-Release
+    Block) -- never the fixed Demo Mode alias, and never a target this
+    module infers or expands on its own.
+
+    Request body: `{"target": "<http(s) URL>", "scope": {"hosts": [...],
+    "ports": [...], "path_prefixes": [...], "allowed_tools": [...]},
+    "operator_scope_acknowledged": true}` -- see
+    `backend.models.validate_authorized_external_target_scope` for the
+    exact contract. `operator_scope_acknowledged` must be the literal
+    `true`; this only permits ThreatTrace to accept the caller-declared
+    scope -- it is never used, and never presented, as proof that the
+    operator actually holds legal authorization to test `target`.
+
+    Shares the same single-active-offensive-assessment concurrency slot
+    as a plain Bug Bounty / Full Security Lifecycle run."""
+    body = await _read_json_body(request)
+    try:
+        scope_bundle = validate_authorized_external_target_scope(
+            target=body.get("target"), scope=body.get("scope"),
+            operator_scope_acknowledged=body.get("operator_scope_acknowledged"),
+        )
+    except RunModelError as exc:
+        raise _ApiError(400, _error_code_from_message(str(exc)), str(exc))
+
+    target = scope_bundle["bug_bounty_scope"]["target"]
+
+    if _run_store.active_bug_bounty_run_id() is not None:
+        raise _ApiError(409, "CONCURRENT_RUN_ACTIVE", "Another Bug Bounty run is already active.")
+
+    run = _run_store.create_run(run_type="bug_bounty", created_at=_now())
+    if not _run_store.try_acquire_bug_bounty_slot(run_id=run["run_id"]):
+        _run_store.transition(
+            run_id=run["run_id"], new_status="blocked", completed_at=_now(),
+            limitations=["CONCURRENT_RUN_ACTIVE: another Bug Bounty run claimed the slot first."],
+        )
+        raise _ApiError(409, "CONCURRENT_RUN_ACTIVE", "Another Bug Bounty run is already active.")
+
+    _event_bus.publish(
+        run_id=run["run_id"], event_type="run_created", timestamp=_now(), stage="intake",
+        source_component="orchestrator", summary=f"Run created (authorized_external_target) for target {target}",
+        sanitized_payload={
+            "target": target, "mode": "authorized_external_target",
+            "allowed_tools": scope_bundle["allowed_tools"],
+        },
+    )
+
+    thread = threading.Thread(
+        target=run_authorized_external_target_workflow,
+        kwargs={
+            "run_id": run["run_id"], "target": target, "scope_bundle": scope_bundle,
+            "run_store": _run_store, "event_bus": _event_bus,
         },
         daemon=True,
     )
@@ -553,6 +643,7 @@ routes = [
     Route("/api/runs", list_runs, methods=["GET"]),
     Route("/api/runs/bug-bounty", create_bug_bounty_run, methods=["POST"]),
     Route("/api/runs/security-lifecycle", create_security_lifecycle_run, methods=["POST"]),
+    Route("/api/runs/authorized-target", create_authorized_target_run, methods=["POST"]),
     Route("/api/runs/detection", create_detection_run, methods=["POST"]),
     Route("/api/runs/{run_id}", get_run, methods=["GET"]),
     Route("/api/runs/{run_id}/events", get_events, methods=["GET"]),

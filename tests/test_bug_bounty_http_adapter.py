@@ -440,8 +440,11 @@ class TestStructuralPurity:
             assert token not in code_body
 
     def test_052_module_only_uses_stdlib_http_client(self):
+        # `socket` is stdlib and is used only for the optional
+        # allow_private_destinations=False resolution check (see module
+        # docstring) -- never a new pip dependency like `requests`/`httpx`.
         code_body = inspect.getsource(bug_bounty_http).split("from __future__ import annotations", 1)[1]
-        for token in ("import requests", "import httpx", "import socket"):
+        for token in ("import requests", "import httpx"):
             assert token not in code_body
         assert "import http.client" in code_body
 
@@ -461,3 +464,104 @@ class TestStructuralPurity:
 
     def test_056_module_documents_dns_rebinding_limitation(self):
         assert "DNS-rebinding" in bug_bounty_http.__doc__ or "DNS rebinding" in bug_bounty_http.__doc__.replace("-", " ")
+
+
+# ---------------------------------------------------------------------------
+# Optional SSRF destination-network validation (allow_private_destinations)
+# ---------------------------------------------------------------------------
+
+
+class TestSSRFDestinationValidation:
+    def test_057_default_allows_private_destinations_unchanged(self, monkeypatch):
+        # Backward-compat: no resolver is even consulted by default, so
+        # existing Demo Mode callers (which target the private juice-shop
+        # Docker alias) are completely unaffected.
+        _install_fake_connection(monkeypatch, status=200, headers={}, body=b"")
+        resolver_calls = []
+        transport = _transport(resolve_hostname=lambda h, p: resolver_calls.append((h, p)) or ["10.0.0.5"])
+        transport.request(url="http://juice-shop:3000/", method="GET")
+        assert resolver_calls == []
+
+    def test_058_public_ip_allowed_when_private_disabled(self, monkeypatch):
+        _install_fake_connection(monkeypatch, status=200, headers={}, body=b"")
+        transport = _transport(allow_private_destinations=False, resolve_hostname=lambda h, p: ["93.184.216.34"])
+        result = transport.request(url="https://app.example.test/", method="GET")
+        assert result["status_code"] == 200
+
+    @pytest.mark.parametrize("ip", ["127.0.0.1", "169.254.169.254", "10.1.2.3", "192.168.1.1", "172.16.0.1", "0.0.0.0"])
+    def test_059_disallowed_ipv4_rejected_when_private_disabled(self, monkeypatch, ip):
+        _install_fake_connection(monkeypatch, status=200, headers={}, body=b"")
+        transport = _transport(allow_private_destinations=False, resolve_hostname=lambda h, p: [ip])
+        with pytest.raises(BugBountyHttpError):
+            transport.request(url="https://app.example.test/", method="GET")
+
+    @pytest.mark.parametrize("ip", ["::1", "fe80::1", "fc00::1", "fd00::1"])
+    def test_060_disallowed_ipv6_rejected_when_private_disabled(self, monkeypatch, ip):
+        _install_fake_connection(monkeypatch, status=200, headers={}, body=b"")
+        transport = _transport(allow_private_destinations=False, resolve_hostname=lambda h, p: [ip])
+        with pytest.raises(BugBountyHttpError):
+            transport.request(url="https://app.example.test/", method="GET")
+
+    def test_061_disallowed_destination_never_reaches_connection(self, monkeypatch):
+        _install_fake_connection(monkeypatch, status=200, headers={}, body=b"")
+        transport = _transport(allow_private_destinations=False, resolve_hostname=lambda h, p: ["127.0.0.1"])
+        with pytest.raises(BugBountyHttpError):
+            transport.request(url="https://app.example.test/", method="GET")
+        assert _FakeConnection.instances == []
+
+    def test_062_one_disallowed_address_among_several_still_rejects(self, monkeypatch):
+        _install_fake_connection(monkeypatch, status=200, headers={}, body=b"")
+        transport = _transport(allow_private_destinations=False, resolve_hostname=lambda h, p: ["93.184.216.34", "127.0.0.1"])
+        with pytest.raises(BugBountyHttpError):
+            transport.request(url="https://app.example.test/", method="GET")
+
+    def test_063_resolution_failure_rejected_not_silently_allowed(self, monkeypatch):
+        _install_fake_connection(monkeypatch, status=200, headers={}, body=b"")
+
+        def _raise(_h, _p):
+            raise OSError("name resolution failed")
+
+        transport = _transport(allow_private_destinations=False, resolve_hostname=_raise)
+        with pytest.raises(BugBountyHttpError):
+            transport.request(url="https://app.example.test/", method="GET")
+
+    def test_064_resolver_receives_hostname_and_effective_port(self, monkeypatch):
+        _install_fake_connection(monkeypatch, status=200, headers={}, body=b"")
+        calls = []
+        transport = _transport(
+            allow_private_destinations=False,
+            resolve_hostname=lambda h, p: calls.append((h, p)) or ["93.184.216.34"],
+        )
+        transport.request(url="https://app.example.test:8443/", method="GET")
+        assert calls == [("app.example.test", 8443)]
+
+    def test_065_default_port_used_when_url_has_none(self, monkeypatch):
+        _install_fake_connection(monkeypatch, status=200, headers={}, body=b"")
+        calls = []
+        transport = _transport(
+            allow_private_destinations=False,
+            resolve_hostname=lambda h, p: calls.append((h, p)) or ["93.184.216.34"],
+        )
+        transport.request(url="https://app.example.test/", method="GET")
+        assert calls == [("app.example.test", 443)]
+
+    def test_066_error_message_never_leaks_raw_resolved_ip(self, monkeypatch):
+        _install_fake_connection(monkeypatch, status=200, headers={}, body=b"")
+        transport = _transport(allow_private_destinations=False, resolve_hostname=lambda h, p: ["127.0.0.1"])
+        try:
+            transport.request(url="https://app.example.test/", method="GET")
+            assert False, "expected BugBountyHttpError"
+        except BugBountyHttpError as exc:
+            assert "127.0.0.1" not in str(exc)
+
+    def test_067_real_resolver_is_default(self):
+        import inspect as _inspect
+
+        signature = _inspect.signature(bug_bounty_http.BugBountyHttpTransport.__init__)
+        assert signature.parameters["resolve_hostname"].default is bug_bounty_http.real_resolve_hostname
+
+    def test_068_allow_private_destinations_defaults_true(self):
+        import inspect as _inspect
+
+        signature = _inspect.signature(bug_bounty_http.BugBountyHttpTransport.__init__)
+        assert signature.parameters["allow_private_destinations"].default is True

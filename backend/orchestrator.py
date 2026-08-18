@@ -52,6 +52,7 @@ cancellation is out of scope for this checkpoint.
 
 from __future__ import annotations
 
+import hashlib
 import traceback
 from collections.abc import Mapping
 from datetime import datetime, timezone
@@ -69,7 +70,7 @@ from core.bug_bounty_evidence_normalization import BugBountyEvidenceNormalizatio
 from core.bug_bounty_final_report import BugBountyFinalReportError, build_final_bug_bounty_report
 from core.bug_bounty_finding_correlation import BugBountyFindingCorrelationError, correlate_bug_bounty_evidence
 from core.bug_bounty_purple_remediation import PurpleRemediationError, build_purple_remediation_recommendation
-from core.bug_bounty_scope import BugBountyScopeError, create_bug_bounty_scope
+from core.bug_bounty_scope import BugBountyScopeError, create_bug_bounty_scope, evaluate_bug_bounty_request_scope
 from core.bug_bounty_threat_hunt_review import ThreatHuntReviewError, review_threat_hunt_for_finding
 from core.bug_bounty_threat_intel_review import ThreatIntelReviewError, review_threat_intelligence_for_finding
 from core.bug_bounty_tool_execution import BugBountyToolExecutionError, execute_bug_bounty_tool
@@ -98,8 +99,8 @@ TRIGGER_SOURCES = frozenset({"bug_bounty", "threat_intelligence"})
 _MAX_ERROR_SUMMARY_LENGTH = 200
 
 __all__ = [
-    "run_bug_bounty_workflow", "run_detection_workflow", "run_security_lifecycle_workflow",
-    "record_lifecycle_human_review", "TRIGGER_SOURCES",
+    "run_bug_bounty_workflow", "run_authorized_external_target_workflow", "run_detection_workflow",
+    "run_security_lifecycle_workflow", "record_lifecycle_human_review", "TRIGGER_SOURCES",
 ]
 
 
@@ -143,19 +144,23 @@ def _stop_cancelled(*, run_store: RunStore, run_id: str, emit: _Emitter, stage: 
 
 
 # The fixed default Bug Bounty tool plan -- every deployment (host-native
-# or self-hosted Docker) requests the same five tools; each one's real
+# or self-hosted Docker) requests the same tools; each one's real
 # availability (adapter binary/daemon present or not) is decided honestly,
-# per tool, by Policy + the real adapter -- never assumed here. Order is
-# significant only for display/execution order, never for authorization.
-# "crawler" (Step 2: Attack-Surface Discovery) runs immediately after
-# http_assessor, reusing the exact same scope + transport instance --
-# it never scans anything itself; it only builds and persists the
-# attack-surface inventory (endpoints/parameters) that a later,
-# dedicated step may eventually wire into nmap/nuclei/zap. It never
+# per tool, by Policy + the real adapter -- never assumed here. Order here
+# is the real discovery pipeline order (Final Pre-Release Block, section
+# 12): Seed -> http_assessor -> httpx enrichment -> bounded crawler ->
+# Katana bounded discovery -> nmap/nuclei/zap. "crawler"/"httpx"/"katana"
+# never scan anything themselves; "crawler" builds and persists the
+# attack-surface inventory (endpoints/parameters), "httpx" enriches the
+# one seed URL with HTTP-level metadata (stored on run["http_enrichment"]),
+# and "katana"'s own raw discovered URLs are independently re-validated
+# against real scope (evaluate_bug_bounty_request_scope) before being
+# merged into that same attack-surface inventory -- see
+# _merge_katana_discoveries_into_attack_surface. None of the three ever
 # contributes to source_results (never normalized/correlated into a
-# finding, never scored by the benchmark) -- discovery data and
-# vulnerability findings are deliberately kept as separate concerns.
-DEFAULT_BUG_BOUNTY_TOOL_PLAN = ("http_assessor", "crawler", "nmap", "nuclei", "zap")
+# finding, never scored by the benchmark) -- discovery/enrichment data
+# and vulnerability findings are deliberately kept as separate concerns.
+DEFAULT_BUG_BOUNTY_TOOL_PLAN = ("http_assessor", "httpx", "crawler", "katana", "nmap", "nuclei", "zap")
 
 # Matches adapters.bug_bounty_{nmap,nuclei,zap}'s own hardcoded
 # `max_output_bytes` safety ceiling (1 MiB) -- see each adapter's own
@@ -180,6 +185,17 @@ _EXECUTION_CONFIG = {"execution_config_version": "1", "process_timeout_seconds":
 # Bounty run now typically takes ~2 minutes when Nuclei's medium tier
 # genuinely runs, not ~40s, in exchange for the wider coverage.
 _NUCLEI_EXECUTION_CONFIG = {"execution_config_version": "1", "process_timeout_seconds": 200, "max_output_bytes": 1_048_576}
+
+# httpx/Katana each enforce their own, tighter execution_config ceiling
+# than the shared _EXECUTION_CONFIG above (see adapters.bug_bounty_httpx.
+# MAX_PROCESS_TIMEOUT_SECONDS/MAX_OUTPUT_BYTES and adapters.bug_bounty_
+# katana's own equivalents) -- passing the shared 60s/1MiB config to
+# either adapter exceeds its ceiling and is rejected at that boundary
+# (ADAPTER_REJECTED_REQUEST), caught during this block's own real local
+# validation run. Each gets its own dedicated config, safely under its
+# adapter's real ceiling.
+_HTTPX_EXECUTION_CONFIG = {"execution_config_version": "1", "process_timeout_seconds": 20, "max_output_bytes": 262_144}
+_KATANA_EXECUTION_CONFIG = {"execution_config_version": "1", "process_timeout_seconds": 30, "max_output_bytes": 1_048_576}
 
 
 # Nuclei Reliability Step 1C: closed, deterministic technology-name
@@ -264,6 +280,128 @@ def _build_tool_request(*, run_id: str, tool_id: str, execution_target: str, por
     }
 
 
+def _katana_endpoint_id(*, scheme: str, host: str, port: int, path: str, method: str) -> str:
+    """A local copy of core.bug_bounty_crawler's own private
+    `_endpoint_id` hash formula (never imported -- this project's
+    established "each module owns its own copy of a shape it shares in
+    spirit with another module" convention) -- using the identical
+    formula means a URL Katana discovers that the crawler already
+    registered collides onto the same id, so it is honestly deduplicated
+    rather than double-counted."""
+    payload = "|".join((scheme, host, str(port), path, method))
+    digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+    return f"EP-{digest}"
+
+
+def _merge_katana_discoveries_into_attack_surface(
+    *, attack_surface: dict[str, Any] | None, katana_observations: list[dict[str, Any]], scope: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Independently re-validates every one of Katana's raw discovered
+    URLs (untrusted candidate data -- see adapters.bug_bounty_katana's
+    own module docstring) against real scope via
+    `evaluate_bug_bounty_request_scope` before merging any of them into
+    the attack-surface inventory the crawler already built (or a fresh
+    one, if the crawler itself was not permitted/executed this run) --
+    satisfying the Final Pre-Release Block's own "every discovered URL
+    must pass existing scope validation before registration" requirement.
+    A URL that fails scope validation is silently dropped (never
+    registered, never an error) -- exactly like the crawler's own
+    out-of-scope-link handling.
+    """
+    base = attack_surface if isinstance(attack_surface, dict) and attack_surface.get("status") != "failed" else {
+        "attack_surface_version": "1", "status": "completed", "target": scope["target"],
+        "endpoints": [], "parameters": [], "attack_surface_summary": {
+            "endpoint_count": 0, "parameter_count": 0, "form_count": 0, "api_endpoint_count": 0,
+            "method_counts": {}, "discovery_sources": [],
+        },
+        "telemetry": {}, "observed_evidence": [],
+    }
+    endpoints = list(base.get("endpoints") or [])
+    existing_ids = {e["endpoint_id"] for e in endpoints}
+    added = 0
+
+    for observation in katana_observations:
+        url = observation.get("url")
+        method = observation.get("method") or "GET"
+        if not isinstance(url, str) or not url.strip():
+            continue
+        scope_result = evaluate_bug_bounty_request_scope(scope=scope, url=url, method="GET")
+        if scope_result["decision"] != "allow" or scope_result["normalized_url"] is None:
+            continue
+        normalized = urlsplit(scope_result["normalized_url"])
+        path = normalized.path or "/"
+        port = normalized.port or (443 if normalized.scheme == "https" else 80)
+        endpoint_id = _katana_endpoint_id(scheme=normalized.scheme, host=normalized.hostname or "", port=port, path=path, method=method)
+        if endpoint_id in existing_ids:
+            continue
+        existing_ids.add(endpoint_id)
+        endpoints.append({
+            "endpoint_id": endpoint_id, "scheme": normalized.scheme, "host": normalized.hostname, "port": port,
+            "path": path, "method": method, "canonical_url": scope_result["normalized_url"], "source": "katana",
+            "discovered_from": None, "depth": None,
+            "content_type": None, "status_code": observation.get("status_code"),
+            "is_static_asset": False, "fetched": observation.get("status_code") is not None,
+        })
+        added += 1
+
+    summary = dict(base.get("attack_surface_summary") or {})
+    method_counts: dict[str, int] = {}
+    for endpoint in endpoints:
+        method_counts[endpoint["method"]] = method_counts.get(endpoint["method"], 0) + 1
+    discovery_sources = sorted({endpoint["source"] for endpoint in endpoints})
+
+    merged = dict(base)
+    merged["endpoints"] = endpoints
+    merged["attack_surface_summary"] = {
+        "endpoint_count": len(endpoints),
+        "parameter_count": summary.get("parameter_count", 0),
+        "form_count": summary.get("form_count", 0),
+        "api_endpoint_count": summary.get("api_endpoint_count", 0),
+        "method_counts": method_counts,
+        "discovery_sources": discovery_sources,
+    }
+    merged["katana_contributed_count"] = added
+    return merged
+
+
+def _external_bug_bounty_permissions(*, bug_bounty_scope: Mapping[str, Any], allowed_tools: list[str]) -> dict[str, Any]:
+    """Builds the `core.bug_bounty_tool_policy` permission contract for
+    an Authorized External Target run from an already-validated
+    `core.bug_bounty_scope` scope (see
+    `backend.models.validate_authorized_external_target_scope`) and its
+    operator-declared `allowed_tools` list -- the external-target
+    equivalent of `_default_bug_bounty_permissions`, which instead
+    always derives a fixed single-host/single-port Demo Mode contract."""
+    hosts: set[str] = set()
+    ports: set[int] = set()
+    for origin in bug_bounty_scope["allowed_origins"]:
+        parsed_origin = urlsplit(origin)
+        hosts.add(parsed_origin.hostname)
+        ports.add(parsed_origin.port or (443 if parsed_origin.scheme == "https" else 80))
+
+    target_parsed = urlsplit(bug_bounty_scope["target"])
+    target_port = target_parsed.port or (443 if target_parsed.scheme == "https" else 80)
+    default_port = 443 if target_parsed.scheme == "https" else 80
+    target_origin = f"{target_parsed.scheme}://{target_parsed.hostname}" + (
+        f":{target_port}" if target_port != default_port else ""
+    )
+
+    return {
+        "permission_version": "1",
+        "target_origin": target_origin,
+        "allowed_hosts": sorted(hosts),
+        "allowed_ports": sorted(ports),
+        "allowed_paths": list(bug_bounty_scope["allowed_paths"]),
+        "excluded_paths": list(bug_bounty_scope["excluded_paths"]),
+        "testing_profile": "safe_dast",
+        "allowed_tools": list(allowed_tools),
+        "authenticated_testing_allowed": False,
+        "controlled_validation_allowed": False,
+        "max_requests": 12,
+        "human_approval_state": "approved",
+    }
+
+
 def _run_bug_bounty_core(
     *,
     run_id: str,
@@ -275,6 +413,7 @@ def _run_bug_bounty_core(
     transport: Any = None,
     env: Any = None,
     execute_tool: Callable[..., dict[str, Any]] = execute_bug_bounty_tool,
+    external_scope_bundle: Mapping[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     """Runs the Bug Bounty phase (scope validation through Tool Policy,
     Governor, tool execution, Normalization, Correlation, and Final
@@ -290,6 +429,24 @@ def _run_bug_bounty_core(
     `"failed"`/`"cancelled"`, so the Bug Bounty phase itself must never
     be the one to make that call for a lifecycle run.
 
+    `external_scope_bundle` (default `None` -- the existing Demo Mode
+    path, completely unchanged) is the Authorized External Target path:
+    when supplied, it must be shaped like
+    `backend.models.validate_authorized_external_target_scope`'s own
+    return value (`bug_bounty_scope`, `allowed_tools`,
+    `operator_scope_acknowledged`). When present, `target` is used
+    as-is (never passed through `validate_local_only_target`/
+    `resolve_execution_target`, which only apply to the fixed Demo Mode
+    alias), the already-validated `bug_bounty_scope` is used directly
+    (never rebuilt), and only the operator's own declared
+    `allowed_tools` are ever permission-eligible -- an operator who
+    never listed `nmap`/`nuclei`/`zap` in scope can never have them
+    execute, regardless of tool availability. The default transport for
+    this path (when `transport` is not injected) is
+    `adapters.bug_bounty_http.BugBountyHttpTransport(allow_private_destinations=False)`
+    -- the real SSRF destination check (see that module) -- never the
+    Demo Mode default.
+
     Returns the real `report` dict (from `core.bug_bounty_final_report.
     build_final_bug_bounty_report`) on success. Returns `None` if the
     run was blocked (tool policy denied every tool, or Governor denied
@@ -299,8 +456,16 @@ def _run_bug_bounty_core(
     and the caller must simply return without any further action.
     """
     try:
-        target = validate_local_only_target(target)
-        execution_target = resolve_execution_target(display_target=target, env=env)
+        is_external = external_scope_bundle is not None
+        if is_external:
+            execution_target = target
+            bug_bounty_scope = external_scope_bundle["bug_bounty_scope"]
+            plan_tools = list(DEFAULT_BUG_BOUNTY_TOOL_PLAN)
+        else:
+            target = validate_local_only_target(target)
+            execution_target = resolve_execution_target(display_target=target, env=env)
+            bug_bounty_scope = None
+            plan_tools = list(DEFAULT_BUG_BOUNTY_TOOL_PLAN)
 
         run_store.transition(
             run_id=run_id, new_status="planning", current_stage="planning", started_at=active_clock(),
@@ -309,7 +474,8 @@ def _run_bug_bounty_core(
         target_payload = {"target": target}
         if execution_target != target:
             target_payload["execution_target"] = execution_target
-        emit("run_started", "intake", "orchestrator", f"Bug Bounty run started against {target}", target_payload)
+        run_label = "Authorized External Target run" if is_external else "Bug Bounty run"
+        emit("run_started", "intake", "orchestrator", f"{run_label} started against {target}", target_payload)
 
         if _is_cancelled(run_store=run_store, run_id=run_id):
             _stop_cancelled(run_store=run_store, run_id=run_id, emit=emit, stage="planning", clock=active_clock)
@@ -319,23 +485,29 @@ def _run_bug_bounty_core(
             "planner_started", "planning", "orchestrator",
             "Using a fixed local default assessment plan -- the backend performs no live LLM call.",
         )
-        port = urlsplit(execution_target).port or 80
+        parsed_execution_target = urlsplit(execution_target)
+        port = parsed_execution_target.port or (443 if parsed_execution_target.scheme == "https" else 80)
         tool_requests = {
             tool_id: _build_tool_request(run_id=run_id, tool_id=tool_id, execution_target=execution_target, port=port)
-            for tool_id in DEFAULT_BUG_BOUNTY_TOOL_PLAN
+            for tool_id in plan_tools
         }
         emit(
             "planner_completed", "planning", "orchestrator",
-            f"Plan accepted: {len(tool_requests)} tool request(s) ({', '.join(DEFAULT_BUG_BOUNTY_TOOL_PLAN)}).",
+            f"Plan accepted: {len(tool_requests)} tool request(s) ({', '.join(plan_tools)}).",
             {"tool_count": len(tool_requests)},
         )
-        run_store.update_fields(run_id=run_id, requested_tools=list(DEFAULT_BUG_BOUNTY_TOOL_PLAN))
+        run_store.update_fields(run_id=run_id, requested_tools=list(plan_tools))
 
         run_store.transition(run_id=run_id, new_status="awaiting_policy", current_stage="tool_policy")
-        permissions = _default_bug_bounty_permissions(execution_target=execution_target)
+        if is_external:
+            permissions = _external_bug_bounty_permissions(
+                bug_bounty_scope=bug_bounty_scope, allowed_tools=external_scope_bundle["allowed_tools"],
+            )
+        else:
+            permissions = _default_bug_bounty_permissions(execution_target=execution_target)
 
         policy_results: dict[str, dict[str, Any]] = {}
-        for tool_id in DEFAULT_BUG_BOUNTY_TOOL_PLAN:
+        for tool_id in plan_tools:
             policy_result = evaluate_tool_permission(permissions=permissions, tool_request=tool_requests[tool_id])
             policy_results[tool_id] = policy_result
             emit(
@@ -344,7 +516,7 @@ def _run_bug_bounty_core(
                 {"tool_id": tool_id, "execution_permitted": policy_result["execution_permitted"], "reason_codes": policy_result["reason_codes"]},
             )
 
-        permitted_tools = [tool_id for tool_id in DEFAULT_BUG_BOUNTY_TOOL_PLAN if policy_results[tool_id]["execution_permitted"]]
+        permitted_tools = [tool_id for tool_id in plan_tools if policy_results[tool_id]["execution_permitted"]]
         if not permitted_tools:
             run_store.transition(
                 run_id=run_id, new_status="blocked", current_stage="tool_policy", completed_at=active_clock(),
@@ -422,11 +594,22 @@ def _run_bug_bounty_core(
         executed_tools: list[str] = []
         detected_technologies: list[str] = []
 
-        needs_scope = "http_assessor" in permitted_tools or "crawler" in permitted_tools
+        needs_scope = (
+            "http_assessor" in permitted_tools or "crawler" in permitted_tools or "katana" in permitted_tools
+        )
         scope = None
-        active_transport = transport if transport is not None else BugBountyHttpTransport()
+        if transport is not None:
+            active_transport = transport
+        elif is_external:
+            # The real SSRF destination check (see
+            # adapters.bug_bounty_http's module docstring) -- never the
+            # Demo Mode default, since an Authorized External Target can
+            # be any operator-declared hostname.
+            active_transport = BugBountyHttpTransport(allow_private_destinations=False)
+        else:
+            active_transport = BugBountyHttpTransport()
         if needs_scope:
-            scope = create_bug_bounty_scope(
+            scope = bug_bounty_scope if is_external else create_bug_bounty_scope(
                 target=execution_target, target_type="web_application", allowed_origins=[permissions["target_origin"]],
                 allowed_paths=["/"], excluded_paths=[], testing_profile="safe_active",
             )
@@ -452,6 +635,35 @@ def _run_bug_bounty_core(
             )
             source_results.append({"source_tool": "http_assessor", "result": assessment_result})
             executed_tools.append("http_assessor")
+
+        if "httpx" in permitted_tools:
+            emit("tool_started", "tool_execution", "bug_bounty_assessment", f"Running httpx against {execution_target}")
+            httpx_execution_result = execute_tool(
+                permissions=permissions, tool_request=tool_requests["httpx"], governor_result=governor_result,
+                execution_config=_HTTPX_EXECUTION_CONFIG, detected_technologies=detected_technologies,
+            )
+            httpx_tool_result = httpx_execution_result["tool_result"]
+            if httpx_execution_result["execution_performed"]:
+                executed_tools.append("httpx")
+                enrichment = httpx_tool_result["observations"][0] if httpx_tool_result["observations"] else None
+                run_store.update_fields(
+                    run_id=run_id,
+                    http_enrichment={
+                        "http_enrichment_version": "1", "status": httpx_tool_result["status"],
+                        "target": execution_target, "enrichment": enrichment,
+                    },
+                )
+                emit(
+                    "tool_completed", "tool_execution", "bug_bounty_assessment",
+                    f"httpx completed: status={httpx_tool_result['status']}, reachable={bool(enrichment and enrichment.get('reachable'))}.",
+                    {"tool_id": "httpx", "status": httpx_tool_result["status"]},
+                )
+            else:
+                reason = httpx_execution_result["execution_blocked_reason"] or (httpx_tool_result.get("status") if httpx_tool_result else "unknown")
+                emit(
+                    "tool_failed", "tool_execution", "bug_bounty_assessment",
+                    f"httpx did not execute: {reason}.", {"tool_id": "httpx", "reason": str(reason)},
+                )
 
         if "crawler" in permitted_tools:
             emit("tool_started", "tool_execution", "bug_bounty_crawler", f"Running crawler against {execution_target}")
@@ -507,6 +719,39 @@ def _run_bug_bounty_core(
                     },
                 )
                 executed_tools.append("crawler")
+
+        if "katana" in permitted_tools:
+            emit("tool_started", "tool_execution", "bug_bounty_assessment", f"Running katana against {execution_target}")
+            katana_execution_result = execute_tool(
+                permissions=permissions, tool_request=tool_requests["katana"], governor_result=governor_result,
+                execution_config=_KATANA_EXECUTION_CONFIG, detected_technologies=detected_technologies,
+            )
+            katana_tool_result = katana_execution_result["tool_result"]
+            if katana_execution_result["execution_performed"]:
+                executed_tools.append("katana")
+                current_attack_surface = run_store.get_run(run_id=run_id).get("attack_surface")
+                merged_surface = _merge_katana_discoveries_into_attack_surface(
+                    attack_surface=current_attack_surface,
+                    katana_observations=katana_tool_result["observations"],
+                    scope=scope,
+                )
+                run_store.update_fields(run_id=run_id, attack_surface=merged_surface)
+                emit(
+                    "tool_completed", "tool_execution", "bug_bounty_assessment",
+                    f"katana completed: status={katana_tool_result['status']}, "
+                    f"{merged_surface['katana_contributed_count']} new in-scope endpoint(s) merged.",
+                    {
+                        "tool_id": "katana", "status": katana_tool_result["status"],
+                        "katana_contributed_count": merged_surface["katana_contributed_count"],
+                        "endpoint_limit_reached": katana_tool_result.get("endpoint_limit_reached", False),
+                    },
+                )
+            else:
+                reason = katana_execution_result["execution_blocked_reason"] or (katana_tool_result.get("status") if katana_tool_result else "unknown")
+                emit(
+                    "tool_failed", "tool_execution", "bug_bounty_assessment",
+                    f"katana did not execute: {reason}.", {"tool_id": "katana", "reason": str(reason)},
+                )
 
         for tool_id in ("nmap", "nuclei", "zap"):
             if tool_id not in permitted_tools:
@@ -584,7 +829,7 @@ def _run_bug_bounty_core(
             correlation_result=correlation_result, evidence_records=evidence_records, target=target,
             scope=permissions["target_origin"], testing_profile="safe_active",
             assessment_started_at=assessment_started_at, assessment_completed_at=assessment_completed_at,
-            tools_requested=list(DEFAULT_BUG_BOUNTY_TOOL_PLAN), tools_permitted=permitted_tools,
+            tools_requested=list(plan_tools), tools_permitted=permitted_tools,
             tools_executed=executed_tools, tools_unavailable=tools_unavailable,
         )
         for finding in report["canonical_findings"]:
@@ -683,6 +928,64 @@ def run_bug_bounty_workflow(
     emit(
         "run_completed", "complete", "orchestrator",
         f"Bug Bounty run complete: {len(report['canonical_findings'])} canonical findings.",
+        {"canonical_finding_count": len(report["canonical_findings"])},
+    )
+
+
+def run_authorized_external_target_workflow(
+    *,
+    run_id: str,
+    target: str,
+    scope_bundle: Mapping[str, Any],
+    run_store: RunStore,
+    event_bus: EventBus,
+    clock: Callable[[], str] | None = None,
+    transport: Any = None,
+    execute_tool: Callable[..., dict[str, Any]] = execute_bug_bounty_tool,
+) -> None:
+    """Run one real, bounded Authorized External Target assessment
+    against `target` -- the Final Pre-Release Block's operator-scoped
+    equivalent of `run_bug_bounty_workflow`, for a target that is
+    **not** the fixed Demo Mode alias.
+
+    `scope_bundle` must be exactly `backend.models.
+    validate_authorized_external_target_scope`'s own return value --
+    this function never re-derives or weakens it, and never accepts a
+    caller-supplied scope shaped any other way. `operator_scope_
+    acknowledged` inside it is a caller/operator assertion only (see
+    that function's own docstring) -- this function never treats it as
+    proof of legal authorization.
+
+    Every proposed request this run makes is still independently
+    re-evaluated against the real `core.bug_bounty_scope.
+    evaluate_bug_bounty_request_scope` before being sent (exactly like
+    Demo Mode), and the default transport (when `transport` is not
+    injected, e.g. by a test) is `adapters.bug_bounty_http.
+    BugBountyHttpTransport(allow_private_destinations=False)` -- the
+    real SSRF destination-network check. Only tools the operator
+    explicitly listed in `scope_bundle["allowed_tools"]` can ever
+    become policy-permitted; the existing Governor evaluation applies
+    exactly as strictly as it does for a Demo Mode run -- there is no
+    `external_mode = bypass_scope` shortcut anywhere in this path.
+
+    This function is a thin wrapper around `_run_bug_bounty_core`,
+    exactly like `run_bug_bounty_workflow` -- see that function's own
+    docstring for the shared completion/threading semantics.
+    """
+    active_clock = clock or _default_clock
+    emit = _Emitter(run_id=run_id, event_bus=event_bus, clock=active_clock)
+
+    report = _run_bug_bounty_core(
+        run_id=run_id, target=target, run_store=run_store, event_bus=event_bus, active_clock=active_clock,
+        emit=emit, transport=transport, execute_tool=execute_tool, external_scope_bundle=scope_bundle,
+    )
+    if report is None:
+        return
+
+    run_store.transition(run_id=run_id, new_status="completed", current_stage="complete", completed_at=active_clock())
+    emit(
+        "run_completed", "complete", "orchestrator",
+        f"Authorized External Target run complete: {len(report['canonical_findings'])} canonical findings.",
         {"canonical_finding_count": len(report["canonical_findings"])},
     )
 
@@ -976,6 +1279,7 @@ def run_security_lifecycle_workflow(
     execute_tool: Callable[..., dict[str, Any]] = execute_bug_bounty_tool,
     available_telemetry: Any = (),
     detection_llm_proposals: Any = None,
+    external_scope_bundle: Mapping[str, Any] | None = None,
 ) -> None:
     """Run one real, bounded, local-only Full Security Lifecycle
     assessment: the exact same Bug Bounty phase `run_bug_bounty_workflow`
@@ -1001,6 +1305,16 @@ def run_security_lifecycle_workflow(
     Every dashboard-visible stage state is backed by a real recorded
     event/result -- this function never marks a stage `"done"` merely
     because the run itself reached a terminal status.
+
+    `external_scope_bundle` (default `None`) mirrors
+    `run_authorized_external_target_workflow`'s own parameter of the
+    same shape -- when supplied, the Bug Bounty phase runs against an
+    operator-declared Authorized External Target (never the Demo Mode
+    alias) exactly as strictly scoped/policy-gated/SSRF-checked as that
+    function's own standalone run; downstream Context Prioritization /
+    Threat Intel / Threat Hunt / Detection Engineering / Red Validation
+    / Purple Remediation review then runs identically regardless of
+    which target mode produced the underlying canonical findings.
     """
     active_clock = clock or _default_clock
     emit = _Emitter(run_id=run_id, event_bus=event_bus, clock=active_clock)
@@ -1010,6 +1324,7 @@ def run_security_lifecycle_workflow(
     report = _run_bug_bounty_core(
         run_id=run_id, target=target, run_store=run_store, event_bus=event_bus, active_clock=active_clock,
         emit=emit, transport=transport, env=env, execute_tool=execute_tool,
+        external_scope_bundle=external_scope_bundle,
     )
     if report is None:
         return

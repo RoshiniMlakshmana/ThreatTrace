@@ -96,6 +96,8 @@ from types import MappingProxyType
 from typing import Any
 
 from adapters.bug_bounty_burp import BugBountyBurpAdapterError, run_burp_scan
+from adapters.bug_bounty_httpx import BugBountyHttpxAdapterError, run_httpx_scan
+from adapters.bug_bounty_katana import BugBountyKatanaAdapterError, run_katana_scan
 from adapters.bug_bounty_nmap import BugBountyNmapAdapterError, run_nmap_scan
 from adapters.bug_bounty_nuclei import BugBountyNucleiAdapterError, run_nuclei_scan
 from adapters.bug_bounty_zap import BugBountyZapAdapterError, run_zap_scan
@@ -207,6 +209,26 @@ def _run_zap_adapter(
     )
 
 
+def _run_httpx_adapter(
+    *, tool_request: Mapping[str, Any], execution_config: Mapping[str, Any], detected_technologies: Any = None,
+) -> dict[str, Any]:
+    return run_httpx_scan(
+        target=tool_request["target"],
+        request_id=tool_request["request_id"],
+        execution_config=execution_config,
+    )
+
+
+def _run_katana_adapter(
+    *, tool_request: Mapping[str, Any], execution_config: Mapping[str, Any], detected_technologies: Any = None,
+) -> dict[str, Any]:
+    return run_katana_scan(
+        target=tool_request["target"],
+        request_id=tool_request["request_id"],
+        execution_config=execution_config,
+    )
+
+
 def _run_burp_adapter(
     *, tool_request: Mapping[str, Any], execution_config: Mapping[str, Any], detected_technologies: Any = None,
 ) -> dict[str, Any]:
@@ -222,10 +244,13 @@ _ADAPTER_REGISTRY: Mapping[str, Any] = MappingProxyType({
     "nuclei": _run_nuclei_adapter,
     "zap": _run_zap_adapter,
     "burp_dast": _run_burp_adapter,
+    "httpx": _run_httpx_adapter,
+    "katana": _run_katana_adapter,
 })
 
 _ADAPTER_ERRORS = (
     BugBountyNmapAdapterError, BugBountyNucleiAdapterError, BugBountyZapAdapterError, BugBountyBurpAdapterError,
+    BugBountyHttpxAdapterError, BugBountyKatanaAdapterError,
 )
 
 

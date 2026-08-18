@@ -299,9 +299,11 @@ class TestGovernorGate:
 
 
 class TestClosedAdapterRegistry:
-    def test_017_registry_contains_only_nmap_nuclei_zap_burp_dast(self):
+    def test_017_registry_contains_only_registered_real_adapters(self):
         import core.bug_bounty_tool_execution as execution_module
-        assert set(execution_module._ADAPTER_REGISTRY.keys()) == {"nmap", "nuclei", "zap", "burp_dast"}
+        assert set(execution_module._ADAPTER_REGISTRY.keys()) == {
+            "nmap", "nuclei", "zap", "burp_dast", "httpx", "katana",
+        }
 
     def test_018_http_assessor_not_registered_reports_no_adapter_registered(self, monkeypatch):
         import core.bug_bounty_tool_execution as execution_module
@@ -662,4 +664,88 @@ class TestZapAndBurpRegistryEntries:
         )
         assert result["execution_permitted"] is False
         assert result["execution_blocked_reason"] == "GOVERNOR_DENIED"
+        assert spy["called"] is False
+
+
+# ---------------------------------------------------------------------------
+# Final Pre-Release Block: httpx/katana registry entries.
+# ---------------------------------------------------------------------------
+
+
+def _fake_httpx_result(**overrides):
+    result = {
+        "tool_result_version": "1", "tool_id": "httpx", "request_id": "REQ-1", "target": "http://localhost:3000/",
+        "status": "completed", "observations": [], "evidence_references": [], "network_requests_performed": 1,
+        "output_truncated": False, "error_detail": None, "execution_performed": True,
+    }
+    result.update(overrides)
+    return result
+
+
+def _fake_katana_result(**overrides):
+    result = {
+        "tool_result_version": "1", "tool_id": "katana", "request_id": "REQ-1", "target": "http://localhost:3000/",
+        "status": "completed", "observations": [], "evidence_references": [], "network_requests_performed": None,
+        "output_truncated": False, "endpoint_limit_reached": False, "error_detail": None, "execution_performed": True,
+    }
+    result.update(overrides)
+    return result
+
+
+class TestHttpxAndKatanaRegistryEntries:
+    def test_033_httpx_permitted_execution_calls_httpx_adapter(self, monkeypatch):
+        import core.bug_bounty_tool_execution as execution_module
+        monkeypatch.setattr(execution_module, "run_httpx_scan", lambda **kw: _fake_httpx_result())
+
+        permissions = _permissions(testing_profile="passive", allowed_tools=["http_assessor", "httpx"])
+        request = _tool_request(tool_id="httpx", testing_mode="passive", target="http://localhost:3000/", ports=[], paths=["/"])
+        result = execute_bug_bounty_tool(
+            permissions=permissions, tool_request=request, governor_result=_governor_result(),
+            execution_config=_execution_config(),
+        )
+        assert result["execution_permitted"] is True
+        assert result["tool_result"]["tool_id"] == "httpx"
+
+    def test_034_katana_permitted_execution_calls_katana_adapter(self, monkeypatch):
+        import core.bug_bounty_tool_execution as execution_module
+        monkeypatch.setattr(execution_module, "run_katana_scan", lambda **kw: _fake_katana_result())
+
+        permissions = _permissions(testing_profile="passive", allowed_tools=["http_assessor", "katana"])
+        request = _tool_request(tool_id="katana", testing_mode="passive", target="http://localhost:3000/", ports=[], paths=["/"])
+        result = execute_bug_bounty_tool(
+            permissions=permissions, tool_request=request, governor_result=_governor_result(),
+            execution_config=_execution_config(),
+        )
+        assert result["execution_permitted"] is True
+        assert result["tool_result"]["tool_id"] == "katana"
+
+    def test_035_httpx_governor_denied_never_calls_adapter(self, monkeypatch):
+        import core.bug_bounty_tool_execution as execution_module
+        spy = {"called": False}
+        monkeypatch.setattr(execution_module, "run_httpx_scan", lambda **kw: spy.update(called=True))
+
+        permissions = _permissions(testing_profile="passive", allowed_tools=["http_assessor", "httpx"])
+        request = _tool_request(tool_id="httpx", testing_mode="passive", target="http://localhost:3000/", ports=[], paths=["/"])
+        governor_result = _governor_result(decision="block", execution_allowed=False)
+        result = execute_bug_bounty_tool(
+            permissions=permissions, tool_request=request, governor_result=governor_result,
+            execution_config=_execution_config(),
+        )
+        assert result["execution_permitted"] is False
+        assert result["execution_blocked_reason"] == "GOVERNOR_DENIED"
+        assert spy["called"] is False
+
+    def test_036_katana_policy_denied_never_calls_adapter(self, monkeypatch):
+        import core.bug_bounty_tool_execution as execution_module
+        spy = {"called": False}
+        monkeypatch.setattr(execution_module, "run_katana_scan", lambda **kw: spy.update(called=True))
+
+        permissions = _permissions(testing_profile="passive", allowed_tools=["http_assessor"])
+        request = _tool_request(tool_id="katana", testing_mode="passive", target="http://localhost:3000/", ports=[], paths=["/"])
+        result = execute_bug_bounty_tool(
+            permissions=permissions, tool_request=request, governor_result=_governor_result(),
+            execution_config=_execution_config(),
+        )
+        assert result["execution_permitted"] is False
+        assert result["execution_blocked_reason"] == "POLICY_DENIED"
         assert spy["called"] is False

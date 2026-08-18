@@ -7,8 +7,10 @@ from __future__ import annotations
 import pytest
 
 from backend.models import (
+    DEFAULT_EXTERNAL_TARGET_ALLOWED_TOOLS,
     DEMO_TARGET_DISPLAY_ALIAS,
     DEMO_TARGET_ENV_VAR,
+    EXTERNAL_TARGET_ELIGIBLE_TOOL_IDS,
     RUN_STATUSES,
     TERMINAL_STATUSES,
     EventModelError,
@@ -17,8 +19,20 @@ from backend.models import (
     build_event,
     build_run,
     resolve_execution_target,
+    validate_authorized_external_target_scope,
     validate_local_only_target,
 )
+
+
+def _external_scope(**overrides):
+    scope = {
+        "hosts": ["security-test.example.com"],
+        "ports": [443],
+        "path_prefixes": ["/"],
+        "allowed_tools": ["http_assessor", "httpx", "katana"],
+    }
+    scope.update(overrides)
+    return scope
 
 
 class TestBuildRun:
@@ -243,3 +257,178 @@ class TestResolveExecutionTarget:
         # resolve_execution_target call is permitted to see it.
         with pytest.raises(RunModelError, match="INVALID_TARGET"):
             validate_local_only_target("http://juice-shop:3000")
+
+
+class TestValidateAuthorizedExternalTargetScope:
+    def test_030_valid_scope_accepted(self):
+        result = validate_authorized_external_target_scope(
+            target="https://security-test.example.com/", scope=_external_scope(), operator_scope_acknowledged=True,
+        )
+        assert result["bug_bounty_scope"]["target"] == "https://security-test.example.com/"
+        assert result["allowed_tools"] == ["http_assessor", "httpx", "katana"]
+        assert result["operator_scope_acknowledged"] is True
+
+    def test_031_acknowledgment_required(self):
+        with pytest.raises(RunModelError, match="EXTERNAL_SCOPE_NOT_ACKNOWLEDGED"):
+            validate_authorized_external_target_scope(
+                target="https://security-test.example.com/", scope=_external_scope(), operator_scope_acknowledged=False,
+            )
+
+    def test_032_acknowledgment_string_true_rejected(self):
+        # Only the literal boolean True satisfies this -- never a
+        # truthy string, which could arrive from a sloppy client.
+        with pytest.raises(RunModelError, match="EXTERNAL_SCOPE_NOT_ACKNOWLEDGED"):
+            validate_authorized_external_target_scope(
+                target="https://security-test.example.com/", scope=_external_scope(), operator_scope_acknowledged="true",
+            )
+
+    def test_033_missing_scope_field_rejected(self):
+        scope = _external_scope()
+        del scope["ports"]
+        with pytest.raises(RunModelError, match="INVALID_EXTERNAL_SCOPE"):
+            validate_authorized_external_target_scope(
+                target="https://security-test.example.com/", scope=scope, operator_scope_acknowledged=True,
+            )
+
+    def test_034_extra_scope_field_rejected(self):
+        scope = _external_scope()
+        scope["cidr_ranges"] = ["10.0.0.0/8"]
+        with pytest.raises(RunModelError, match="INVALID_EXTERNAL_SCOPE"):
+            validate_authorized_external_target_scope(
+                target="https://security-test.example.com/", scope=scope, operator_scope_acknowledged=True,
+            )
+
+    def test_035_wildcard_host_rejected(self):
+        with pytest.raises(RunModelError, match="EXTERNAL_SCOPE_WILDCARD_NOT_ALLOWED"):
+            validate_authorized_external_target_scope(
+                target="https://security-test.example.com/",
+                scope=_external_scope(hosts=["*.example.com"]),
+                operator_scope_acknowledged=True,
+            )
+
+    def test_036_empty_hosts_rejected(self):
+        with pytest.raises(RunModelError, match="INVALID_EXTERNAL_SCOPE"):
+            validate_authorized_external_target_scope(
+                target="https://security-test.example.com/", scope=_external_scope(hosts=[]), operator_scope_acknowledged=True,
+            )
+
+    def test_037_port_out_of_range_rejected(self):
+        with pytest.raises(RunModelError, match="INVALID_EXTERNAL_SCOPE"):
+            validate_authorized_external_target_scope(
+                target="https://security-test.example.com/", scope=_external_scope(ports=[70000]), operator_scope_acknowledged=True,
+            )
+
+    def test_038_bool_port_rejected(self):
+        with pytest.raises(RunModelError, match="INVALID_EXTERNAL_SCOPE"):
+            validate_authorized_external_target_scope(
+                target="https://security-test.example.com/", scope=_external_scope(ports=[True]), operator_scope_acknowledged=True,
+            )
+
+    def test_039_relative_path_prefix_rejected(self):
+        with pytest.raises(RunModelError, match="INVALID_EXTERNAL_SCOPE"):
+            validate_authorized_external_target_scope(
+                target="https://security-test.example.com/",
+                scope=_external_scope(path_prefixes=["relative"]),
+                operator_scope_acknowledged=True,
+            )
+
+    def test_040_unrecognized_tool_id_rejected(self):
+        with pytest.raises(RunModelError, match="EXTERNAL_SCOPE_TOOL_NOT_PERMITTED"):
+            validate_authorized_external_target_scope(
+                target="https://security-test.example.com/",
+                scope=_external_scope(allowed_tools=["nikto"]),
+                operator_scope_acknowledged=True,
+            )
+
+    def test_041_authenticated_testing_not_permitted_via_this_endpoint(self):
+        with pytest.raises(RunModelError, match="EXTERNAL_SCOPE_TOOL_NOT_PERMITTED"):
+            validate_authorized_external_target_scope(
+                target="https://security-test.example.com/",
+                scope=_external_scope(allowed_tools=["authenticated_testing"]),
+                operator_scope_acknowledged=True,
+            )
+
+    def test_042_target_host_not_in_scope_hosts_rejected(self):
+        with pytest.raises(RunModelError, match="INVALID_EXTERNAL_TARGET"):
+            validate_authorized_external_target_scope(
+                target="https://other-host.example.com/", scope=_external_scope(), operator_scope_acknowledged=True,
+            )
+
+    def test_043_target_port_not_in_scope_ports_rejected(self):
+        with pytest.raises(RunModelError, match="INVALID_EXTERNAL_TARGET"):
+            validate_authorized_external_target_scope(
+                target="https://security-test.example.com:8443/",
+                scope=_external_scope(),
+                operator_scope_acknowledged=True,
+            )
+
+    def test_044_raw_ip_target_rejected(self):
+        with pytest.raises(RunModelError):
+            validate_authorized_external_target_scope(
+                target="https://93.184.216.34/", scope=_external_scope(hosts=["93.184.216.34"]), operator_scope_acknowledged=True,
+            )
+
+    def test_045_non_http_scheme_rejected(self):
+        with pytest.raises(RunModelError, match="INVALID_TARGET"):
+            validate_authorized_external_target_scope(
+                target="ftp://security-test.example.com/", scope=_external_scope(), operator_scope_acknowledged=True,
+            )
+
+    def test_046_javascript_scheme_rejected(self):
+        with pytest.raises(RunModelError, match="INVALID_TARGET"):
+            validate_authorized_external_target_scope(
+                target="javascript:alert(1)", scope=_external_scope(), operator_scope_acknowledged=True,
+            )
+
+    def test_047_non_default_port_reflected_in_allowed_origins(self):
+        result = validate_authorized_external_target_scope(
+            target="https://security-test.example.com:8443/",
+            scope=_external_scope(ports=[8443], path_prefixes=["/app"]),
+            operator_scope_acknowledged=True,
+        )
+        assert "https://security-test.example.com:8443" in result["bug_bounty_scope"]["allowed_origins"]
+
+    def test_048_multiple_hosts_and_ports_produce_cartesian_origins(self):
+        result = validate_authorized_external_target_scope(
+            target="https://a.example.com/",
+            scope=_external_scope(hosts=["a.example.com", "b.example.com"], ports=[443, 8443]),
+            operator_scope_acknowledged=True,
+        )
+        origins = set(result["bug_bounty_scope"]["allowed_origins"])
+        assert origins == {
+            "https://a.example.com", "https://a.example.com:8443",
+            "https://b.example.com", "https://b.example.com:8443",
+        }
+
+    def test_049_path_prefixes_become_allowed_paths(self):
+        result = validate_authorized_external_target_scope(
+            target="https://security-test.example.com/",
+            scope=_external_scope(path_prefixes=["/app", "/api"]),
+            operator_scope_acknowledged=True,
+        )
+        assert result["bug_bounty_scope"]["allowed_paths"] == ["/app", "/api"]
+
+    def test_050_default_external_target_allowed_tools_is_conservative(self):
+        assert DEFAULT_EXTERNAL_TARGET_ALLOWED_TOOLS == ("http_assessor", "httpx", "katana")
+        for tool_id in DEFAULT_EXTERNAL_TARGET_ALLOWED_TOOLS:
+            assert tool_id in EXTERNAL_TARGET_ELIGIBLE_TOOL_IDS
+
+    def test_051_nmap_nuclei_zap_are_eligible_but_not_default(self):
+        for tool_id in ("nmap", "nuclei", "zap", "burp_dast"):
+            assert tool_id in EXTERNAL_TARGET_ELIGIBLE_TOOL_IDS
+            assert tool_id not in DEFAULT_EXTERNAL_TARGET_ALLOWED_TOOLS
+
+    def test_052_scope_never_mutated(self):
+        scope = _external_scope()
+        original = dict(scope)
+        validate_authorized_external_target_scope(
+            target="https://security-test.example.com/", scope=scope, operator_scope_acknowledged=True,
+        )
+        assert scope == original
+
+    def test_053_returns_new_dict_not_reusing_scope_object(self):
+        scope = _external_scope()
+        result = validate_authorized_external_target_scope(
+            target="https://security-test.example.com/", scope=scope, operator_scope_acknowledged=True,
+        )
+        assert result["allowed_tools"] is not scope["allowed_tools"]

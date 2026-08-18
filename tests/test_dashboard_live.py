@@ -835,3 +835,284 @@ class TestLifecycleRefreshFix:
         run = self._awaiting_review_run()
         calls = self._fetch_after_event(dashboard_script, run, "tool_completed")
         assert not any("/api/runs/RUN-test" in c for c in calls)
+
+
+# ---------------------------------------------------------------------------
+# Final Pre-Release Block: explainability features (AI Activity panel,
+# httpx enrichment, Attack Surface human summary, finding CWE/OWASP/
+# CVE/ATT&CK columns, Target Mode selector, external-target UI).
+# ---------------------------------------------------------------------------
+
+
+def _render_element(dashboard_script, element_id, fn_call):
+    expr = f"""(function() {{
+        const captured = {{ html: null }};
+        const real = document.getElementById;
+        document.getElementById = (id) => {{
+            if (id === {json.dumps(element_id)}) {{
+                const el = {{ set innerHTML(v) {{ captured.html = v; }}, get innerHTML() {{ return captured.html; }} }};
+                return el;
+            }}
+            return real(id);
+        }};
+        {fn_call};
+        document.getElementById = real;
+        return captured.html;
+    }})()"""
+    return _eval_js(dashboard_script, expr)
+
+
+class TestTargetModeAndExternalTargetUI:
+    def test_001_target_mode_selector_present(self, dashboard_html):
+        assert 'id="target-mode"' in dashboard_html
+        assert "Demo — OWASP Juice Shop" in dashboard_html
+        assert "Authorized External Target" in dashboard_html
+
+    def test_002_external_target_form_fields_present(self, dashboard_html):
+        for field_id in ("ext-target", "ext-hosts", "ext-ports", "ext-paths", "ext-ack"):
+            assert f'id="{field_id}"' in dashboard_html
+
+    def test_003_default_tool_selection_matches_recommended_conservative_default(self, dashboard_html):
+        assert 'id="ext-tool-http_assessor" checked disabled' in dashboard_html
+        assert 'id="ext-tool-httpx" checked' in dashboard_html
+        assert 'id="ext-tool-katana" checked' in dashboard_html
+
+    def test_004_scanners_opt_in_not_checked_by_default(self, dashboard_html):
+        import re
+
+        for tool_id in ("nmap", "nuclei", "zap"):
+            match = re.search(rf'id="ext-tool-{tool_id}"[^>]*>', dashboard_html)
+            assert match is not None
+            assert "checked" not in match.group(0)
+
+    def test_005_acknowledgment_wording_present(self, dashboard_html):
+        assert "I am providing the scope for a system I am authorized to test." in dashboard_html
+
+    def test_006_acknowledgment_labeled_as_assertion_not_proof(self, dashboard_html):
+        lowered = dashboard_html.lower()
+        assert "operator assertion only" in lowered
+        assert "does not verify or establish legal authorization" in lowered
+
+    def test_007_missing_acknowledgment_blocks_submission_client_side(self, dashboard_script):
+        script = _NODE_STUBS + dashboard_script + """
+(function() {
+    let alerted = null;
+    global.alert = (msg) => { alerted = msg; };
+    document.getElementById = (id) => {
+        const values = {
+            "ext-ack": { checked: false },
+            "ext-target": { value: "https://security-test.example.com/" },
+            "ext-hosts": { value: "security-test.example.com" },
+            "ext-ports": { value: "443" },
+            "ext-paths": { value: "/" },
+        };
+        return values[id] || fakeElement();
+    };
+    const result = _buildExternalTargetBody();
+    console.log(JSON.stringify({ result, alerted }));
+})();
+"""
+        outcome = json.loads(_run_node(script))
+        assert outcome["result"] is None
+        assert "authorized to test" in outcome["alerted"]
+
+    def test_008_katana_discovery_source_label_present_for_new_source(self, dashboard_html):
+        assert '"Katana crawl"' in dashboard_html or "Katana crawl" in dashboard_html
+
+
+class TestAiActivityPanel:
+    def test_009_ai_activity_card_present(self, dashboard_html):
+        assert "M. AI Assistance" in dashboard_html
+        assert 'id="ai-activity-body"' in dashboard_html
+
+    def test_010_bug_bounty_planner_always_says_no_ai(self, dashboard_script):
+        run = _completed_run(lifecycle=None)
+        html = _render_element(dashboard_script, "ai-activity-body", f"renderAiActivity({json.dumps(run)})")
+        assert "Bug Bounty planner" in html
+        assert ">NO<" in html
+        assert "never calls an LLM" in html
+
+    def test_011_detection_planner_says_no_when_telemetry_gap(self, dashboard_script):
+        run = _completed_run(lifecycle={
+            "lifecycle_version": "1", "total_canonical_findings": 1, "findings_selected": ["CF-1"],
+            "results": [{
+                "finding_id": "CF-1",
+                "detection_result": {"outcome": "not_applicable", "reason": "telemetry_gap", "rule": None},
+            }],
+        })
+        html = _render_element(dashboard_script, "ai-activity-body", f"renderAiActivity({json.dumps(run)})")
+        assert "Detection planner (CF-1)" in html
+        assert "telemetry_gap" in html
+
+    def test_012_detection_planner_says_yes_only_with_real_llm_proposal(self, dashboard_script):
+        run = _completed_run(lifecycle={
+            "lifecycle_version": "1", "total_canonical_findings": 1, "findings_selected": ["CF-1"],
+            "results": [{
+                "finding_id": "CF-1",
+                "detection_result": {
+                    "outcome": "candidate_ready", "reason": "rule_generated",
+                    "rule": {"deployment_state": "NOT_DEPLOYED"},
+                },
+            }],
+        })
+        html = _render_element(dashboard_script, "ai-activity-body", f"renderAiActivity({json.dumps(run)})")
+        assert "Detection planner (CF-1)" in html
+        assert ">YES<" in html
+        assert "NOT_DEPLOYED" in html
+
+    def test_013_no_hardcoded_ai_claim_independent_of_data(self, dashboard_script):
+        # Two different runs with different detection reasons must
+        # render different AI-invoked verdicts -- proves the panel is
+        # data-driven, not a hardcoded YES/NO string.
+        run_gap = _completed_run(lifecycle={
+            "lifecycle_version": "1", "total_canonical_findings": 1, "findings_selected": ["CF-1"],
+            "results": [{"finding_id": "CF-1", "detection_result": {"outcome": "not_applicable", "reason": "no_llm_proposal_supplied", "rule": None}}],
+        })
+        run_real = _completed_run(lifecycle={
+            "lifecycle_version": "1", "total_canonical_findings": 1, "findings_selected": ["CF-1"],
+            "results": [{"finding_id": "CF-1", "detection_result": {"outcome": "needs_review", "reason": "syntax_rejected", "rule": {"deployment_state": "NOT_DEPLOYED"}}}],
+        })
+        html_gap = _render_element(dashboard_script, "ai-activity-body", f"renderAiActivity({json.dumps(run_gap)})")
+        html_real = _render_element(dashboard_script, "ai-activity-body", f"renderAiActivity({json.dumps(run_real)})")
+        assert html_gap != html_real
+
+    def test_014_deployment_never_claimed_auto_deployed(self, dashboard_html):
+        assert "auto-deployed" in dashboard_html.lower() or "NOT_DEPLOYED" in dashboard_html
+
+
+class TestArchitectureExplainer:
+    def test_015_card_present(self, dashboard_html):
+        assert "How ThreatTrace Works" in dashboard_html
+
+    def test_016_pipeline_diagram_text_present(self, dashboard_html):
+        for phrase in ("AI proposes/reasons", "Policy checks", "Governor authorizes/blocks", "Deterministic tools execute", "Human reviews"):
+            assert phrase in dashboard_html
+
+    def test_017_uses_details_element_expandable(self, dashboard_html):
+        import re
+
+        match = re.search(r'id="card-architecture".*?</section>', dashboard_html, re.DOTALL)
+        assert match is not None
+        assert "<details>" in match.group(0)
+
+
+class TestHttpEnrichmentCard:
+    def test_018_card_present(self, dashboard_html):
+        assert "N. HTTP Enrichment (httpx)" in dashboard_html
+        assert 'id="http-enrichment-body"' in dashboard_html
+
+    def test_019_no_activity_empty_state(self, dashboard_html):
+        assert "No httpx activity on this run." in dashboard_html
+
+    def test_020_renders_real_enrichment_data(self, dashboard_script):
+        run = _completed_run(http_enrichment={
+            "http_enrichment_version": "1", "status": "completed", "target": "http://localhost:3000/",
+            "enrichment": {
+                "reachable": True, "status_code": 200, "title": "Juice Shop", "content_type": "text/html",
+                "server": "Express", "technologies": ["Express"], "redirect_location": None,
+            },
+        })
+        html = _render_element(dashboard_script, "http-enrichment-body", f"renderHttpEnrichment({json.dumps(run)})")
+        assert "Juice Shop" in html
+        assert "Express" in html
+
+    def test_021_technology_never_labeled_as_vulnerability(self, dashboard_html):
+        import re
+
+        match = re.search(r"function renderHttpEnrichment.*?\n\}", dashboard_html, re.DOTALL)
+        assert match is not None
+        # The only mention of "vulnerability" here is the disclaimer
+        # stating technology detection is NOT a vulnerability claim --
+        # never a labeling pattern like "vulnerability:" or "is a
+        # vulnerability" that would imply one.
+        assert "never a vulnerability claim" in match.group(0).lower()
+        assert "vulnerability:" not in match.group(0).lower()
+        assert "is a vulnerability" not in match.group(0).lower()
+
+
+class TestFindingExplainability:
+    def test_022_cwe_owasp_cve_column_renders(self, dashboard_script):
+        run = _completed_run(report={"canonical_findings": [{
+            "finding_id": "CF-1", "title": "SQL Injection", "technical_severity": "high", "confidence": "high",
+            "tools_used": ["nuclei"], "evidence_sources": [{"source_tool": "nuclei"}], "status": "requires_human_review",
+            "cwe": "CWE-89", "owasp_category": "A03:2021", "cve": ["CVE-2024-1234"], "mitre_attack_mapping": None,
+        }]})
+        html = _render_element(dashboard_script, "findings-body", f"renderFindings({json.dumps(run)})")
+        assert "CWE-89" in html
+        assert "A03:2021" in html
+        assert "CVE-2024-1234" in html
+
+    def test_023_mitre_attck_honestly_not_mapped_when_absent(self, dashboard_script):
+        run = _completed_run(report={"canonical_findings": [{
+            "finding_id": "CF-1", "title": "Missing CSP", "technical_severity": "medium", "confidence": "high",
+            "tools_used": ["http_assessor"], "evidence_sources": [{"source_tool": "http_assessor"}],
+            "status": "requires_human_review", "cwe": None, "owasp_category": None, "cve": [],
+            "mitre_attack_mapping": None,
+        }]})
+        html = _render_element(dashboard_script, "findings-body", f"renderFindings({json.dumps(run)})")
+        assert "Not mapped" in html
+        assert "insufficient behavioral evidence" in html
+
+    def test_024_mitre_attck_never_forced_onto_config_finding(self, dashboard_html):
+        import re
+
+        match = re.search(r"report\.canonical_findings\.map.*?\n  \}\)\.join", dashboard_html, re.DOTALL)
+        assert match is not None
+        assert "f.mitre_attack_mapping" in match.group(0)
+        assert "Not mapped" in match.group(0)
+
+
+class TestAttackSurfaceHumanSummary:
+    def test_025_human_summary_sentence_computed_from_real_counts(self, dashboard_script):
+        run = _completed_run(attack_surface={
+            "attack_surface_version": "1", "status": "completed", "target": "http://localhost:3000/",
+            "endpoints": [
+                {"endpoint_id": "EP-1", "path": "/", "method": "GET", "source": "seed", "fetched": True, "status_code": 200, "is_static_asset": False, "depth": 0},
+                {"endpoint_id": "EP-2", "path": "/styles.css", "method": "GET", "source": "html_link", "fetched": False, "status_code": None, "is_static_asset": True, "depth": 1},
+            ],
+            "parameters": [],
+            "attack_surface_summary": {"endpoint_count": 2, "parameter_count": 0, "form_count": 0, "api_endpoint_count": 0},
+            "telemetry": {},
+        })
+        html = _render_element(dashboard_script, "attack-surface-body", f"renderAttackSurface({json.dumps(run)})")
+        assert "ThreatTrace discovered 2 application resources in this bounded crawl." in html
+        assert "1 was fetched successfully, 1 was static resource" in html
+        assert "No forms, parameters, or API routes were observed" in html
+
+    def test_026_endpoint_what_it_is_column_renders(self, dashboard_script):
+        run = _completed_run(attack_surface={
+            "attack_surface_version": "1", "status": "completed", "target": "http://localhost:3000/",
+            "endpoints": [
+                {"endpoint_id": "EP-1", "path": "/main.js", "method": "GET", "source": "html_link", "fetched": True, "status_code": 200, "is_static_asset": False, "depth": 1},
+            ],
+            "parameters": [],
+            "attack_surface_summary": {"endpoint_count": 1, "parameter_count": 0, "form_count": 0, "api_endpoint_count": 0},
+            "telemetry": {},
+        })
+        html = _render_element(dashboard_script, "attack-surface-body", f"renderAttackSurface({json.dumps(run)})")
+        assert "JavaScript application resource" in html
+
+    def test_027_katana_contribution_mentioned_when_present(self, dashboard_script):
+        run = _completed_run(attack_surface={
+            "attack_surface_version": "1", "status": "completed", "target": "http://localhost:3000/",
+            "endpoints": [
+                {"endpoint_id": "EP-1", "path": "/", "method": "GET", "source": "seed", "fetched": True, "status_code": 200, "is_static_asset": False, "depth": 0},
+                {"endpoint_id": "EP-2", "path": "/rest/products", "method": "GET", "source": "katana", "fetched": True, "status_code": 200, "is_static_asset": False, "depth": None},
+            ],
+            "parameters": [],
+            "attack_surface_summary": {"endpoint_count": 2, "parameter_count": 0, "form_count": 0, "api_endpoint_count": 0},
+            "telemetry": {},
+        })
+        html = _render_element(dashboard_script, "attack-surface-body", f"renderAttackSurface({json.dumps(run)})")
+        assert "Katana discovery crawl" in html
+        assert "Katana crawl" in html  # discovery-source label for the katana row itself
+
+    def test_028_no_fabricated_endpoint_counts_independent_of_data(self, dashboard_script):
+        run_empty = _completed_run(attack_surface={
+            "attack_surface_version": "1", "status": "completed", "target": "http://localhost:3000/",
+            "endpoints": [], "parameters": [],
+            "attack_surface_summary": {"endpoint_count": 0, "parameter_count": 0, "form_count": 0, "api_endpoint_count": 0},
+            "telemetry": {},
+        })
+        html = _render_element(dashboard_script, "attack-surface-body", f"renderAttackSurface({json.dumps(run_empty)})")
+        assert "ThreatTrace discovered 0 application resources" in html

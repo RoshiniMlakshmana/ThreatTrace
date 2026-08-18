@@ -77,6 +77,23 @@ class TestDockerfileSafety:
         text = (REPO_ROOT / "Dockerfile").read_text(encoding="utf-8")
         assert "HEALTHCHECK" in text
 
+    def test_005b_httpx_binary_installed_after_pip_install_not_before(self):
+        # Regression guard for a real bug found during live Docker
+        # validation: the Python `httpx` package (a transitive `mcp`
+        # dependency) installs its own same-named `httpx` console-script
+        # into /usr/local/bin. If the real ProjectDiscovery Go binary is
+        # unzipped to that same path BEFORE `pip install` runs, pip
+        # silently overwrites it with the broken Python CLI shim (which
+        # errors without the `httpx[cli]` extra this project never
+        # installs) -- `runtime.tool_runtime.check_httpx` then reports
+        # `runtime_unavailable` even though a binary is present on PATH.
+        # The httpx/Katana download step must appear strictly after the
+        # `pip install -r requirements.txt` line in the Dockerfile.
+        text = (REPO_ROOT / "Dockerfile").read_text(encoding="utf-8")
+        pip_install_index = text.index("pip install --no-cache-dir -r requirements.txt")
+        httpx_download_index = text.index("/tmp/httpx.zip")
+        assert pip_install_index < httpx_download_index
+
 
 class TestComposeSafety:
     def test_006_no_privileged_or_host_network_mode(self):

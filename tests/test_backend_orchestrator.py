@@ -148,10 +148,13 @@ class TestBugBountyWorkflowOrdering:
         assert events == [
             "run_started", "planner_started", "planner_completed",
             "tool_policy_evaluated", "tool_policy_evaluated", "tool_policy_evaluated",
-            "tool_policy_evaluated", "tool_policy_evaluated",
+            "tool_policy_evaluated", "tool_policy_evaluated", "tool_policy_evaluated",
+            "tool_policy_evaluated",
             "governor_evaluated",
             "tool_started", "tool_completed", "http_assessment_completed",
+            "tool_started", "tool_failed",  # httpx
             "tool_started", "tool_completed",  # crawler
+            "tool_started", "tool_failed",  # katana
             "tool_started", "tool_failed",  # nmap
             "tool_started", "tool_failed",  # nuclei
             "tool_started", "tool_completed",  # zap
@@ -162,7 +165,7 @@ class TestBugBountyWorkflowOrdering:
         final = store.get_run(run_id=run["run_id"])
         assert final["status"] == "completed"
         assert final["report"] is not None
-        assert final["requested_tools"] == ["http_assessor", "crawler", "nmap", "nuclei", "zap"]
+        assert final["requested_tools"] == ["http_assessor", "httpx", "crawler", "katana", "nmap", "nuclei", "zap"]
         assert final["executed_tools"] == ["http_assessor", "crawler", "zap"]
 
     def test_001b_tool_unavailable_never_fabricates_execution(self):
@@ -177,7 +180,7 @@ class TestBugBountyWorkflowOrdering:
         assert final["executed_tools"] == ["http_assessor", "crawler"]
         events = bus.get_events(run_id=run["run_id"])
         failed_tools = {e["sanitized_payload"]["tool_id"] for e in events if e["event_type"] == "tool_failed"}
-        assert failed_tools == {"nmap", "nuclei", "zap"}
+        assert failed_tools == {"httpx", "katana", "nmap", "nuclei", "zap"}
 
     def test_002_slot_released_after_completion(self):
         store = RunStore()
@@ -1124,3 +1127,352 @@ class TestSecurityLifecycleWorkflow:
         assert source.count("def _run_bug_bounty_core(") == 1
         assert "_run_bug_bounty_core(" in inspect.getsource(orchestrator.run_bug_bounty_workflow)
         assert "_run_bug_bounty_core(" in inspect.getsource(orchestrator.run_security_lifecycle_workflow)
+
+
+# ---------------------------------------------------------------------------
+# Final Pre-Release Block: httpx enrichment / Katana discovery wiring.
+# ---------------------------------------------------------------------------
+
+
+_HTTPX_OBSERVATION = {
+    "type": "http_enrichment", "reachable": True, "url": "http://localhost:3000/", "status_code": 200,
+    "title": "Juice Shop", "content_type": "text/html", "server": "Express", "technologies": ["Express"],
+    "redirect_location": None, "scheme": "http", "host": "localhost", "port": 3000, "failed": False,
+}
+
+
+def _fake_execute_tool_httpx_katana(*, permissions, tool_request, governor_result, execution_config, detected_technologies=None):
+    """httpx/katana genuinely 'execute' with real-shaped observations;
+    every other tool honestly reports unavailable -- isolates the new
+    wiring under test from nmap/nuclei/zap's own already-covered paths."""
+    tool_id = tool_request["tool_id"]
+    if tool_id == "httpx":
+        return {
+            "tool_execution_version": "1", "request_id": tool_request["request_id"], "tool_id": tool_id,
+            "execution_permitted": True, "execution_blocked_reason": None,
+            "permission_result": None, "governor_decision": governor_result["decision"],
+            "tool_result": {
+                "tool_result_version": "1", "tool_id": "httpx", "status": "completed",
+                "observations": [_HTTPX_OBSERVATION], "evidence_references": ["httpx_json_sha256:" + "a" * 64],
+                "network_requests_performed": 1, "output_truncated": False, "error_detail": None,
+                "execution_performed": True,
+            },
+            "execution_performed": True,
+        }
+    if tool_id == "katana":
+        observations = [
+            {"type": "discovered_url", "url": "http://localhost:3000/rest/products", "method": "GET", "source": "body", "status_code": 200, "parameter_names": None},
+            {"type": "discovered_url", "url": "http://evil.example.com/steal", "method": "GET", "source": "body", "status_code": 200, "parameter_names": None},
+        ]
+        return {
+            "tool_execution_version": "1", "request_id": tool_request["request_id"], "tool_id": tool_id,
+            "execution_permitted": True, "execution_blocked_reason": None,
+            "permission_result": None, "governor_decision": governor_result["decision"],
+            "tool_result": {
+                "tool_result_version": "1", "tool_id": "katana", "status": "completed",
+                "observations": observations, "evidence_references": ["katana_json_sha256:" + "a" * 64],
+                "network_requests_performed": None, "output_truncated": False, "endpoint_limit_reached": False,
+                "error_detail": None, "execution_performed": True,
+            },
+            "execution_performed": True,
+        }
+    return _fake_execute_tool_unavailable(
+        permissions=permissions, tool_request=tool_request, governor_result=governor_result,
+        execution_config=execution_config,
+    )
+
+
+class TestHttpxKatanaWiring:
+    def test_H1_httpx_success_stores_http_enrichment_on_run(self):
+        store = RunStore()
+        bus = EventBus()
+        run = store.create_run(run_type="bug_bounty", created_at="t0")
+        orchestrator.run_bug_bounty_workflow(
+            run_id=run["run_id"], target="http://localhost:3000/", run_store=store, event_bus=bus,
+            clock=_clock_factory(), transport=_FakeTransport(), execute_tool=_fake_execute_tool_httpx_katana,
+        )
+        final = store.get_run(run_id=run["run_id"])
+        assert final["http_enrichment"] is not None
+        assert final["http_enrichment"]["status"] == "completed"
+        assert final["http_enrichment"]["enrichment"]["technologies"] == ["Express"]
+        assert "httpx" in final["executed_tools"]
+
+    def test_H2_httpx_unavailable_leaves_http_enrichment_none(self):
+        store = RunStore()
+        bus = EventBus()
+        run = store.create_run(run_type="bug_bounty", created_at="t0")
+        orchestrator.run_bug_bounty_workflow(
+            run_id=run["run_id"], target="http://localhost:3000/", run_store=store, event_bus=bus,
+            clock=_clock_factory(), transport=_FakeTransport(), execute_tool=_fake_execute_tool_unavailable,
+        )
+        final = store.get_run(run_id=run["run_id"])
+        assert final["http_enrichment"] is None
+
+    def test_H3_httpx_never_contributes_to_canonical_findings(self):
+        store = RunStore()
+        bus = EventBus()
+        run = store.create_run(run_type="bug_bounty", created_at="t0")
+        orchestrator.run_bug_bounty_workflow(
+            run_id=run["run_id"], target="http://localhost:3000/", run_store=store, event_bus=bus,
+            clock=_clock_factory(), transport=_FakeTransport(), execute_tool=_fake_execute_tool_httpx_katana,
+        )
+        final = store.get_run(run_id=run["run_id"])
+        for finding in final["report"]["canonical_findings"]:
+            assert "httpx" not in finding["tools_used"]
+
+    def test_H4_katana_in_scope_url_merged_into_attack_surface(self):
+        store = RunStore()
+        bus = EventBus()
+        run = store.create_run(run_type="bug_bounty", created_at="t0")
+        orchestrator.run_bug_bounty_workflow(
+            run_id=run["run_id"], target="http://localhost:3000/", run_store=store, event_bus=bus,
+            clock=_clock_factory(), transport=_FakeTransport(), execute_tool=_fake_execute_tool_httpx_katana,
+        )
+        final = store.get_run(run_id=run["run_id"])
+        katana_endpoints = [e for e in final["attack_surface"]["endpoints"] if e["source"] == "katana"]
+        assert any(e["path"] == "/rest/products" for e in katana_endpoints)
+
+    def test_H5_katana_out_of_scope_url_never_merged(self):
+        # http://evil.example.com is not the scoped target's own origin
+        # -- real evaluate_bug_bounty_request_scope must reject it, and
+        # it must never appear in the attack surface regardless of what
+        # Katana itself reported.
+        store = RunStore()
+        bus = EventBus()
+        run = store.create_run(run_type="bug_bounty", created_at="t0")
+        orchestrator.run_bug_bounty_workflow(
+            run_id=run["run_id"], target="http://localhost:3000/", run_store=store, event_bus=bus,
+            clock=_clock_factory(), transport=_FakeTransport(), execute_tool=_fake_execute_tool_httpx_katana,
+        )
+        final = store.get_run(run_id=run["run_id"])
+        all_urls = [e["canonical_url"] for e in final["attack_surface"]["endpoints"]]
+        assert not any("evil.example.com" in url for url in all_urls)
+
+    def test_H6_katana_endpoints_merge_alongside_crawler_endpoints(self):
+        store = RunStore()
+        bus = EventBus()
+        run = store.create_run(run_type="bug_bounty", created_at="t0")
+        orchestrator.run_bug_bounty_workflow(
+            run_id=run["run_id"], target="http://localhost:3000/", run_store=store, event_bus=bus,
+            clock=_clock_factory(), transport=_FakeTransport(), execute_tool=_fake_execute_tool_httpx_katana,
+        )
+        final = store.get_run(run_id=run["run_id"])
+        sources = {e["source"] for e in final["attack_surface"]["endpoints"]}
+        assert "seed" in sources  # the crawler's own always-registered seed entry
+        assert "katana" in sources
+
+    def test_H7_katana_never_contributes_to_canonical_findings(self):
+        store = RunStore()
+        bus = EventBus()
+        run = store.create_run(run_type="bug_bounty", created_at="t0")
+        orchestrator.run_bug_bounty_workflow(
+            run_id=run["run_id"], target="http://localhost:3000/", run_store=store, event_bus=bus,
+            clock=_clock_factory(), transport=_FakeTransport(), execute_tool=_fake_execute_tool_httpx_katana,
+        )
+        final = store.get_run(run_id=run["run_id"])
+        for finding in final["report"]["canonical_findings"]:
+            assert "katana" not in finding["tools_used"]
+
+    def test_H8_katana_unavailable_leaves_attack_surface_from_crawler_only(self):
+        store = RunStore()
+        bus = EventBus()
+        run = store.create_run(run_type="bug_bounty", created_at="t0")
+        orchestrator.run_bug_bounty_workflow(
+            run_id=run["run_id"], target="http://localhost:3000/", run_store=store, event_bus=bus,
+            clock=_clock_factory(), transport=_FakeTransport(), execute_tool=_fake_execute_tool_unavailable,
+        )
+        final = store.get_run(run_id=run["run_id"])
+        sources = {e["source"] for e in final["attack_surface"]["endpoints"]}
+        assert "katana" not in sources
+
+    def test_H9_default_plan_includes_httpx_and_katana_in_pipeline_order(self):
+        assert list(orchestrator.DEFAULT_BUG_BOUNTY_TOOL_PLAN) == [
+            "http_assessor", "httpx", "crawler", "katana", "nmap", "nuclei", "zap",
+        ]
+
+    def test_H10_httpx_execution_config_within_its_own_adapter_ceiling(self):
+        # Regression guard for a real bug found during this block's own
+        # live Docker validation: httpx/Katana each enforce a tighter
+        # execution_config ceiling than the shared _EXECUTION_CONFIG
+        # nmap/zap use -- passing the shared config to either adapter
+        # exceeded its ceiling and was rejected (ADAPTER_REJECTED_REQUEST)
+        # before a single real httpx/katana process ever started.
+        from adapters.bug_bounty_httpx import MAX_OUTPUT_BYTES as HTTPX_MAX_BYTES
+        from adapters.bug_bounty_httpx import MAX_PROCESS_TIMEOUT_SECONDS as HTTPX_MAX_TIMEOUT
+        from adapters.bug_bounty_katana import MAX_OUTPUT_BYTES as KATANA_MAX_BYTES
+        from adapters.bug_bounty_katana import MAX_PROCESS_TIMEOUT_SECONDS as KATANA_MAX_TIMEOUT
+
+        assert orchestrator._HTTPX_EXECUTION_CONFIG["process_timeout_seconds"] <= HTTPX_MAX_TIMEOUT
+        assert orchestrator._HTTPX_EXECUTION_CONFIG["max_output_bytes"] <= HTTPX_MAX_BYTES
+        assert orchestrator._KATANA_EXECUTION_CONFIG["process_timeout_seconds"] <= KATANA_MAX_TIMEOUT
+        assert orchestrator._KATANA_EXECUTION_CONFIG["max_output_bytes"] <= KATANA_MAX_BYTES
+
+    def test_H11_httpx_real_execution_config_accepted_by_real_adapter_validation(self):
+        # Exercises the REAL adapter's own private _validate_execution_config
+        # (not a mock, and never a real subprocess) against the
+        # orchestrator's real dedicated config -- this is exactly the
+        # check that silently passed for the shared config's byte-for-
+        # byte-equal Katana case but raised for httpx.
+        from adapters.bug_bounty_httpx import _validate_execution_config as httpx_validate_config
+        from adapters.bug_bounty_katana import _validate_execution_config as katana_validate_config
+
+        httpx_validate_config(orchestrator._HTTPX_EXECUTION_CONFIG)  # must not raise
+        katana_validate_config(orchestrator._KATANA_EXECUTION_CONFIG)  # must not raise
+
+
+# ---------------------------------------------------------------------------
+# Final Pre-Release Block: Authorized External Target workflow.
+# ---------------------------------------------------------------------------
+
+
+def _external_scope_bundle(**overrides):
+    from backend.models import validate_authorized_external_target_scope
+
+    bundle = validate_authorized_external_target_scope(
+        target="https://security-test.example.com/",
+        scope={
+            "hosts": ["security-test.example.com"], "ports": [443], "path_prefixes": ["/"],
+            "allowed_tools": ["http_assessor", "httpx", "katana"],
+        },
+        operator_scope_acknowledged=True,
+    )
+    bundle.update(overrides)
+    return bundle
+
+
+class TestAuthorizedExternalTargetWorkflow:
+    def test_E1_completes_with_only_operator_permitted_tools(self):
+        store = RunStore()
+        bus = EventBus()
+        run = store.create_run(run_type="bug_bounty", created_at="t0")
+        orchestrator.run_authorized_external_target_workflow(
+            run_id=run["run_id"], target="https://security-test.example.com/",
+            scope_bundle=_external_scope_bundle(), run_store=store, event_bus=bus,
+            clock=_clock_factory(), transport=_FakeTransport(), execute_tool=_fake_execute_tool_unavailable,
+        )
+        final = store.get_run(run_id=run["run_id"])
+        assert final["status"] == "completed"
+        assert final["target_summary"] == "https://security-test.example.com/"
+
+    def test_E2_nmap_never_permitted_when_not_in_operator_scope(self):
+        store = RunStore()
+        bus = EventBus()
+        run = store.create_run(run_type="bug_bounty", created_at="t0")
+        calls: list = []
+
+        def tracking_execute_tool(*, permissions, tool_request, governor_result, execution_config, detected_technologies=None):
+            calls.append(tool_request["tool_id"])
+            return _fake_execute_tool_unavailable(
+                permissions=permissions, tool_request=tool_request, governor_result=governor_result,
+                execution_config=execution_config,
+            )
+
+        # Operator scope explicitly excludes nmap/nuclei/zap -- only
+        # http_assessor/httpx/katana are allowed_tools.
+        orchestrator.run_authorized_external_target_workflow(
+            run_id=run["run_id"], target="https://security-test.example.com/",
+            scope_bundle=_external_scope_bundle(), run_store=store, event_bus=bus,
+            clock=_clock_factory(), transport=_FakeTransport(), execute_tool=tracking_execute_tool,
+        )
+        final = store.get_run(run_id=run["run_id"])
+        assert "nmap" not in final["executed_tools"]
+        assert "nmap" not in calls  # policy-denied before execute_tool is ever called for it
+
+    def test_E3_demo_localhost_target_never_accepted_via_this_path(self):
+        # validate_authorized_external_target_scope itself would reject
+        # a target whose host isn't in scope['hosts'] -- confirming the
+        # workflow's own scope_bundle is authoritative, never re-derived
+        # from the raw target string.
+        from backend.models import RunModelError, validate_authorized_external_target_scope
+
+        with pytest.raises(RunModelError, match="INVALID_EXTERNAL_TARGET"):
+            validate_authorized_external_target_scope(
+                target="http://localhost:3000/",
+                scope={
+                    "hosts": ["security-test.example.com"], "ports": [443], "path_prefixes": ["/"],
+                    "allowed_tools": ["http_assessor"],
+                },
+                operator_scope_acknowledged=True,
+            )
+
+    def test_E4_default_transport_is_ssrf_safe_when_not_injected(self, monkeypatch):
+        captured = {}
+
+        class _SpyTransport:
+            def __init__(self, *, allow_private_destinations=True, **kwargs):
+                captured["allow_private_destinations"] = allow_private_destinations
+
+            def request(self, *, url, method, headers=None):
+                return {"url": url, "status_code": 200, "headers": {}, "body_excerpt": "<html></html>", "redirect_location": None, "request_performed": True}
+
+        monkeypatch.setattr(orchestrator, "BugBountyHttpTransport", _SpyTransport)
+        store = RunStore()
+        bus = EventBus()
+        run = store.create_run(run_type="bug_bounty", created_at="t0")
+        orchestrator.run_authorized_external_target_workflow(
+            run_id=run["run_id"], target="https://security-test.example.com/",
+            scope_bundle=_external_scope_bundle(), run_store=store, event_bus=bus,
+            clock=_clock_factory(), execute_tool=_fake_execute_tool_unavailable,
+        )
+        assert captured["allow_private_destinations"] is False
+
+    def test_E5_governor_still_evaluated_for_external_runs(self):
+        store = RunStore()
+        bus = EventBus()
+        run = store.create_run(run_type="bug_bounty", created_at="t0")
+        orchestrator.run_authorized_external_target_workflow(
+            run_id=run["run_id"], target="https://security-test.example.com/",
+            scope_bundle=_external_scope_bundle(), run_store=store, event_bus=bus,
+            clock=_clock_factory(), transport=_FakeTransport(), execute_tool=_fake_execute_tool_unavailable,
+        )
+        events = [e["event_type"] for e in bus.get_events(run_id=run["run_id"])]
+        assert "governor_evaluated" in events
+
+    def test_E6_report_reflects_only_requested_operator_tools(self):
+        store = RunStore()
+        bus = EventBus()
+        run = store.create_run(run_type="bug_bounty", created_at="t0")
+        orchestrator.run_authorized_external_target_workflow(
+            run_id=run["run_id"], target="https://security-test.example.com/",
+            scope_bundle=_external_scope_bundle(), run_store=store, event_bus=bus,
+            clock=_clock_factory(), transport=_FakeTransport(), execute_tool=_fake_execute_tool_unavailable,
+        )
+        final = store.get_run(run_id=run["run_id"])
+        assert set(final["report"]["tools_requested"]) == set(orchestrator.DEFAULT_BUG_BOUNTY_TOOL_PLAN)
+        assert set(final["report"]["tools_permitted"]).issubset({"http_assessor", "httpx", "katana"})
+
+    def test_E7_full_lifecycle_accepts_external_scope_bundle(self):
+        store = RunStore()
+        bus = EventBus()
+        run = store.create_run(run_type="bug_bounty", created_at="t0")
+        orchestrator.run_security_lifecycle_workflow(
+            run_id=run["run_id"], target="https://security-test.example.com/",
+            run_store=store, event_bus=bus,
+            clock=_clock_factory(), transport=_FakeTransport(), execute_tool=_fake_execute_tool_unavailable,
+            external_scope_bundle=_external_scope_bundle(),
+        )
+        final = store.get_run(run_id=run["run_id"])
+        assert final["target_summary"] == "https://security-test.example.com/"
+        assert final["status"] in ("completed", "awaiting_human_review")
+
+    def test_E8_full_lifecycle_external_never_permits_unlisted_tools(self):
+        store = RunStore()
+        bus = EventBus()
+        run = store.create_run(run_type="bug_bounty", created_at="t0")
+        calls: list = []
+
+        def tracking_execute_tool(*, permissions, tool_request, governor_result, execution_config, detected_technologies=None):
+            calls.append(tool_request["tool_id"])
+            return _fake_execute_tool_unavailable(
+                permissions=permissions, tool_request=tool_request, governor_result=governor_result,
+                execution_config=execution_config,
+            )
+
+        orchestrator.run_security_lifecycle_workflow(
+            run_id=run["run_id"], target="https://security-test.example.com/",
+            run_store=store, event_bus=bus,
+            clock=_clock_factory(), transport=_FakeTransport(), execute_tool=tracking_execute_tool,
+            external_scope_bundle=_external_scope_bundle(),
+        )
+        assert "zap" not in calls
+        assert "nuclei" not in calls

@@ -6,7 +6,12 @@ ThreatTrace is a security research and Purple Team investigation platform. It is
 
 Every offensive-adjacent capability in ThreatTrace — the Bug Bounty engine, its tool adapters (HTTP/Nmap/Nuclei/ZAP/Burp), and the live platform backend's Bug Bounty run endpoint — is built on the assumption that the caller already has explicit, documented authorization to test the target they supply. Do not point any part of this system at a target you do not have that authorization for.
 
-For this checkpoint's live platform backend specifically, this is also enforced structurally: `backend.models.validate_local_only_target` rejects any Bug Bounty run target whose host is not exactly `localhost` — no public host, no LAN host or IP, not even the raw loopback IP `127.0.0.1`. This is a deliberate, narrow safety boundary for the current local-research checkpoint, not a general authorization mechanism — see the next section.
+For this checkpoint's live platform backend specifically, this is also enforced structurally, in one of two ways depending on run mode:
+
+- **Demo Mode** (`POST /api/runs/bug-bounty`, `POST /api/runs/security-lifecycle` without a `scope` field): `backend.models.validate_local_only_target` rejects any target whose host is not exactly `localhost` — no public host, no LAN host or IP, not even the raw loopback IP `127.0.0.1`.
+- **Authorized External Target mode** (`POST /api/runs/authorized-target`, or `POST /api/runs/security-lifecycle` with a `scope` field): `backend.models.validate_authorized_external_target_scope` requires an explicit operator-declared scope (exact hostname(s), port(s), path prefix(es), allowed tools) and the literal boolean `operator_scope_acknowledged: true`. **This acknowledgment is a caller/operator assertion only — it is never treated as, or presented as, proof of legal authorization.** `adapters.bug_bounty_http` additionally rejects any resolved destination that is loopback/link-local/private/reserved (see `SECURITY.md`'s own Authorized External Target section for the exact mechanism and its known limitations) unless Demo Mode's own trusted internal alias is what's actually being reached.
+
+Neither mode is a general authorization mechanism — see the next section.
 
 ## Scope is caller/analyst-supplied technical configuration — never proof of authorization
 

@@ -1,8 +1,76 @@
 # ThreatTrace
 
-**ThreatTrace is an analyst-governed, AI-assisted security research platform.** It combines an LLM reasoning layer with deterministic, code-enforced security cores to run authorized Bug Bounty-style assessments, correlate the results into evidence-grounded findings, turn Threat Intelligence and Bug Bounty findings into draft detection rules, and validate Purple Team investigations end to end — all inside explicit, human-reviewed boundaries.
+ThreatTrace runs an authorized bug bounty-style scan, then walks the results through threat intel review, detection engineering, and human review — with every AI proposal deterministically re-checked before anything runs.
 
 ThreatTrace is a **research prototype**, not a production security product. See [Current Maturity](#current-maturity) and [Known Limitations](#known-limitations) before relying on it for anything beyond local, authorized research.
+
+## What does it do?
+
+```
+Seed target
+   |
+HTTP Assessor / httpx / bounded crawler / Katana   (discovery)
+   |
+Nmap / Nuclei / ZAP                                 (scanning, bounded + policy-gated)
+   |
+Evidence Normalization -> Correlation -> Findings
+   |
+(Full Lifecycle only) Prioritization -> Threat Intel -> Threat Hunt -> Detection Engineering -> Red Validation -> Purple Recommendation
+   |
+Human Review
+```
+
+Every stage above is either a deterministic Python module or a real, bounded external tool call — an AI proposal (used only in the Detection Engineering step) is always re-validated by non-AI code before it becomes a rule candidate, and nothing is ever deployed automatically.
+
+## Quick Start
+
+**Prerequisites:** [Git](https://git-scm.com/) and [Docker](https://docs.docker.com/get-docker/) (with Compose v2). Nothing else — no Python, Nmap, Nuclei, httpx, Katana, or ZAP install required.
+
+```bash
+git clone <repo-url>
+cd ThreatTrace
+docker compose up -d --build
+```
+
+Open **http://127.0.0.1:8420**.
+
+## Run your first demo
+
+Target field is pre-filled with `http://localhost:3000` (the bundled local [Juice Shop](#juice-shop-demo) container — never a public target). Click:
+
+- **New Bug Bounty Run** — fast, bounded scan only (HTTP Assessor / httpx / crawler / Katana / Nmap / Nuclei / ZAP), or
+- **Run Full Security Lifecycle** — the Bug Bounty scan, then real Context Prioritization, Threat Intel/Hunt review, Detection Engineering review, a Red Validation fact-check, and Purple remediation recommendations for the highest-priority findings.
+
+Watch the live event feed, pipeline, and cards below populate as the run progresses.
+
+## What will I see?
+
+| Card | What it shows |
+|---|---|
+| **Findings** | Canonical findings correlated across tools, with severity, confidence, evidence source count, and CWE/OWASP/CVE/MITRE ATT&CK classification (honestly "Not mapped" when no behavioral evidence supports an ATT&CK technique). |
+| **Attack Surface Discovery** | A human-readable summary of what was crawled/discovered, plus a per-endpoint breakdown (what it is, how it was found, whether it was fetched). |
+| **HTTP Enrichment (httpx)** | Reachability, status, page title, technology/server headers — observation only, never a vulnerability claim. |
+| **Threat Intelligence / Security Lifecycle Detail** | Per-finding review outcome (e.g. "no relevant intel," "telemetry gap") with the real reason, never a fabricated "detected" claim. |
+| **Detection Engineering** | Whether a rule candidate was generated, and if not, exactly why (e.g. missing telemetry) — a rule is always `NOT_DEPLOYED`. |
+| **Purple Recommendations** | A finding-specific remediation/retest recommendation — a recommendation only, never a claim that remediation was applied. |
+| **Human Review** | Stays `AWAITING REVIEW` until a human explicitly approves or rejects each selected finding — a local, unauthenticated development action, never a claim of authenticated analyst sign-off. |
+| **Accuracy & Evaluation** | Precision/recall/F1 against a fixed, supported Juice Shop benchmark subset — never a general accuracy claim (Demo target only). |
+
+## Test your own authorized system
+
+Switch **Target Mode** to **Authorized External Target** to scan a system you own or are explicitly authorized to test. You provide the target URL and an explicit scope (allowed host(s), port(s), path prefix(es), and which tools may run — HTTP Assessor/httpx/Katana are on by default; Nmap/Nuclei/ZAP are opt-in, since some bug-bounty programs restrict automated scanning). You must check the acknowledgment box before a run can start.
+
+**This acknowledgment is an operator assertion only — ThreatTrace does not verify or establish that you actually hold legal authorization to test the target.** You are responsible for confirming that yourself, and for following any additional rules a bug-bounty program or client engagement imposes on automated tooling. See [Security Boundaries](#security-boundaries) and [docs/authorized-use.md](docs/authorized-use.md).
+
+## Stop
+
+```bash
+docker compose down
+```
+
+---
+
+The rest of this document is advanced/reference material: architecture detail, the full command reference, the host-native (non-Docker) setup path, testing, and the current security/maturity model.
 
 ## What ThreatTrace Is Not
 
@@ -77,7 +145,7 @@ Analyst-supplied scope
   -> LLM Planner proposes a tool plan
   -> Tool Permission Policy (deterministic: is this tool/target/path actually permitted?)
   -> Security Governor (deterministic: does this action cross a policy boundary?)
-  -> HTTP / Nmap / Nuclei / ZAP / Burp adapter boundary (only implemented, permitted tools ever run)
+  -> HTTP / httpx / Crawler / Katana / Nmap / Nuclei / ZAP / Burp adapter boundary (only implemented, permitted tools ever run)
   -> Evidence Normalization -> Correlation (multi-tool corroboration, deduplication)
   -> Final Bug Bounty Report (status is always requires_human_review)
 ```
@@ -188,12 +256,17 @@ Investigation-loop commands (the platform's newer Bug Bounty/Detection/live-plat
 | Tool | Purpose | Readiness states this checkpoint can report |
 |---|---|---|
 | `http_assessor` | Passive/safe-active HTTP assessment (pure Python) | always `ready` |
+| `httpx` | Bounded HTTP enrichment (status/title/technology/server) of one already-validated target | `ready` / `missing` |
+| `crawler` | Bounded, same-origin ThreatTrace discovery crawl | always `ready` (pure Python) |
+| `katana` | Bounded, non-headless discovery crawl (second, independent discovery engine) | `ready` / `missing` |
 | `nmap` | Network reconnaissance | `ready` / `requires_admin_install` (Windows) / `missing` |
 | `nuclei` | Template-based web vulnerability scanning | `ready` / `missing` |
 | `zap` | Active/passive DAST via a local Docker container | `ready` / `container_available` / `runtime_unavailable` |
 | `burp_dast` | DAST via an analyst-configured external Burp runtime | `ready` / `not_configured` |
 | `authenticated_testing` | Declared, not implemented | `not_implemented` |
 | `controlled_validation` | Declared, not implemented | `not_implemented` |
+
+`httpx`/`katana` are packaged inside the Docker image (pinned release binaries, same discipline as Nuclei) — no host install needed for the Docker path.
 
 Run `curl http://127.0.0.1:8420/api/system` (Docker) or `python -m runtime.bootstrap check` (host-native) for a live readiness report — see [Quickstart](#quickstart).
 
@@ -267,7 +340,24 @@ ThreatTrace includes a bounded, reproducible benchmark against the local Juice S
 - No automatic attack execution, containment, or detection-rule deployment anywhere in the system.
 - Every risky action requires a separate, explicit human decision outside ThreatTrace's automated flow.
 - The `backend/` local platform binds `127.0.0.1` only, implements no authentication, and is explicitly not production-hardened.
+- **Only test systems you own or are explicitly authorized to assess.** ThreatTrace's Authorized External Target mode requires an operator-declared scope and an explicit acknowledgment checkbox, but **this does not establish that you have legal permission** to test the target — that determination is always the operator's own responsibility. Bug-bounty platforms may impose additional restrictions on automated tools beyond what ThreatTrace itself enforces (exact hostname/port/path scoping, an SSRF destination-network check, and a conservative default tool set); the operator must still follow the program's actual rules.
 - Full detail: [SECURITY.md](SECURITY.md).
+
+### Internal network deployment
+
+An organization may point the self-hosted Docker stack at its own internal, explicitly-scoped target instead of (or alongside) the public Juice Shop demo:
+
+```
+Organization server (internal, explicitly authorized)
+   |
+Docker Compose (this repository's docker-compose.yml)
+   |
+ThreatTrace backend (127.0.0.1-only by default)
+   |
+Authorized External Target scope (exact host/port/path, operator-declared)
+```
+
+The current v0.1 interface is **not production-authenticated** — there is no login, no RBAC, and no multi-user session model. Before any multi-user or production-facing internal deployment, add: TLS termination, SSO/authentication in front of the dashboard, RBAC, persistent (not in-memory) audit storage, secrets management for any credentials the deployment needs, and network isolation for the worker process. None of these exist in this checkpoint.
 
 ## Known Limitations
 
@@ -281,6 +371,8 @@ ThreatTrace includes a bounded, reproducible benchmark against the local Juice S
 - Not every finding or TI record yields a useful detection rule — a `TELEMETRY_GAP` honestly proposes zero rules.
 - Structural rule-syntax validation is not detection-efficacy validation.
 - Live validation has been performed primarily on **Windows**, against the local Juice Shop container — see [Cross-Platform Status](#cross-platform-status).
+- Authorized External Target mode's SSRF protection resolves and rejects loopback/link-local/private/reserved destinations before connecting, but does not pin the validated IP for the subsequent connection — a narrow DNS-rebinding race between validation and connect is a known, disclosed limitation (see `adapters/bug_bounty_http.py`), not a claim of full rebinding resistance.
+- No LICENSE file is currently present in this repository — see [License](#license).
 
 ## Repository Structure
 
@@ -331,6 +423,10 @@ Historical pass counts reported in per-block docs (e.g. *"at the Block 15J-K che
 ## Current Maturity
 
 **Research prototype / pre-release** (see [`VERSION`](VERSION) — `0.1.0-dev`; this does not yet follow strict release discipline and should not be treated as a stable API contract). ThreatTrace has been developed and live-validated on Windows against local, authorized targets (a local Juice Shop container, a local ZAP container). It has not undergone external security review, has no production authentication, and is not intended for deployment outside a local research/lab environment. See [docs/architecture.md](docs/architecture.md) for the full block-by-block build history and [SECURITY.md](SECURITY.md) for the current security model.
+
+## License
+
+No LICENSE file currently exists in this repository. A license must be selected before this project is publicly described as "open source" — until one is added, all rights are reserved by default and the terms under which this code may be used, modified, or redistributed are undefined.
 
 ## Responsible-Use Notice
 

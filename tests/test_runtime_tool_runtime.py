@@ -16,6 +16,8 @@ from runtime.tool_runtime import (
     check_controlled_validation,
     check_docker,
     check_http_assessor,
+    check_httpx,
+    check_katana,
     check_nmap,
     check_nuclei,
     check_nuclei_templates,
@@ -148,6 +150,66 @@ class TestNucleiTemplates:
         (populated / "file.yaml").write_text("x")
         result = check_nuclei_templates(env={"THREATTRACE_NUCLEI_TEMPLATES_DIR": str(populated)})
         assert result["state"] == "ready"
+
+
+class TestHttpx:
+    def test_020_missing(self):
+        result = check_httpx(which_func=_which({}), runner=_runner({}))
+        assert result["state"] == "missing"
+
+    def test_021_present_parses_version(self):
+        which = _which({"httpx": "/usr/local/bin/httpx"})
+        runner = _runner({"returncode": 0, "stdout": "Current Version: v1.10.0\n", "stderr": "", "timed_out": False})
+        result = check_httpx(which_func=which, runner=runner)
+        assert result["state"] == "ready"
+        assert result["version"] == "1.10.0"
+
+    def test_022_present_version_unparseable(self):
+        which = _which({"httpx": "/usr/local/bin/httpx"})
+        runner = _runner({"returncode": 0, "stdout": "unexpected output", "stderr": "", "timed_out": False})
+        result = check_httpx(which_func=which, runner=runner)
+        assert result["state"] == "runtime_unavailable"
+
+    def test_023_times_out(self):
+        which = _which({"httpx": "/usr/local/bin/httpx"})
+        runner = _runner({"returncode": None, "stdout": "", "stderr": "", "timed_out": True})
+        result = check_httpx(which_func=which, runner=runner)
+        assert result["state"] == "runtime_unavailable"
+
+    def test_024_never_calls_runner_when_missing(self):
+        runner = _runner({})
+        check_httpx(which_func=_which({}), runner=runner)
+        assert runner.calls == []
+
+
+class TestKatana:
+    def test_025_missing(self):
+        result = check_katana(which_func=_which({}), runner=_runner({}))
+        assert result["state"] == "missing"
+
+    def test_026_present_parses_version(self):
+        which = _which({"katana": "/usr/local/bin/katana"})
+        runner = _runner({"returncode": 0, "stdout": "Current Version: v1.7.0\n", "stderr": "", "timed_out": False})
+        result = check_katana(which_func=which, runner=runner)
+        assert result["state"] == "ready"
+        assert result["version"] == "1.7.0"
+
+    def test_027_present_version_unparseable(self):
+        which = _which({"katana": "/usr/local/bin/katana"})
+        runner = _runner({"returncode": 0, "stdout": "unexpected output", "stderr": "", "timed_out": False})
+        result = check_katana(which_func=which, runner=runner)
+        assert result["state"] == "runtime_unavailable"
+
+    def test_028_times_out(self):
+        which = _which({"katana": "/usr/local/bin/katana"})
+        runner = _runner({"returncode": None, "stdout": "", "stderr": "", "timed_out": True})
+        result = check_katana(which_func=which, runner=runner)
+        assert result["state"] == "runtime_unavailable"
+
+    def test_029_never_calls_runner_when_missing(self):
+        runner = _runner({})
+        check_katana(which_func=_which({}), runner=runner)
+        assert runner.calls == []
 
 
 class TestDocker:
@@ -307,7 +369,7 @@ class TestEvaluateToolReadiness:
             which_func=_which({}), runner=_runner({}), http_get=_broken_http_get, env={}, platform_name="Linux",
         )
         assert set(report["tools"]) == {
-            "http_assessor", "nmap", "nuclei", "nuclei_templates", "docker", "zap", "burp_dast",
+            "http_assessor", "nmap", "nuclei", "nuclei_templates", "httpx", "katana", "docker", "zap", "burp_dast",
             "authenticated_testing", "controlled_validation",
         }
         assert report["tools"]["http_assessor"]["state"] == "ready"

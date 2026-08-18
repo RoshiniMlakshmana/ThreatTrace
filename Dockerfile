@@ -1,10 +1,11 @@
 # ThreatTrace application image (Docker self-hosted deployment refinement).
 #
 # Bundles the Python runtime, ThreatTrace's own project dependencies, and
-# two of its bounded scanner adapters -- Nmap and Nuclei -- so a user only
-# needs Docker (and, for the demo stack, Compose) to get a fully
-# operational ThreatTrace backend + dashboard. No host installation of
-# Python, Nmap, Npcap, or Nuclei is required for this deployment path.
+# its bounded scanner/discovery adapters -- Nmap, Nuclei, httpx, and
+# Katana -- so a user only needs Docker (and, for the demo stack, Compose)
+# to get a fully operational ThreatTrace backend + dashboard. No host
+# installation of Python, Nmap, Npcap, Nuclei, httpx, or Katana is
+# required for this deployment path.
 #
 # Security posture (see docs/docker-self-hosted-deployment.md for the
 # full write-up):
@@ -27,6 +28,8 @@ LABEL org.opencontainers.image.title="ThreatTrace" \
 
 # --- Pinned tool versions -----------------------------------------------
 ARG NUCLEI_VERSION=3.11.1
+ARG HTTPX_VERSION=1.10.0
+ARG KATANA_VERSION=1.7.0
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -47,9 +50,9 @@ RUN apt-get update \
 
 # --- Nuclei: pinned release binary, never `go install`, never a moving
 # --- "latest" tag -- reproducible across builds until this ARG changes.
-RUN curl -fsSL -o /tmp/nuclei.zip \
+RUN curl -fsSL --retry 5 --retry-all-errors --retry-delay 2 -o /tmp/nuclei.zip \
         "https://github.com/projectdiscovery/nuclei/releases/download/v${NUCLEI_VERSION}/nuclei_${NUCLEI_VERSION}_linux_amd64.zip" \
-    && unzip -q /tmp/nuclei.zip -d /usr/local/bin nuclei \
+    && unzip -o -q /tmp/nuclei.zip -d /usr/local/bin nuclei \
     && chmod +x /usr/local/bin/nuclei \
     && rm -f /tmp/nuclei.zip
 
@@ -60,6 +63,35 @@ WORKDIR /app
 
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
+
+# --- httpx / Katana: same pinned-release-binary discipline as Nuclei
+# --- above (same ProjectDiscovery release-asset naming convention) --
+# --- never `go install`, never a moving "latest" tag. --retry guards
+# --- against the same transient GitHub release-CDN HTTP/2 stream resets
+# --- observed for the Nuclei download above -- a network flake, never a
+# --- reason to weaken the pinned-version/no-`latest`-tag guarantee.
+#
+# Deliberately placed AFTER `pip install` above: the Python `httpx`
+# package (a transitive dependency of `mcp`) ships its own optional CLI
+# console-script also named `httpx`, installed into this same
+# /usr/local/bin -- if the real ProjectDiscovery Go binary were unzipped
+# here BEFORE pip install ran, pip's own install step would silently
+# overwrite it with that broken CLI shim (it errors without the
+# `httpx[cli]` extra, which this project never installs). Unzipping the
+# real Go binary last guarantees it -- not the Python package's
+# same-named shim -- is what `/usr/local/bin/httpx` actually resolves
+# to at runtime. Katana has no such name collision but is installed in
+# the same step for locality.
+RUN curl -fsSL --retry 5 --retry-all-errors --retry-delay 2 -o /tmp/httpx.zip \
+        "https://github.com/projectdiscovery/httpx/releases/download/v${HTTPX_VERSION}/httpx_${HTTPX_VERSION}_linux_amd64.zip" \
+    && unzip -o -q /tmp/httpx.zip -d /usr/local/bin httpx \
+    && chmod +x /usr/local/bin/httpx \
+    && rm -f /tmp/httpx.zip \
+    && curl -fsSL --retry 5 --retry-all-errors --retry-delay 2 -o /tmp/katana.zip \
+        "https://github.com/projectdiscovery/katana/releases/download/v${KATANA_VERSION}/katana_${KATANA_VERSION}_linux_amd64.zip" \
+    && unzip -o -q /tmp/katana.zip -d /usr/local/bin katana \
+    && chmod +x /usr/local/bin/katana \
+    && rm -f /tmp/katana.zip
 
 # --- Bake a pinned Nuclei template set into the image at build time
 # --- (Option A from the deployment spec -- the most reproducible choice:

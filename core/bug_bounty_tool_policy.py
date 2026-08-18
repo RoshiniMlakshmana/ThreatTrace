@@ -68,6 +68,8 @@ REQUEST_VERSION = "1"
 TOOL_IDS = frozenset({
     "http_assessor",
     "crawler",
+    "httpx",
+    "katana",
     "nmap",
     "nuclei",
     "zap",
@@ -114,8 +116,11 @@ REASON_CODES = (
 # `implemented: True` reflects that a real, deterministic adapter
 # boundary exists, independent of whether a compatible Burp runtime is
 # actually configured in any given environment; see that module's own
-# `runtime_status`/`adapter_status` distinction). `authenticated_testing`
-# and `controlled_validation` remain declared, not-yet-built capabilities.
+# `runtime_status`/`adapter_status` distinction); `httpx` and `katana`
+# became `True` in the Final Pre-Release Block (see
+# `adapters.bug_bounty_httpx`/`adapters.bug_bounty_katana`).
+# `authenticated_testing` and `controlled_validation` remain declared,
+# not-yet-built capabilities.
 # ---------------------------------------------------------------------------
 
 _TOOL_CATALOG_ENTRIES: tuple[dict[str, Any], ...] = (
@@ -132,6 +137,28 @@ _TOOL_CATALOG_ENTRIES: tuple[dict[str, Any], ...] = (
         # never a state-changing request) -- never authenticated, never
         # a controlled-validation capability.
         "tool_id": "crawler", "category": "passive_web", "risk_level": "low",
+        "implemented": True, "requires_human_approval": False,
+        "supports_authentication": False, "state_changing_capability": False,
+    },
+    {
+        # Final Pre-Release Block (Authorized External Targets +
+        # httpx/Katana): bounded HTTP enrichment of one already-validated
+        # target -- see adapters.bug_bounty_httpx. Same risk category as
+        # http_assessor (single bounded GET-shaped request, no state
+        # change) -- never authenticated, never a controlled-validation
+        # capability.
+        "tool_id": "httpx", "category": "passive_web", "risk_level": "low",
+        "implemented": True, "requires_human_approval": False,
+        "supports_authentication": False, "state_changing_capability": False,
+    },
+    {
+        # Final Pre-Release Block: bounded, non-headless, same-host
+        # discovery crawl -- see adapters.bug_bounty_katana. Read-only
+        # discovery, same risk category as crawler -- every discovered
+        # URL is untrusted candidate data the orchestrator must
+        # independently scope-revalidate before further use (see that
+        # adapter's own docstring).
+        "tool_id": "katana", "category": "passive_web", "risk_level": "low",
         "implemented": True, "requires_human_approval": False,
         "supports_authentication": False, "state_changing_capability": False,
     },
@@ -174,14 +201,15 @@ TOOL_CATALOG: Mapping[str, Mapping[str, Any]] = MappingProxyType({
 # Fixed profile ceilings -- the maximum tool set a permission contract
 # under that profile could ever permit. Never a grant by itself.
 PROFILE_TOOL_CEILING: Mapping[str, frozenset[str]] = MappingProxyType({
-    "passive": frozenset({"http_assessor", "crawler"}),
-    "recon": frozenset({"http_assessor", "crawler", "nmap"}),
-    "safe_dast": frozenset({"http_assessor", "crawler", "nmap", "nuclei", "zap", "burp_dast"}),
+    "passive": frozenset({"http_assessor", "crawler", "httpx", "katana"}),
+    "recon": frozenset({"http_assessor", "crawler", "httpx", "katana", "nmap"}),
+    "safe_dast": frozenset({"http_assessor", "crawler", "httpx", "katana", "nmap", "nuclei", "zap", "burp_dast"}),
     "authenticated": frozenset({
-        "http_assessor", "crawler", "nmap", "nuclei", "zap", "burp_dast", "authenticated_testing",
+        "http_assessor", "crawler", "httpx", "katana", "nmap", "nuclei", "zap", "burp_dast",
+        "authenticated_testing",
     }),
     "controlled_validation": frozenset({
-        "http_assessor", "crawler", "nmap", "nuclei", "zap", "burp_dast",
+        "http_assessor", "crawler", "httpx", "katana", "nmap", "nuclei", "zap", "burp_dast",
         "authenticated_testing", "controlled_validation",
     }),
 })

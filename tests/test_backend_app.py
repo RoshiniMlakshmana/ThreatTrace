@@ -62,7 +62,9 @@ class TestHealthAndSystem:
     def test_002b_system_categories_present_and_optional_never_shows_as_failed(self, client):
         r = client.get("/api/system")
         categories = {c["category"]: c for c in r.json()["categories"]}
-        assert set(categories) == {"core_services", "scanners", "intelligence", "detection", "optional_integrations"}
+        assert set(categories) == {
+            "core_services", "discovery", "scanners", "intelligence", "detection", "optional_integrations",
+        }
 
         optional_ids = {item["id"]: item for item in categories["optional_integrations"]["items"]}
         assert set(optional_ids) == {"burp_dast", "authenticated_testing", "controlled_validation"}
@@ -217,6 +219,147 @@ class TestSecurityLifecycleEndpoint:
         )
         assert captured["available_telemetry"] == ["web_server"]
         assert captured["detection_llm_proposals"] == {"CF-1": {"detection_objective": "x"}}
+
+
+class TestAuthorizedTargetEndpoint:
+    """POST /api/runs/authorized-target -- validation only. Never
+    performs a real external network request in these tests -- the
+    real workflow is monkeypatched, exactly like
+    TestSecurityLifecycleEndpoint's own established pattern."""
+
+    @pytest.fixture(autouse=True)
+    def _isolated_backend_state(self, monkeypatch):
+        from backend.event_bus import EventBus
+        from backend.run_store import RunStore
+
+        monkeypatch.setattr(backend_app, "_run_store", RunStore())
+        monkeypatch.setattr(backend_app, "_event_bus", EventBus())
+
+    @staticmethod
+    def _body(**overrides):
+        body = {
+            "target": "https://security-test.example.com/",
+            "scope": {
+                "hosts": ["security-test.example.com"], "ports": [443], "path_prefixes": ["/"],
+                "allowed_tools": ["http_assessor", "httpx", "katana"],
+            },
+            "operator_scope_acknowledged": True,
+        }
+        body.update(overrides)
+        return body
+
+    def test_043_missing_acknowledgment_rejected(self, client):
+        r = client.post("/api/runs/authorized-target", json=self._body(operator_scope_acknowledged=False))
+        assert r.status_code == 400
+        assert r.json()["error_code"] == "EXTERNAL_SCOPE_NOT_ACKNOWLEDGED"
+
+    def test_044_missing_scope_field_rejected(self, client):
+        body = self._body()
+        del body["scope"]["ports"]
+        r = client.post("/api/runs/authorized-target", json=body)
+        assert r.status_code == 400
+        assert r.json()["error_code"] == "INVALID_EXTERNAL_SCOPE"
+
+    def test_045_wildcard_host_rejected(self, client):
+        body = self._body()
+        body["scope"]["hosts"] = ["*.example.com"]
+        r = client.post("/api/runs/authorized-target", json=body)
+        assert r.status_code == 400
+        assert r.json()["error_code"] == "EXTERNAL_SCOPE_WILDCARD_NOT_ALLOWED"
+
+    def test_046_unrecognized_tool_rejected(self, client):
+        body = self._body()
+        body["scope"]["allowed_tools"] = ["nikto"]
+        r = client.post("/api/runs/authorized-target", json=body)
+        assert r.status_code == 400
+        assert r.json()["error_code"] == "EXTERNAL_SCOPE_TOOL_NOT_PERMITTED"
+
+    def test_047_target_host_not_in_scope_rejected(self, client):
+        body = self._body(target="https://other.example.com/")
+        r = client.post("/api/runs/authorized-target", json=body)
+        assert r.status_code == 400
+        assert r.json()["error_code"] == "INVALID_EXTERNAL_TARGET"
+
+    def test_048_localhost_goes_through_same_real_validation_path(self, client, monkeypatch):
+        # localhost IS a syntactically valid hostname the general scope
+        # engine would accept -- this endpoint doesn't specifically ban
+        # it, but it also grants it no special treatment; this test just
+        # confirms it goes through the same real validation path (proven
+        # by a 202 here, not a silent bypass) rather than being treated
+        # as the Demo Mode alias.
+        captured = {}
+
+        def _fake_workflow(**kwargs):
+            captured.update(kwargs)
+
+        monkeypatch.setattr(backend_app, "run_authorized_external_target_workflow", _fake_workflow)
+        body = self._body(target="http://localhost:3000/")
+        body["scope"]["hosts"] = ["localhost"]
+        body["scope"]["ports"] = [3000]
+        r = client.post("/api/runs/authorized-target", json=body)
+        assert r.status_code == 202
+        assert captured["target"] == "http://localhost:3000/"
+
+    def test_049_accepted_response_shape(self, client, monkeypatch):
+        started = {}
+
+        def _fake_workflow(**kwargs):
+            started.update(kwargs)
+
+        monkeypatch.setattr(backend_app, "run_authorized_external_target_workflow", _fake_workflow)
+        r = client.post("/api/runs/authorized-target", json=self._body())
+        assert r.status_code == 202
+        body = r.json()
+        assert body["run_id"].startswith("RUN-")
+        assert body["status"] == "created"
+
+    def test_050_concurrent_run_rejected(self, client, monkeypatch):
+        def _fake_workflow(**kwargs):
+            import time as _time
+            _time.sleep(0.05)
+
+        monkeypatch.setattr(backend_app, "run_authorized_external_target_workflow", _fake_workflow)
+        r1 = client.post("/api/runs/authorized-target", json=self._body())
+        assert r1.status_code == 202
+        r2 = client.post("/api/runs/authorized-target", json=self._body())
+        assert r2.status_code == 409
+        assert r2.json()["error_code"] == "CONCURRENT_RUN_ACTIVE"
+
+    def test_051_scope_bundle_forwarded_to_workflow(self, client, monkeypatch):
+        captured = {}
+
+        def _fake_workflow(**kwargs):
+            captured.update(kwargs)
+
+        monkeypatch.setattr(backend_app, "run_authorized_external_target_workflow", _fake_workflow)
+        client.post("/api/runs/authorized-target", json=self._body())
+        assert captured["scope_bundle"]["allowed_tools"] == ["http_assessor", "httpx", "katana"]
+        assert captured["scope_bundle"]["operator_scope_acknowledged"] is True
+
+    def test_052_nmap_not_permitted_when_operator_never_listed_it(self, client, monkeypatch):
+        captured = {}
+
+        def _fake_workflow(**kwargs):
+            captured.update(kwargs)
+
+        monkeypatch.setattr(backend_app, "run_authorized_external_target_workflow", _fake_workflow)
+        client.post("/api/runs/authorized-target", json=self._body())
+        assert "nmap" not in captured["scope_bundle"]["allowed_tools"]
+
+    def test_053_missing_operator_acknowledgment_field_rejected(self, client):
+        body = self._body()
+        del body["operator_scope_acknowledged"]
+        r = client.post("/api/runs/authorized-target", json=body)
+        assert r.status_code == 400
+        assert r.json()["error_code"] == "EXTERNAL_SCOPE_NOT_ACKNOWLEDGED"
+
+    def test_054_run_created_event_labels_mode_honestly(self, client, monkeypatch):
+        monkeypatch.setattr(backend_app, "run_authorized_external_target_workflow", lambda **kwargs: None)
+        r = client.post("/api/runs/authorized-target", json=self._body())
+        run_id = r.json()["run_id"]
+        events = client.get(f"/api/runs/{run_id}/events").json()["events"]
+        created = next(e for e in events if e["event_type"] == "run_created")
+        assert created["sanitized_payload"]["mode"] == "authorized_external_target"
 
 
 class TestLifecycleReviewEndpoint:
@@ -409,7 +552,7 @@ class TestBugBountyRunLifecycle:
         # each honestly execute or not depending on real, environment-specific
         # availability -- this integration test never hardcodes that.
         assert "http_assessor" in run["executed_tools"]
-        assert run["requested_tools"] == ["http_assessor", "crawler", "nmap", "nuclei", "zap"]
+        assert run["requested_tools"] == ["http_assessor", "httpx", "crawler", "katana", "nmap", "nuclei", "zap"]
 
     def test_013_events_endpoint_returns_ordered_events(self, client):
         run_id, _ = self._create_and_wait(client)

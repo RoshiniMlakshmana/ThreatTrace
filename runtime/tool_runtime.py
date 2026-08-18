@@ -78,7 +78,7 @@ READINESS_STATES = frozenset({
 })
 
 TOOL_IDS = frozenset({
-    "http_assessor", "nmap", "nuclei", "nuclei_templates", "docker", "zap", "burp_dast",
+    "http_assessor", "nmap", "nuclei", "nuclei_templates", "httpx", "katana", "docker", "zap", "burp_dast",
     "authenticated_testing", "controlled_validation",
 })
 
@@ -251,6 +251,60 @@ def check_nuclei(*, which_func: WhichFunc = real_which, runner: CommandRunner = 
     if version is None:
         return {"tool_id": "nuclei", "state": "runtime_unavailable", "version": None, "detail": "Nuclei found but its version could not be determined."}
     return {"tool_id": "nuclei", "state": "ready", "version": version, "detail": path}
+
+
+# ---------------------------------------------------------------------------
+# httpx / Katana (Final Pre-Release Block) -- same detect-only, never-
+# install discipline as check_nmap/check_nuclei above.
+# ---------------------------------------------------------------------------
+
+_PROJECTDISCOVERY_VERSION_PATTERN = re.compile(r"[Vv]ersion:?\s*v?(\S+)")
+
+
+def check_httpx(*, which_func: WhichFunc = real_which, runner: CommandRunner = real_run) -> dict[str, Any]:
+    """Detect an httpx (ProjectDiscovery) binary on `PATH` and its
+    reported version. Never runs a scan itself -- see
+    `adapters.bug_bounty_httpx` for the real bounded-enrichment call."""
+    path = which_func("httpx")
+    if path is None:
+        return {
+            "tool_id": "httpx", "state": "missing", "version": None,
+            "detail": "httpx not found on PATH. See docs/demo-runbook.md for a user-local install path (no admin required).",
+        }
+
+    result = runner([path, "-version"], timeout=DEFAULT_COMMAND_TIMEOUT_SECONDS)
+    if result.get("timed_out"):
+        return {"tool_id": "httpx", "state": "runtime_unavailable", "version": None, "detail": "httpx found but 'httpx -version' timed out."}
+
+    combined_output = (result.get("stdout") or "") + (result.get("stderr") or "")
+    match = _PROJECTDISCOVERY_VERSION_PATTERN.search(combined_output)
+    version = match.group(1) if match else None
+    if version is None:
+        return {"tool_id": "httpx", "state": "runtime_unavailable", "version": None, "detail": "httpx found but its version could not be determined."}
+    return {"tool_id": "httpx", "state": "ready", "version": version, "detail": path}
+
+
+def check_katana(*, which_func: WhichFunc = real_which, runner: CommandRunner = real_run) -> dict[str, Any]:
+    """Detect a Katana (ProjectDiscovery) binary on `PATH` and its
+    reported version. Never runs a crawl itself -- see
+    `adapters.bug_bounty_katana` for the real bounded-discovery call."""
+    path = which_func("katana")
+    if path is None:
+        return {
+            "tool_id": "katana", "state": "missing", "version": None,
+            "detail": "katana not found on PATH. See docs/demo-runbook.md for a user-local install path (no admin required).",
+        }
+
+    result = runner([path, "-version"], timeout=DEFAULT_COMMAND_TIMEOUT_SECONDS)
+    if result.get("timed_out"):
+        return {"tool_id": "katana", "state": "runtime_unavailable", "version": None, "detail": "katana found but 'katana -version' timed out."}
+
+    combined_output = (result.get("stdout") or "") + (result.get("stderr") or "")
+    match = _PROJECTDISCOVERY_VERSION_PATTERN.search(combined_output)
+    version = match.group(1) if match else None
+    if version is None:
+        return {"tool_id": "katana", "state": "runtime_unavailable", "version": None, "detail": "katana found but its version could not be determined."}
+    return {"tool_id": "katana", "state": "ready", "version": version, "detail": path}
 
 
 def _resolve_nuclei_templates_dir(*, templates_dir: str | None, env: Any) -> Path:
@@ -498,6 +552,8 @@ def evaluate_tool_readiness(
         "nmap": check_nmap(which_func=which_func, runner=runner, platform_name=platform_name),
         "nuclei": check_nuclei(which_func=which_func, runner=runner),
         "nuclei_templates": check_nuclei_templates(templates_dir=templates_dir, env=env),
+        "httpx": check_httpx(which_func=which_func, runner=runner),
+        "katana": check_katana(which_func=which_func, runner=runner),
         "docker": docker_result,
         "zap": check_zap(docker_state=docker_result, which_func=which_func, runner=runner, http_get=http_get, env=env),
         "burp_dast": check_burp_dast(env=env, http_get=http_get),

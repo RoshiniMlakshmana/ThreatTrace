@@ -47,8 +47,9 @@ this project's established "each module owns its own copy of a shape
 it shares in spirit with another module" convention.
 
 `RunModelError`, `EventModelError`, `build_run`, `apply_run_transition`,
-`build_event`, and `validate_local_only_target` are this module's
-public symbols (plus its fixed vocabulary constants).
+`build_event`, `validate_local_only_target`, and
+`validate_authorized_external_target_scope` are this module's public
+symbols (plus its fixed vocabulary constants).
 """
 
 from __future__ import annotations
@@ -58,6 +59,8 @@ import os
 from collections.abc import Mapping
 from typing import Any
 from urllib.parse import urlsplit
+
+from core.bug_bounty_scope import BugBountyScopeError, create_bug_bounty_scope
 
 RUN_MODEL_VERSION = "1"
 EVENT_MODEL_VERSION = "1"
@@ -194,6 +197,7 @@ _RUN_FIELD_DEFAULTS: dict[str, Any] = {
     "report": None,
     "attack_surface": None,
     "lifecycle": None,
+    "http_enrichment": None,
 }
 
 _RUN_MUTABLE_FIELDS = frozenset(_RUN_FIELD_DEFAULTS) | {"status", "current_stage", "started_at", "completed_at"}
@@ -553,3 +557,167 @@ def resolve_execution_target(*, display_target: str, env: Any = None) -> str:
     if display_target.rstrip("/") != DEMO_TARGET_DISPLAY_ALIAS.rstrip("/"):
         return display_target
     return configured
+
+
+# ---------------------------------------------------------------------------
+# Authorized External Target scope (operator-declared, never proof of
+# authorization)
+# ---------------------------------------------------------------------------
+
+# Every tool id this v0.1 Authorized External Target endpoint can ever
+# permit -- deliberately excludes "authenticated_testing"/
+# "controlled_validation" (core.bug_bounty_tool_policy's own separate,
+# still-unimplemented capability gates; irrelevant to this simpler
+# per-run tool selection). An operator lists a subset of this set in
+# scope["allowed_tools"] -- never a value outside it.
+EXTERNAL_TARGET_ELIGIBLE_TOOL_IDS = (
+    "http_assessor", "crawler", "httpx", "katana", "nmap", "nuclei", "zap", "burp_dast",
+)
+
+# Recommended conservative default for the dashboard's own pre-checked
+# selection (section 5) -- the API itself always requires an explicit
+# scope["allowed_tools"] list; this constant is never applied silently
+# server-side. Some real bug-bounty programs restrict automated
+# scanning, so nmap/nuclei/zap start opt-in, never on by default.
+DEFAULT_EXTERNAL_TARGET_ALLOWED_TOOLS = ("http_assessor", "httpx", "katana")
+
+_EXTERNAL_SCOPE_REQUIRED_FIELDS = ("hosts", "ports", "path_prefixes", "allowed_tools")
+
+
+def validate_authorized_external_target_scope(
+    *, target: Any, scope: Any, operator_scope_acknowledged: Any,
+) -> dict[str, Any]:
+    """Deterministically validate one operator-declared Authorized
+    External Target scope and build the underlying
+    `core.bug_bounty_scope` scope configuration from it. Performs no
+    network activity, no DNS resolution -- pure string/structure
+    validation, exactly like `core.bug_bounty_scope.create_bug_bounty_scope`
+    itself (which this function is a thin, v0.1-conservative front end
+    for -- see module docstring's "local-only target policy" note for
+    why `validate_local_only_target` instead owns an independent copy;
+    this function is different: it deliberately *is* a front end onto
+    the general scope engine, because an Authorized External Target is
+    exactly the caller-listed-origin case that engine already exists
+    to answer).
+
+    `operator_scope_acknowledged` must be the literal value `True` --
+    this is a **caller/operator assertion only**. This function never
+    verifies, and never claims to verify, real-world legal authorization
+    to test `target`; it only records that the operator explicitly
+    affirmed providing scope for a system they assert they are
+    authorized to test. Raises `RunModelError`
+    (`EXTERNAL_SCOPE_NOT_ACKNOWLEDGED`) otherwise.
+
+    `scope` must be a mapping with exactly `hosts` (non-empty list of
+    non-blank hostnames; wildcards -- any entry containing `*` -- are
+    rejected in this checkpoint, per the project's v0.1 preference for
+    exact hostnames only, even though the underlying
+    `core.bug_bounty_scope` engine itself supports a single leading
+    wildcard label), `ports` (non-empty list of ints in `1..65535`),
+    `path_prefixes` (non-empty list of absolute path strings), and
+    `allowed_tools` (non-empty list of tool ids, each drawn from
+    `EXTERNAL_TARGET_ELIGIBLE_TOOL_IDS` -- never
+    `authenticated_testing`/`controlled_validation`, and never an
+    unrecognized string). No CIDR ranges, no subdomain brute forcing,
+    and no automatic scope expansion are supported by this contract at
+    all -- there is structurally no field for any of them.
+
+    `target` must be a well-formed `http`/`https` URL whose origin is
+    covered by `scope['hosts']` x `scope['ports']` -- this function
+    builds the exact-hostname `allowed_origins` list from those two
+    fields and delegates the real construction/validation to
+    `core.bug_bounty_scope.create_bug_bounty_scope`, translating any
+    `BugBountyScopeError` into `RunModelError`
+    (`INVALID_EXTERNAL_TARGET`).
+
+    Returns a new dict containing exactly `bug_bounty_scope` (the
+    `core.bug_bounty_scope.create_bug_bounty_scope` result -- this is
+    the scope every proposed request must be re-checked against via
+    `evaluate_bug_bounty_request_scope`, exactly like a Demo Mode run),
+    `allowed_tools` (the validated list, order preserved),
+    `operator_scope_acknowledged` (always `True`).
+    """
+    if operator_scope_acknowledged is not True:
+        _raise_run(
+            "EXTERNAL_SCOPE_NOT_ACKNOWLEDGED",
+            "operator_scope_acknowledged must be true -- providing scope is a caller/operator assertion "
+            "only, never proof that ThreatTrace has verified legal authorization",
+        )
+
+    if not isinstance(scope, Mapping) or set(scope) != set(_EXTERNAL_SCOPE_REQUIRED_FIELDS):
+        _raise_run(
+            "INVALID_EXTERNAL_SCOPE",
+            "scope must be a mapping containing exactly hosts, ports, path_prefixes, allowed_tools",
+        )
+
+    raw_hosts = scope["hosts"]
+    if not isinstance(raw_hosts, list) or not raw_hosts or not all(isinstance(h, str) and h.strip() for h in raw_hosts):
+        _raise_run("INVALID_EXTERNAL_SCOPE", "scope['hosts'] must be a non-empty list of non-blank hostnames")
+    hosts = [h.strip().lower() for h in raw_hosts]
+    for host in hosts:
+        if "*" in host:
+            _raise_run(
+                "EXTERNAL_SCOPE_WILDCARD_NOT_ALLOWED",
+                "wildcard hostnames are not supported for Authorized External Target scope in this "
+                "checkpoint -- list each exact hostname explicitly",
+            )
+
+    raw_ports = scope["ports"]
+    if not isinstance(raw_ports, list) or not raw_ports or not all(
+        isinstance(p, int) and not isinstance(p, bool) and 1 <= p <= 65535 for p in raw_ports
+    ):
+        _raise_run("INVALID_EXTERNAL_SCOPE", "scope['ports'] must be a non-empty list of ints between 1 and 65535")
+
+    raw_path_prefixes = scope["path_prefixes"]
+    if not isinstance(raw_path_prefixes, list) or not raw_path_prefixes or not all(
+        isinstance(p, str) and p.startswith("/") for p in raw_path_prefixes
+    ):
+        _raise_run("INVALID_EXTERNAL_SCOPE", "scope['path_prefixes'] must be a non-empty list of absolute path strings")
+
+    raw_allowed_tools = scope["allowed_tools"]
+    if not isinstance(raw_allowed_tools, list) or not raw_allowed_tools or not all(
+        isinstance(t, str) for t in raw_allowed_tools
+    ):
+        _raise_run("INVALID_EXTERNAL_SCOPE", "scope['allowed_tools'] must be a non-empty list of tool id strings")
+    for tool_id in raw_allowed_tools:
+        if tool_id not in EXTERNAL_TARGET_ELIGIBLE_TOOL_IDS:
+            _raise_run(
+                "EXTERNAL_SCOPE_TOOL_NOT_PERMITTED",
+                f"{tool_id!r} is not a recognized/permitted tool id for an Authorized External Target run",
+            )
+
+    if not isinstance(target, str) or not target.strip():
+        _raise_run("INVALID_TARGET", "target must be a non-blank string")
+    try:
+        parsed_target = urlsplit(target.strip())
+    except ValueError:
+        _raise_run("INVALID_TARGET", "target could not be parsed as a URL")
+    scheme = parsed_target.scheme.lower()
+    if scheme not in ("http", "https"):
+        _raise_run("INVALID_TARGET", "target must use the http or https scheme")
+    default_port = 443 if scheme == "https" else 80
+
+    allowed_origins: list[str] = []
+    for host in hosts:
+        for port in raw_ports:
+            origin = f"{scheme}://{host}" if port == default_port else f"{scheme}://{host}:{port}"
+            if origin not in allowed_origins:
+                allowed_origins.append(origin)
+
+    try:
+        bug_bounty_scope = create_bug_bounty_scope(
+            target=target.strip(),
+            target_type="web_application",
+            allowed_origins=allowed_origins,
+            allowed_paths=list(raw_path_prefixes),
+            excluded_paths=None,
+            testing_profile="safe_active",
+        )
+    except BugBountyScopeError as exc:
+        _raise_run("INVALID_EXTERNAL_TARGET", str(exc))
+
+    return {
+        "bug_bounty_scope": bug_bounty_scope,
+        "allowed_tools": list(raw_allowed_tools),
+        "operator_scope_acknowledged": True,
+    }

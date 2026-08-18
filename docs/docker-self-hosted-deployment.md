@@ -14,7 +14,7 @@ cd Threattrace
 docker compose up -d --build
 ```
 
-Then open **http://127.0.0.1:8420**. The dashboard should immediately show accurate System Readiness — Backend/Governor/HTTP Assessor/Nmap/Nuclei/ZAP/Threat Intelligence/Detection Engineering all `READY`, Burp DAST clearly under Optional Integrations — even before you start a run.
+Then open **http://127.0.0.1:8420**. The dashboard should immediately show accurate System Readiness — Backend/Governor/HTTP Assessor/httpx/Katana/Nmap/Nuclei/ZAP/Threat Intelligence/Detection Engineering all `READY`, Burp DAST clearly under Optional Integrations — even before you start a run.
 
 Shutdown:
 
@@ -44,7 +44,7 @@ curl http://127.0.0.1:8420/api/system
                     └─────────────────────────────────────────────────────┘
 ```
 
-- **`threattrace`** — the application image: Python runtime, ThreatTrace source (`core/`, `adapters/`, `backend/`, `runtime/`, `dashboard/`), plus Nmap and Nuclei installed *inside the image*. Serves the backend API and the dashboard on `8420`.
+- **`threattrace`** — the application image: Python runtime, ThreatTrace source (`core/`, `adapters/`, `backend/`, `runtime/`, `dashboard/`), plus Nmap, Nuclei, httpx, and Katana installed *inside the image*. Serves the backend API and the dashboard on `8420`.
 - **`zap`** — the official `zaproxy/zap-stable` image, running as its own daemon on the internal network. The backend reaches it at `http://zap:8080` (the Compose service name), never `127.0.0.1:8080` — inside a container, `127.0.0.1` means that container, not a sibling service.
 - **`juice-shop`** — the official `bkimminich/juice-shop` image, the default authorized demo scan target, reachable internally at `http://juice-shop:3000`.
 
@@ -74,17 +74,18 @@ This is why the dashboard can honestly show `http://localhost:3000/` to a human 
 
 ## 5. Required vs. optional tools
 
-`/api/system` is the single authoritative source for platform readiness (backed by `runtime.tool_runtime.evaluate_tool_readiness`), organized into five categories:
+`/api/system` is the single authoritative source for platform readiness (backed by `runtime.tool_runtime.evaluate_tool_readiness`), organized into six categories:
 
 | Category | Items | Required? |
 |---|---|---|
 | Core Services | ThreatTrace Backend, Security Governor | required |
-| Scanners | HTTP Assessor, Nmap, Nuclei, ZAP | required |
+| Discovery | HTTP Assessor, httpx, Katana | required |
+| Scanners | Nmap, Nuclei, ZAP | required |
 | Intelligence | Threat Intelligence | required |
 | Detection | Detection Engineering | required |
 | Optional Integrations | Burp DAST, Authenticated Testing, Controlled Validation | **optional** |
 
-Nmap and Nuclei are baked into the `threattrace` image, so both report `ready` as soon as the image builds successfully — no host install, no `PATH` edits, no admin rights. Nuclei's template set is baked in at build time at a pinned version (`nuclei -update-templates` is run once during image build, never at runtime, and never triggered by LLM output) — deterministic and fully offline-capable after the image exists.
+Nmap, Nuclei, httpx, and Katana are all baked into the `threattrace` image (pinned release binaries for the latter three, same reproducible-build discipline), so all four report `ready` as soon as the image builds successfully — no host install, no `PATH` edits, no admin rights. Nuclei's template set is baked in at build time at a pinned version (`nuclei -update-templates` is run once during image build, never at runtime, and never triggered by LLM output) — deterministic and fully offline-capable after the image exists.
 
 Burp DAST, Authenticated Testing, and Controlled Validation are **not implemented** in this checkpoint. The dashboard shows them under "Optional Integrations" and never renders them as a failed core service — an unconfigured optional integration does not make the platform look unhealthy. Authenticated Testing and Controlled Validation are shown as `not_implemented` (a declared, future capability), not `not_installed` (an unexpectedly missing required one).
 
