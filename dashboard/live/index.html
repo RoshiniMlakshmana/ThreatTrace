@@ -92,6 +92,13 @@
   .surface-metric-value { font-size: 22px; font-weight: 600; }
   .surface-note { font-size: 12px; color: var(--muted); margin: 8px 0; }
   .surface-subsection-title { font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); margin: 14px 0 6px; border-top: 1px solid var(--border); padding-top: 10px; }
+  .finding-block { border: 1px solid var(--border); border-radius: 8px; padding: 12px 14px; margin-bottom: 10px; }
+  .finding-block:last-child { margin-bottom: 0; }
+  .finding-head { display: flex; align-items: baseline; gap: 8px; margin-bottom: 6px; flex-wrap: wrap; }
+  .finding-title { font-size: 14px; font-weight: 600; margin-right: auto; }
+  .finding-why { font-size: 13px; color: var(--text); margin: 8px 0 0; }
+  .finding-action { font-size: 13px; margin: 8px 0 0; padding: 8px 10px; background: var(--panel-2); border-left: 3px solid var(--accent); border-radius: 4px; }
+  .lifecycle-subsection-title { font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); margin: 12px 0 4px; border-top: 1px solid var(--border); padding-top: 8px; }
 </style>
 </head>
 <body>
@@ -141,9 +148,9 @@
 
 <main>
 
-  <section class="card wide" id="card-readiness">
-    <h2>System Readiness</h2>
-    <div id="readiness-body" class="readiness-grid empty">Checking backend…</div>
+  <section class="card wide" id="card-overview">
+    <h2>ThreatTrace Overview</h2>
+    <div id="overview-body"><div class="empty">No active run.</div></div>
   </section>
 
   <section class="card" id="card-status">
@@ -156,9 +163,9 @@
     <div class="pipeline" id="pipeline-body"></div>
   </section>
 
-  <section class="card" id="card-tools">
-    <h2>D. Tool Activity</h2>
-    <div id="tools-body"></div>
+  <section class="card wide" id="card-findings">
+    <h2>F. Findings</h2>
+    <div id="findings-body" class="empty">No active run.</div>
   </section>
 
   <section class="card wide" id="card-attack-surface">
@@ -166,29 +173,9 @@
     <div id="attack-surface-body"><div class="empty">No discovery data for this run.</div></div>
   </section>
 
-  <section class="card" id="card-http-enrichment">
-    <h2>N. HTTP Enrichment (httpx)</h2>
-    <div id="http-enrichment-body" class="empty">No httpx activity on this run.</div>
-  </section>
-
-  <section class="card" id="card-governor">
-    <h2>E. Security Governor</h2>
-    <div id="governor-body" class="empty">No Governor evaluation yet.</div>
-  </section>
-
-  <section class="card wide" id="card-findings">
-    <h2>F. Findings</h2>
-    <div id="findings-body" class="empty">No active run.</div>
-  </section>
-
   <section class="card wide" id="card-lifecycle">
     <h2>L. Security Lifecycle Detail</h2>
     <div id="lifecycle-body"><div class="empty">Not a Full Security Lifecycle run.</div></div>
-  </section>
-
-  <section class="card wide" id="card-evaluation">
-    <h2>J. Accuracy &amp; Evaluation</h2>
-    <div id="evaluation-body"><div class="empty">No benchmark evaluation available for this run.</div></div>
   </section>
 
   <section class="card" id="card-ti">
@@ -206,38 +193,72 @@
     <div id="ai-activity-body"><div class="empty">No active run.</div></div>
   </section>
 
-  <section class="card wide" id="card-feed">
-    <h2>C. Live Event Feed</h2>
-    <div id="feed-body" class="feed"><div class="empty">No active run.</div></div>
+  <section class="card wide" id="card-evaluation">
+    <h2>J. Supported Juice Shop Evaluation</h2>
+    <div id="evaluation-body"><div class="empty">No benchmark evaluation available for this run.</div></div>
+  </section>
+
+  <section class="card wide" id="card-readiness">
+    <h2>System Readiness</h2>
+    <div id="readiness-body" class="readiness-grid empty">Checking backend…</div>
+  </section>
+
+  <section class="card" id="card-tools">
+    <h2>D. Tool Activity</h2>
+    <div id="tools-body"></div>
+  </section>
+
+  <section class="card" id="card-http-enrichment">
+    <h2>N. HTTP Enrichment (httpx)</h2>
+    <div id="http-enrichment-body" class="empty">No httpx activity on this run.</div>
+  </section>
+
+  <section class="card" id="card-governor">
+    <h2>E. Security Governor</h2>
+    <div id="governor-body" class="empty">No Governor evaluation yet.</div>
   </section>
 
   <section class="card wide" id="card-architecture">
     <h2>How ThreatTrace Works</h2>
-    <details>
+    <details open>
       <summary>Expand architecture overview</summary>
       <div class="safety" style="margin-top:8px">
-        <strong>AI proposes/reasons</strong> &rarr;
-        <strong>Policy checks</strong> &rarr;
-        <strong>Governor authorizes/blocks</strong> &rarr;
-        <strong>Deterministic tools execute</strong> &rarr;
-        <strong>Evidence normalized/correlated</strong> &rarr;
-        <strong>Human reviews</strong>
+        <strong>Discover</strong> &rarr;
+        <strong>Validate Scope</strong> &rarr;
+        <strong>Security Tools</strong> &rarr;
+        <strong>Normalize Evidence</strong> &rarr;
+        <strong>Correlate Findings</strong> &rarr;
+        <strong>Prioritize</strong> &rarr;
+        <strong>Threat Intel / Hunt / Detection</strong> &rarr;
+        <strong>Purple Recommendation</strong> &rarr;
+        <strong>Human Review</strong>
         <br><br>
-        AI (when actually invoked -- see the AI Assistance card below for this run) only ever <em>proposes</em>; it never executes a tool or applies a remediation directly. Every proposal is re-checked by deterministic Policy and Governor code before anything real happens, every real tool call goes through a closed, non-LLM-generated argument vector, and every result is normalized/correlated deterministically. A human analyst is the only party who can mark a finding reviewed.
+        <strong>AI may propose/reason</strong> (see the AI Assistance card for exactly where, this run) -- it never executes a tool or applies a remediation directly.<br>
+        <strong>Policy + the Security Governor control execution</strong> -- every proposal is re-checked by deterministic code before anything real happens, and every real tool call goes through a closed, non-LLM-generated argument vector.<br>
+        <strong>Human approves final outcomes</strong> -- a human analyst is the only party who can mark a finding reviewed.
       </div>
     </details>
   </section>
 
+  <section class="card wide" id="card-feed">
+    <h2>C. Technical Event Log</h2>
+    <div class="surface-note">Low-level execution events for debugging and audit visibility.</div>
+    <div id="feed-body" class="feed"><div class="empty">No active run.</div></div>
+  </section>
+
   <section class="card wide" id="card-safety">
-    <h2>I. Limitations &amp; Safety</h2>
-    <div class="safety">
-      <strong>Local development/research interface</strong> -- not a production-authenticated control plane. No authentication of any kind is implemented.<br>
-      <strong>Run history</strong> is in-memory only for this backend process's lifetime; restarting the backend loses every run.<br>
-      <strong>Security Governor decisions</strong> evaluate caller-supplied observable state only -- never proof of intent or authenticated identity.<br>
-      <strong>Detection rule candidates</strong> are drafts only: <code class="small">deployment_state</code> is always <code class="small">NOT_DEPLOYED</code> in this checkpoint. Syntax validation is structural only, never detection-efficacy testing.<br>
-      <strong>Human review status</strong> shown here is caller-supplied / local development action unless separately authenticated.<br>
-      <strong>Live scanning is localhost-only</strong> for this checkpoint -- the backend refuses any non-<code class="small">localhost</code> Bug Bounty target.
-    </div>
+    <h2>I. Scope &amp; Safety</h2>
+    <details>
+      <summary>What this result means -- and what it does not mean</summary>
+      <div class="safety" style="margin-top:8px">
+        <strong>Local development/research interface</strong> -- not a production-authenticated control plane. No authentication of any kind is implemented.<br>
+        <strong>Run history</strong> is in-memory only for this backend process's lifetime; restarting the backend loses every run.<br>
+        <strong>Security Governor decisions</strong> evaluate caller-supplied observable state only -- never proof of intent or authenticated identity.<br>
+        <strong>Detection rule candidates</strong> are drafts only: <code class="small">deployment_state</code> is always <code class="small">NOT_DEPLOYED</code> in this checkpoint. Syntax validation is structural only, never detection-efficacy testing.<br>
+        <strong>Human review status</strong> shown here is caller-supplied / local development action unless separately authenticated.<br>
+        <strong>Live scanning is localhost-only</strong> for Demo Mode -- the backend refuses any non-<code class="small">localhost</code> Bug Bounty target. Authorized External Target mode requires an explicit operator-declared scope and acknowledgment; this is never proof of legal authorization.
+      </div>
+    </details>
   </section>
 
 </main>
@@ -501,6 +522,169 @@ function renderStatus(run) {
   el("cancel-run").disabled = TERMINAL.has(run.status);
 }
 
+// ---------------------------------------------------------------------------
+// ThreatTrace Overview -- the primary "understand this run in ~20 seconds"
+// summary. Every field below is read directly from the real run object
+// (run.report, run.attack_surface, run.lifecycle) or computed by simple,
+// deterministic aggregation over them -- never hardcoded, never invented,
+// and never produced by an LLM. A field whose underlying data does not
+// exist for this run is simply omitted from the summary sentence(s)
+// rather than guessed at (see buildPlainEnglishSummary).
+// ---------------------------------------------------------------------------
+
+function runModeLabel(run) {
+  return run.lifecycle ? "Full Security Lifecycle" : "Bug Bounty (fast scan)";
+}
+
+function severityBreakdown(canonicalFindings) {
+  const counts = { critical: 0, high: 0, medium: 0, low: 0, unknown: 0 };
+  for (const f of canonicalFindings) {
+    const sev = f.technical_severity;
+    if (sev in counts) counts[sev]++; else counts.unknown++;
+  }
+  return counts;
+}
+
+// Aggregates one outcome field across every selected lifecycle finding
+// into a single honest summary label -- "mixed" when findings disagree,
+// never silently picking the first one as if it were the only one.
+function aggregateLifecycleOutcome(results, resultKey) {
+  if (!results || !results.length) return null;
+  const outcomes = new Set(results.map(r => r[resultKey] && r[resultKey].outcome).filter(Boolean));
+  if (outcomes.size === 0) return null;
+  if (outcomes.size === 1) return lifecycleOutcomeLabel([...outcomes][0]);
+  return "Mixed (" + [...outcomes].map(lifecycleOutcomeLabel).join(", ") + ")";
+}
+
+function humanReviewCounts(results) {
+  if (!results || !results.length) return null;
+  const reviewed = results.filter(r => r.case && r.case.approval_state !== "pending").length;
+  return { total: results.length, reviewed, pending: results.length - reviewed };
+}
+
+// "AI used in this run?" -- YES only when at least one real Detection
+// Engineering proposal was actually processed (see renderAiActivity's
+// own NO_AI_REASONS); the Bug Bounty planner itself never invokes an
+// LLM, so it alone can never make this YES.
+function aiParticipationSummary(run) {
+  const results = run.lifecycle && Array.isArray(run.lifecycle.results) ? run.lifecycle.results : [];
+  const NO_AI_REASONS = new Set(["telemetry_gap", "no_llm_proposal_supplied"]);
+  const invokedCount = results.filter(r => r.detection_result && !NO_AI_REASONS.has(r.detection_result.reason)).length;
+  if (invokedCount === 0) return "NO";
+  if (invokedCount === results.length) return "YES";
+  return "PARTIAL";
+}
+
+function renderOverview(run) {
+  const body = el("overview-body");
+  if (!run) { body.innerHTML = '<div class="empty">No active run.</div>'; return; }
+
+  const report = run.report;
+  const findings = report && Array.isArray(report.canonical_findings) ? report.canonical_findings : null;
+  const surface = run.attack_surface && run.attack_surface.status !== "failed" ? run.attack_surface : null;
+  const lifecycle = run.lifecycle;
+  const results = lifecycle && Array.isArray(lifecycle.results) ? lifecycle.results : null;
+  const corroborated = report && report.correlation_summary ? report.correlation_summary.multi_tool_corroborated_count : null;
+  const reviewCounts = humanReviewCounts(results);
+
+  const rows = [
+    ["Target", run.target_summary || "—"],
+    ["Run mode", runModeLabel(run)],
+    ["Run status", `<span class="pill ${pillClass(TERMINAL.has(run.status) ? run.status : 'active')}">${esc(run.status)}</span>`],
+  ];
+
+  if (findings) {
+    const sev = severityBreakdown(findings);
+    const sevText = ["critical","high","medium","low"].filter(k => sev[k] > 0).map(k => `${sev[k]} ${k}`).join(" · ") || "none above informational";
+    rows.push(["Security findings", `${findings.length} (${sevText})`]);
+  }
+  if (surface) {
+    rows.push(["Application resources discovered", esc(surface.attack_surface_summary && surface.attack_surface_summary.endpoint_count != null ? surface.attack_surface_summary.endpoint_count : "—")]);
+  }
+  if (corroborated !== null && corroborated !== undefined) {
+    rows.push(["Multi-tool corroborated findings", esc(corroborated)]);
+  }
+  if (lifecycle) {
+    rows.push(["Findings prioritized / selected", `${esc(lifecycle.total_canonical_findings ?? 0)} prioritized, ${esc((lifecycle.findings_selected || []).length)} selected for downstream review`]);
+  }
+  if (results) {
+    const ti = aggregateLifecycleOutcome(results, "ti_result");
+    const hunt = aggregateLifecycleOutcome(results, "hunt_result");
+    const det = aggregateLifecycleOutcome(results, "detection_result");
+    const purpleCount = results.filter(r => r.purple_result && r.purple_result.outcome === "recommendation_created").length;
+    if (ti) rows.push(["Threat Intelligence outcome", esc(ti)]);
+    if (hunt) rows.push(["Threat Hunt outcome", esc(hunt)]);
+    if (det) rows.push(["Detection Engineering outcome", esc(det)]);
+    rows.push(["Purple recommendations created", esc(purpleCount)]);
+  }
+  if (reviewCounts) {
+    rows.push(["Human Review", `${reviewCounts.reviewed} of ${reviewCounts.total} reviewed, ${reviewCounts.pending} awaiting decision`]);
+  } else if (run.human_review_required) {
+    rows.push(["Human Review", "awaiting review"]);
+  }
+  rows.push(["AI participation", `<span class="pill ${aiParticipationSummary(run) === 'NO' ? 'na' : 'warn'}">${esc(aiParticipationSummary(run))}</span> -- see AI Assistance card for detail`]);
+
+  const rowsHtml = rows.map(([k, v]) => `<div class="row"><span class="k">${esc(k)}</span><span>${v}</span></div>`).join("");
+  const summarySentences = buildPlainEnglishSummary(run);
+  const summaryHtml = summarySentences.length
+    ? `<div class="surface-note" style="font-size:13px;line-height:1.5">${esc(summarySentences.join(" "))}</div>`
+    : "";
+
+  body.innerHTML = summaryHtml + rowsHtml;
+}
+
+// Deterministic, template-assembled plain-English summary -- every
+// sentence is built from real fields already present on `run`; a
+// sentence whose underlying data is unavailable is omitted entirely,
+// never guessed at, and no LLM is ever involved in producing this text.
+function buildPlainEnglishSummary(run) {
+  const sentences = [];
+  const report = run.report;
+  const findings = report && Array.isArray(report.canonical_findings) ? report.canonical_findings : null;
+  const lifecycle = run.lifecycle;
+  const results = lifecycle && Array.isArray(lifecycle.results) ? lifecycle.results : null;
+
+  if (run.target_summary && Array.isArray(run.executed_tools) && run.executed_tools.length) {
+    sentences.push(`ThreatTrace assessed ${run.target_summary} using ${run.executed_tools.length} executed tool(s) (${run.executed_tools.join(", ")}).`);
+  }
+  if (findings) {
+    sentences.push(`It produced ${findings.length} canonical finding(s).`);
+  }
+  if (lifecycle) {
+    sentences.push(`${(lifecycle.findings_selected || []).length} finding(s) were selected for downstream defensive review.`);
+  }
+  if (results && results.length) {
+    const tiOutcomes = new Set(results.map(r => r.ti_result && r.ti_result.outcome).filter(Boolean));
+    if (tiOutcomes.has("reviewed_relevant")) {
+      sentences.push("Relevant external threat intelligence was linked to at least one selected finding.");
+    } else if (tiOutcomes.size) {
+      sentences.push("No relevant external threat intelligence was linked to those findings.");
+    }
+
+    const huntGap = results.some(r => r.hunt_result && r.hunt_result.outcome === "telemetry_gap");
+    const detGap = results.some(r => r.detection_result && r.detection_result.reason === "telemetry_gap");
+    const detRuleCreated = results.some(r => r.detection_result && r.detection_result.outcome === "candidate_ready");
+    if (detRuleCreated) {
+      sentences.push("At least one detection rule candidate was generated for human review.");
+    } else if (huntGap || detGap) {
+      sentences.push("Threat hunting and/or detection engineering were limited by missing telemetry.");
+    }
+
+    const purpleCount = results.filter(r => r.purple_result && r.purple_result.outcome === "recommendation_created").length;
+    if (purpleCount) {
+      sentences.push(`Purple Team remediation recommendations were created for ${purpleCount} finding(s) (recommendations only -- nothing was applied automatically).`);
+    }
+
+    const reviewCounts = humanReviewCounts(results);
+    if (reviewCounts) {
+      sentences.push(reviewCounts.pending > 0
+        ? `Human review is pending for ${reviewCounts.pending} of ${reviewCounts.total} selected finding(s).`
+        : "All selected findings have been reviewed.");
+    }
+  }
+  return sentences;
+}
+
 const ALL_TOOLS = ["http_assessor","nmap","nuclei","zap","burp_dast"];
 let systemToolReadiness = {};
 
@@ -558,7 +742,7 @@ function renderReadiness(categories) {
 
 function renderGovernor(payload) {
   const body = el("governor-body");
-  if (!payload) { body.innerHTML = '<div class="empty">No Governor evaluation yet.</div>'; return; }
+  if (!payload) { body.innerHTML = '<div class="empty">No Governor evaluation yet -- this appears once the first tool-execution request for this run is evaluated.</div>'; return; }
   body.innerHTML = `
     <div class="row"><span class="k">Decision</span><span class="pill ${payload.decision === 'allow' ? 'done' : 'blocked'}">${esc(payload.decision)}</span></div>
     <div class="row"><span class="k">Execution allowed</span><span>${payload.execution_allowed ? "true" : "false"}</span></div>
@@ -592,33 +776,121 @@ function renderFindings(run) {
   // so it is always null today; that is shown honestly as "Not mapped
   // -- insufficient behavioral evidence," never fabricated or forced
   // onto a config/DAST-style finding.
-  let rows = report.canonical_findings.map(f => {
-    const sources = Array.isArray(f.tools_used) && f.tools_used.length ? f.tools_used.join(", ") : "unknown";
-    const evidenceCount = Array.isArray(f.evidence_sources) ? f.evidence_sources.length
-      : (Array.isArray(f.evidence_digests) ? f.evidence_digests.length : null);
-    const evidenceText = evidenceCount === null ? "no evidence metadata" : `${evidenceCount} record${evidenceCount === 1 ? "" : "s"}`;
-    const reviewState = f.status === "requires_human_review" ? "Awaiting Review" : (f.status || "—");
-    const classification = [
-      f.cwe ? esc(f.cwe) : null,
-      f.owasp_category ? esc(f.owasp_category) : null,
-      (f.cve || []).length ? esc(f.cve.join(", ")) : null,
-    ].filter(Boolean).join(" · ") || "—";
-    const attck = f.mitre_attack_mapping
-      ? esc(JSON.stringify(f.mitre_attack_mapping))
-      : "Not mapped — insufficient behavioral evidence";
-    return `
-    <tr>
-      <td>${esc(f.title || f.finding_id)}</td>
-      <td class="sev-${esc(f.technical_severity)}">${esc(f.technical_severity)}</td>
-      <td>${esc(f.confidence || "—")}</td>
-      <td>${esc(sources)}</td>
-      <td>${esc(evidenceText)}</td>
-      <td>${classification}</td>
-      <td>${attck}</td>
-      <td>${esc(reviewState)}</td>
-    </tr>`;
-  }).join("");
-  body.innerHTML = `<table><thead><tr><th>Finding</th><th>Severity</th><th>Confidence</th><th>Sources</th><th>Evidence</th><th>CWE / OWASP / CVE</th><th>MITRE ATT&amp;CK</th><th>Review State</th></tr></thead><tbody>${rows}</tbody></table>`;
+  let rows = report.canonical_findings.map(f => renderFindingBlock(f, run)).join("");
+  body.innerHTML = rows;
+}
+
+// Deterministic, closed-vocabulary explanation of *why a finding class
+// matters* -- keyed on the exact real vulnerability_class values this
+// codebase ever assigns (core.bug_bounty_findings.VULNERABILITY_CLASSES
+// plus the two generic DAST/Nuclei fallbacks in
+// core.bug_bounty_evidence_normalization). This is a fixed lookup
+// table, never an LLM invention or a per-finding guess -- an unknown or
+// null class always falls through to the honest fallback sentence
+// below rather than a fabricated explanation.
+const FINDING_CLASS_IMPACT = {
+  security_header_misconfiguration: "Missing or weak security headers make it easier for an attacker to run clickjacking, MIME-sniffing, or script-injection attacks against people using this site.",
+  information_disclosure: "The application is exposing information (such as version numbers, stack traces, or internal paths) that an attacker can use to plan a more targeted attack.",
+  cors_misconfiguration: "A permissive Cross-Origin Resource Sharing policy can let another website read data from this application on behalf of a logged-in victim.",
+  exposed_metadata: "Internal files or metadata are reachable from outside the application, which can leak configuration or source details to an attacker.",
+  input_reflection: "User-supplied input is reflected back by the application without confirmed sanitization -- a precondition commonly abused for cross-site scripting.",
+  access_control_indicator: "The application shows a signal that access control on this resource may not be enforced as expected, which can allow unauthorized access to data or functionality.",
+  http_method_observation: "An HTTP method is accepted that may not be intended for this endpoint, which can expose unintended functionality.",
+  redirect_observation: "The application redirects based on attacker-influenceable input, a precondition commonly abused for open-redirect / phishing attacks.",
+  dast_observation: "A dynamic application security scanner flagged this behavior. See Technical Details (CWE / OWASP category) for the specific weakness class.",
+  nuclei_template_match: "A known vulnerability signature matched this target. See Technical Details (CVE / CWE) for the specific issue.",
+};
+
+function findingWhyItMatters(f) {
+  return FINDING_CLASS_IMPACT[f.vulnerability_class]
+    || "Potential impact has not yet been classified by ThreatTrace for this finding type -- see Technical Details for the raw evidence.";
+}
+
+function findingLocation(f) {
+  const hostPort = f.host ? esc(f.host) + (f.port ? ":" + esc(f.port) : "") : null;
+  const pathPart = f.path || f.url ? esc(f.path || f.url) : null;
+  if (hostPort && pathPart) return `${hostPort} &mdash; ${pathPart}`;
+  return hostPort || pathPart || "—";
+}
+
+// Recommended action is read only from real fields: a matching
+// lifecycle result's purple_result.recommendations (created by
+// core.bug_bounty_purple_remediation, never invented here), falling
+// back to the finding's own remediation field (always null today --
+// core.bug_bounty_final_report never populates it). A canonical finding
+// that a Full Security Lifecycle run's own bounded selection never
+// carried into run.lifecycle.results is distinguished explicitly
+// ("not_selected") from one where no lifecycle ran at all ("none") --
+// never a fabricated recommendation either way.
+function findingRecommendedAction(f, run) {
+  const lifecycle = run.lifecycle;
+  const results = lifecycle && Array.isArray(lifecycle.results) ? lifecycle.results : [];
+  const match = results.find(r => r.finding_id === f.finding_id);
+  if (match && match.purple_result && Array.isArray(match.purple_result.recommendations) && match.purple_result.recommendations.length) {
+    return { kind: "recommendation", text: match.purple_result.recommendations[0], source: "Purple Team recommendation -- not yet applied" };
+  }
+  if (f.remediation) return { kind: "recommendation", text: f.remediation, source: "remediation field" };
+  if (lifecycle && !match) {
+    return {
+      kind: "not_selected",
+      selectedCount: Array.isArray(lifecycle.findings_selected) ? lifecycle.findings_selected.length : null,
+      totalCount: lifecycle.total_canonical_findings ?? null,
+    };
+  }
+  return { kind: "none" };
+}
+
+function renderFindingBlock(f, run) {
+  const sources = Array.isArray(f.tools_used) && f.tools_used.length ? f.tools_used.join(", ") : "unknown";
+  const evidenceCount = Array.isArray(f.evidence_sources) ? f.evidence_sources.length
+    : (Array.isArray(f.evidence_digests) ? f.evidence_digests.length : null);
+  const evidenceText = evidenceCount === null ? "no evidence metadata" : `${evidenceCount} record${evidenceCount === 1 ? "" : "s"}`;
+  const reviewState = f.status === "requires_human_review" ? "Awaiting Review" : (f.status || "—");
+  const classification = [
+    f.cwe ? esc(f.cwe) : null,
+    f.owasp_category ? esc(f.owasp_category) : null,
+    (f.cve || []).length ? esc(f.cve.join(", ")) : null,
+  ].filter(Boolean).join(" · ") || "—";
+  const attck = f.mitre_attack_mapping
+    ? esc(JSON.stringify(f.mitre_attack_mapping))
+    : "Not mapped — insufficient behavioral evidence";
+  const action = findingRecommendedAction(f, run);
+  let actionHtml;
+  if (action.kind === "recommendation") {
+    actionHtml = `<div class="finding-action"><strong>What to do:</strong> ${esc(action.text)}<div class="surface-note" style="margin:4px 0 0">${esc(action.source)}</div></div>`;
+  } else if (action.kind === "not_selected") {
+    const countsText = (action.selectedCount !== null && action.totalCount !== null)
+      ? ` ${esc(action.selectedCount)} of ${esc(action.totalCount)} findings were selected.`
+      : "";
+    actionHtml = `<div class="finding-action"><strong>What to do:</strong> No Purple recommendation generated because this finding was not selected for downstream lifecycle review in this run.<div class="surface-note" style="margin:4px 0 0">ThreatTrace selected the highest-priority findings for Threat Intelligence, Hunting, Detection, Purple remediation, and Human Review.${countsText}</div></div>`;
+  } else {
+    actionHtml = `<div class="finding-action"><strong>What to do:</strong> No remediation recommendation has been generated for this finding yet.</div>`;
+  }
+
+  return `
+  <div class="finding-block">
+    <div class="finding-head">
+      <span class="finding-title">${esc(f.title || f.finding_id)}</span>
+      <span class="pill sev-${esc(f.technical_severity)}">${esc(f.technical_severity)} severity</span>
+      <span class="pill na">${esc(f.confidence || "—")} confidence</span>
+    </div>
+    <div class="row"><span class="k">Where</span><span>${findingLocation(f)}</span></div>
+    <div class="row"><span class="k">Detected by</span><span>${esc(sources)}</span></div>
+    <div class="row"><span class="k">Evidence</span><span>${esc(evidenceText)}</span></div>
+    <div class="row"><span class="k">Review state</span><span>${esc(reviewState)}</span></div>
+    <div class="finding-why"><strong>Why it matters:</strong> ${esc(findingWhyItMatters(f))}</div>
+    ${actionHtml}
+    <details>
+      <summary>Technical Details</summary>
+      <div class="row"><span class="k">Finding ID</span><span>${esc(f.finding_id)}</span></div>
+      <div class="row"><span class="k">CWE / OWASP / CVE</span><span>${classification}</span></div>
+      <div class="row"><span class="k">MITRE ATT&amp;CK</span><span>${attck}</span></div>
+      <div class="row"><span class="k">Vulnerability class</span><span>${esc(f.vulnerability_class || "—")}</span></div>
+      <div class="row"><span class="k">Validation state</span><span>${esc(f.validation_state || "—")}</span></div>
+      <div class="row"><span class="k">Evidence digests</span><span>${esc((f.evidence_digests || []).filter(Boolean).join(", ") || "—")}</span></div>
+      ${(f.limitations || []).length ? `<div class="row"><span class="k">Limitations</span><span>${esc(f.limitations.join(" "))}</span></div>` : ""}
+    </details>
+  </div>`;
 }
 
 // All values rendered below come directly from the real run.lifecycle
@@ -639,6 +911,21 @@ function lifecycleOutcomeLabel(outcome) {
   }[outcome] || outcome || "—";
 }
 
+// core.context_prioritization.prioritize_finding's real priority_reasons
+// are a list of {code, modifier, message} objects -- never plain strings
+// in production. Test fixtures (and any future legacy caller) may still
+// pass plain strings, so both are supported here; an object with neither
+// a usable message nor code renders as nothing (filtered out) rather than
+// ever falling through to JavaScript's default object-to-string coercion.
+function priorityReasonText(reason) {
+  if (typeof reason === "string") return reason.trim() || null;
+  if (reason && typeof reason === "object") {
+    if (typeof reason.message === "string" && reason.message.trim()) return reason.message.trim();
+    if (typeof reason.code === "string" && reason.code.trim()) return reason.code.trim();
+  }
+  return null;
+}
+
 function renderLifecycle(run) {
   const body = el("lifecycle-body");
   const lifecycle = run && run.lifecycle;
@@ -648,61 +935,110 @@ function renderLifecycle(run) {
     <div class="row"><span class="k">Context</span><span>${esc(lifecycle.context_label || "demo/research context")}</span></div>
     <div class="row"><span class="k">Canonical findings</span><span>${esc(lifecycle.total_canonical_findings ?? 0)}</span></div>
     <div class="row"><span class="k">Findings selected</span><span>${esc((lifecycle.findings_selected || []).length)} (${esc(lifecycle.selection_reason || "—")})</span></div>
+    <div class="surface-note">ThreatTrace prioritizes all findings, then sends a bounded subset of the highest-priority findings through deeper defensive analysis (Threat Intelligence, Hunting, Detection Engineering, Purple remediation, and Human Review).</div>
   `;
 
   const results = Array.isArray(lifecycle.results) ? lifecycle.results : [];
   if (!results.length) {
-    body.innerHTML = summary + '<div class="empty">No findings selected for downstream review.</div>';
+    body.innerHTML = summary + `<div class="empty">No findings were selected for downstream review (0 of ${esc(lifecycle.total_canonical_findings ?? 0)} canonical findings met the selection criteria).</div>`;
     return;
   }
 
-  // Per-cell titles below surface the real "why" behind each outcome --
-  // e.g. Threat Intel's own queried_cve, Threat Hunt's own
-  // missing_telemetry list, Detection's own reason -- exactly the real
-  // fields core.bug_bounty_threat_intel_review / core.bug_bounty_
-  // threat_hunt_review / backend.orchestrator._review_detection_
-  // engineering_for_finding already return; never invented text.
-  const rows = results.map(r => {
+  // Every field below is real -- Threat Intel's own queried_cve, Threat
+  // Hunt's own required/available/missing_telemetry, Detection's own
+  // reason and rule, Purple's own recommendations -- exactly what
+  // core.bug_bounty_threat_intel_review / core.bug_bounty_threat_hunt_review
+  // / backend.orchestrator._review_detection_engineering_for_finding /
+  // core.bug_bounty_purple_remediation already return; never invented
+  // text. Shown as visible text (not hover-only title attributes) so a
+  // reviewer never has to guess-and-hover to see why an outcome happened.
+  const reviewCounts = humanReviewCounts(results);
+  const countsLine = reviewCounts
+    ? `<div class="row"><span class="k">Human Review</span><span>${reviewCounts.total} finding(s) selected -- ${reviewCounts.reviewed} reviewed, ${reviewCounts.pending} awaiting review</span></div>`
+    : "";
+
+  const canonicalById = {};
+  if (run.report && Array.isArray(run.report.canonical_findings)) {
+    for (const f of run.report.canonical_findings) canonicalById[f.finding_id] = f;
+  }
+
+  const blocks = results.map(r => {
     const c = r.case || {};
     const reviewCell = c.approval_state === "pending"
       ? `<button class="lifecycle-approve" data-case-id="${esc(c.case_id)}">Approve</button>
          <button class="lifecycle-reject" data-case-id="${esc(c.case_id)}">Reject</button>`
       : `Reviewed &mdash; ${esc((c.approval_state || "—").charAt(0).toUpperCase() + (c.approval_state || "").slice(1))} (${esc(c.approval_reference || "—")})`;
 
+    const finding = canonicalById[r.finding_id];
+    const titleText = finding ? (finding.title || r.finding_id) : r.finding_id;
+
+    const prio = r.prioritization || {};
+    const reasonTexts = (prio.priority_reasons || []).map(priorityReasonText).filter(Boolean);
+    const priorityLine = prio.operational_priority
+      ? `<div class="row"><span class="k">Priority</span><span>${esc(prio.operational_priority)} (${esc(prio.priority_direction || "unchanged")}${reasonTexts.length ? " -- " + esc(reasonTexts.join("; ")) : ""})</span></div>`
+      : "";
+
     const ti = r.ti_result || {};
-    const tiTitle = ti.real_query_performed
-      ? `Queried CVE ${ti.queried_cve || "—"} against NVD.`
-      : "No CVE identifier available on this finding -- no external query was performed.";
+    const tiReason = ti.real_query_performed
+      ? `Queried CVE ${esc(ti.queried_cve || "—")} against NVD.`
+      : "No CVE identifier was present on this finding -- no external query was performed.";
 
     const hunt = r.hunt_result || {};
-    const huntTitle = hunt.outcome === "telemetry_gap" && (hunt.missing_telemetry || []).length
-      ? `Missing telemetry: ${hunt.missing_telemetry.join(", ")}.`
-      : (hunt.hunt_hypothesis || "");
+    const huntTelemetry = `Required: ${esc((hunt.required_telemetry || []).join(", ") || "—")} · Available: ${esc((hunt.available_telemetry || []).join(", ") || "none")} · Missing: ${esc((hunt.missing_telemetry || []).join(", ") || "none")}`;
 
     const det = r.detection_result || {};
-    const detTitle = det.reason ? `Reason: ${det.reason}.` : "";
+    const detRuleGenerated = det.outcome === "candidate_ready";
+    const detReasonText = DETECTION_REASON_TEXT[det.reason] || det.reason || "—";
+    const detRuleLine = detRuleGenerated && det.rule
+      ? `<div class="row"><span class="k">Rule</span><span>Format: ${esc(det.rule.rule_format || "—")} · Validation: ${esc(det.rule.validation_status || "—")} · Human review: ${esc(det.rule.human_approval_state || "—")} · Deployment: ${esc(det.rule.deployment_state || "NOT_DEPLOYED")}</span></div>`
+      : "";
 
     const red = r.red_validation_result || {};
-    const redTitle = "core.bug_bounty_tool_policy.TOOL_CATALOG['controlled_validation'].implemented is False -- no automated exploit-validation engine exists in this checkpoint.";
+
+    const purple = r.purple_result || {};
+    const recommendations = (purple.recommendations || []);
 
     return `
-    <tr>
-      <td>${esc(r.finding_id)}</td>
-      <td title="${esc(tiTitle)}">${esc(lifecycleOutcomeLabel(ti.outcome))}</td>
-      <td title="${esc(huntTitle)}">${esc(lifecycleOutcomeLabel(hunt.outcome))}</td>
-      <td title="${esc(detTitle)}">${esc(lifecycleOutcomeLabel(det.outcome))}</td>
-      <td title="${esc(redTitle)}">${esc(lifecycleOutcomeLabel(red.outcome))}</td>
-      <td>${(r.purple_result && r.purple_result.recommendations || []).map(esc).join("<br>")}</td>
-      <td>${reviewCell}</td>
-    </tr>`;
+    <div class="finding-block">
+      <div class="finding-head"><span class="finding-title">${esc(titleText)}</span></div>
+      <div class="row"><span class="k">Finding ID</span><span>${esc(r.finding_id)}</span></div>
+      ${priorityLine}
+
+      <div class="lifecycle-subsection-title">Threat Intelligence</div>
+      <div class="row"><span class="k">Status</span><span>Evaluated</span></div>
+      <div class="row"><span class="k">Outcome</span><span>${esc(lifecycleOutcomeLabel(ti.outcome))}</span></div>
+      <div class="row"><span class="k">Reason</span><span>${tiReason}</span></div>
+      <div class="row"><span class="k">External source queried</span><span>${ti.real_query_performed ? "NVD" : "None -- no CVE identifier was present"}</span></div>
+
+      <div class="lifecycle-subsection-title">Threat Hunt</div>
+      <div class="row"><span class="k">Outcome</span><span>${esc(lifecycleOutcomeLabel(hunt.outcome))}</span></div>
+      <div class="row"><span class="k">Hypothesis</span><span>${esc(hunt.hunt_hypothesis || "—")}</span></div>
+      <div class="row"><span class="k">Telemetry</span><span>${huntTelemetry}</span></div>
+
+      <div class="lifecycle-subsection-title">Detection Engineering</div>
+      <div class="row"><span class="k">Decision</span><span>${esc(lifecycleOutcomeLabel(det.outcome))}</span></div>
+      <div class="row"><span class="k">Rule generated?</span><span>${detRuleGenerated ? "YES" : "NO"}</span></div>
+      <div class="row"><span class="k">Reason</span><span>${esc(detReasonText)}</span></div>
+      ${detRuleLine}
+
+      <div class="lifecycle-subsection-title">Red Validation</div>
+      <div class="row"><span class="k">Outcome</span><span>${esc(lifecycleOutcomeLabel(red.outcome))}</span></div>
+      <div class="row"><span class="k">Reason</span><span>Controlled/automated exploit validation is not implemented in this project -- manual analyst validation required.</span></div>
+
+      <div class="lifecycle-subsection-title">Purple Team</div>
+      <div class="row"><span class="k">Problem</span><span>${esc(titleText)}</span></div>
+      <div class="row"><span class="k">Recommendations</span><span>${recommendations.map(esc).join("<br>") || "—"}</span></div>
+      <div class="row"><span class="k">Success criteria</span><span>The recommended action above is applied, the finding is retested, and Human Review approves this finding.</span></div>
+      <div class="surface-note" style="margin:4px 0 8px">${esc(lifecycleOutcomeLabel(purple.outcome))} -- recommendation created, NOT remediation applied.</div>
+
+      <div class="lifecycle-subsection-title">Human Review</div>
+      <div class="row"><span class="k">Decision</span><span>${reviewCell}</span></div>
+    </div>`;
   }).join("");
 
   const reviewNote = `<div class="surface-note">Human review actions here are a <strong>local development/research review action only</strong> -- this backend implements no authentication, so the reference you enter is never verified against any real identity.</div>`;
 
-  body.innerHTML = summary + reviewNote + `
-    <table><thead><tr>
-      <th>Finding</th><th>Threat Intel</th><th>Threat Hunt</th><th>Detection</th><th>Red Validation</th><th>Purple Recommendation</th><th>Human Review</th>
-    </tr></thead><tbody>${rows}</tbody></table>`;
+  body.innerHTML = summary + countsLine + reviewNote + blocks;
 }
 
 // Honest, per-run AI participation summary. Every row below is derived
@@ -718,6 +1054,9 @@ function renderLifecycle(run) {
 function renderAiActivity(run) {
   const body = el("ai-activity-body");
   if (!run) { body.innerHTML = '<div class="empty">No active run.</div>'; return; }
+
+  const participation = aiParticipationSummary(run);
+  const summaryLine = `<div class="row"><span class="k">AI used in this run?</span><span class="pill ${participation === 'NO' ? 'na' : 'warn'}">${esc(participation)}</span></div>`;
 
   const rows = [`
     <tr>
@@ -748,11 +1087,12 @@ function renderAiActivity(run) {
   }
 
   body.innerHTML = `
+    ${summaryLine}
     <table><thead><tr>
       <th>Component</th><th>Purpose</th><th>AI Invoked?</th><th>Reason / Proposal</th>
       <th>Deterministic Validation</th><th>Deployment</th>
     </tr></thead><tbody>${rows.join("")}</tbody></table>
-    <div class="surface-note">AI only ever proposes -- every proposal above is independently, deterministically validated before anything is treated as a candidate; nothing here is ever auto-deployed (deployment_state is always NOT_DEPLOYED in this checkpoint).</div>`;
+    <div class="surface-note">AI proposes/reasons where enabled above -- deterministic policy and the Security Governor remain authoritative. Every proposal is independently, deterministically validated before anything is treated as a candidate; nothing here is ever auto-deployed (deployment_state is always NOT_DEPLOYED in this checkpoint).</div>`;
 }
 
 // Event delegation for the dynamically-generated Approve/Reject
@@ -825,7 +1165,7 @@ function endpointDiscoverySourceLabel(source) {
 function renderAttackSurface(run) {
   const body = el("attack-surface-body");
   const surface = run && run.attack_surface;
-  if (!surface) { body.innerHTML = '<div class="empty">No discovery data for this run.</div>'; return; }
+  if (!surface) { body.innerHTML = '<div class="empty">No discovery data for this run -- attack-surface crawling has not run (or has not yet completed) for this run.</div>'; return; }
 
   if (surface.status === "failed") {
     body.innerHTML = `
@@ -944,7 +1284,13 @@ function httpEnrichmentClassLabel(enrichment) {
 function renderHttpEnrichment(run) {
   const body = el("http-enrichment-body");
   const record = run && run.http_enrichment;
-  if (!record) { body.innerHTML = '<div class="empty">No httpx activity on this run.</div>'; return; }
+  if (!record) {
+    const ranHttpx = run && Array.isArray(run.executed_tools) && run.executed_tools.includes("httpx");
+    body.innerHTML = ranHttpx
+      ? '<div class="empty">httpx ran but produced no enrichment record for this run.</div>'
+      : '<div class="empty">No httpx activity on this run because httpx was not selected to run for this target/mode.</div>';
+    return;
+  }
   if (record.status !== "completed" || !record.enrichment) {
     body.innerHTML = `<div class="empty">httpx ${esc(record.status || "did not complete")} for this run.</div>`;
     return;
@@ -979,7 +1325,7 @@ function toolStatusClass(status) {
 function renderEvaluation(evaluation) {
   const body = el("evaluation-body");
   if (!evaluation || evaluation.evaluation_state === "run_incomplete") {
-    body.innerHTML = '<div class="empty">No benchmark evaluation available for this run.</div>';
+    body.innerHTML = '<div class="empty">No benchmark evaluation available for this run yet -- this becomes available once the run\'s report is complete.</div>';
     return;
   }
   if (evaluation.evaluation_state === "not_evaluated") {
@@ -1059,38 +1405,101 @@ async function loadEvaluation(runId) {
 }
 
 let lastTi = null;
-function renderTi(payload) {
+// This card shows two distinct real signals, never conflated: the
+// legacy single-trigger live payload (`lastTi`, set only by the
+// `detection_plan_created` SSE event) and, when present, a per-finding
+// rollup of the real `run.lifecycle.results[].ti_result` values written
+// by core.bug_bounty_threat_intel_review. A Full Security Lifecycle run
+// always runs Threat Intel review for every selected finding even when
+// no `detection_plan_created` event has ever fired for this run, so the
+// empty state below is only ever shown when neither source has real
+// data -- never when TI review genuinely ran.
+function renderTi(payload, run) {
   if (payload) lastTi = payload;
   const body = el("ti-body");
-  if (!lastTi || lastTi.trigger_type !== "threat_intelligence") {
-    body.innerHTML = '<div class="empty">No Threat Intelligence activity on this run.</div>';
+  const lifecycleResults = run && run.lifecycle && Array.isArray(run.lifecycle.results) ? run.lifecycle.results : [];
+  const lifecycleTi = lifecycleResults.filter(r => r.ti_result);
+
+  if (lastTi && lastTi.trigger_type === "threat_intelligence") {
+    body.innerHTML = `
+      <div class="row"><span class="k">Trigger</span><span>${esc(lastTi.trigger_id)}</span></div>
+      <div class="row"><span class="k">CVE</span><span>${(lastTi.cve || []).length ? esc(lastTi.cve.join(", ")) : "none supplied"}</span></div>
+      <div class="row"><span class="k">CWE</span><span>${(lastTi.cwe || []).length ? esc(lastTi.cwe.join(", ")) : "none supplied"}</span></div>
+      <div class="row"><span class="k">Confidence</span><span>${esc(lastTi.confidence || "—")}</span></div>
+      <div class="row"><span class="k">Affected technology</span><span>${(lastTi.affected_technology || []).length ? esc(lastTi.affected_technology.join(", ")) : "—"}</span></div>
+    `;
     return;
   }
-  body.innerHTML = `
-    <div class="row"><span class="k">Trigger</span><span>${esc(lastTi.trigger_id)}</span></div>
-    <div class="row"><span class="k">CVE</span><span>${(lastTi.cve || []).length ? esc(lastTi.cve.join(", ")) : "none supplied"}</span></div>
-    <div class="row"><span class="k">CWE</span><span>${(lastTi.cwe || []).length ? esc(lastTi.cwe.join(", ")) : "none supplied"}</span></div>
-    <div class="row"><span class="k">Confidence</span><span>${esc(lastTi.confidence || "—")}</span></div>
-    <div class="row"><span class="k">Affected technology</span><span>${(lastTi.affected_technology || []).length ? esc(lastTi.affected_technology.join(", ")) : "—"}</span></div>
-  `;
+
+  if (!lifecycleTi.length) {
+    body.innerHTML = '<div class="empty">No external threat-intelligence lookup was performed because no finding on this run has reached Threat Intelligence review yet.</div>';
+    return;
+  }
+
+  const rows = lifecycleTi.map(r => {
+    const ti = r.ti_result;
+    const reason = ti.real_query_performed
+      ? `Queried CVE ${esc(ti.queried_cve || "—")} against NVD.`
+      : "No CVE identifier was present on this finding -- no external query was performed.";
+    return `
+    <div class="row"><span class="k">${esc(r.finding_id)}</span><span>${esc(lifecycleOutcomeLabel(ti.outcome))}</span></div>
+    <div class="surface-note" style="margin:0 0 8px">${reason}</div>`;
+  }).join("");
+  body.innerHTML = `<div class="surface-note">Status: Evaluated (Full Security Lifecycle, per selected finding). See Security Lifecycle Detail below for full per-finding context.</div>${rows}`;
 }
+
+// Real, closed-vocabulary explanation text for each detection_result.reason
+// backend.orchestrator._review_detection_engineering_for_finding can ever
+// return -- never inferred from title text or guessed per finding.
+const DETECTION_REASON_TEXT = {
+  telemetry_gap: "Required telemetry for this finding class is not available in this environment.",
+  no_llm_proposal_supplied: "No AI detection proposal was supplied for this finding.",
+  llm_proposal_had_no_rules: "The AI detection proposal contained no usable rule drafts.",
+  syntax_rejected: "The generated rule candidate failed structural syntax validation.",
+  rule_generated: "A rule candidate was generated and passed structural syntax validation.",
+};
 
 const ruleState = {};
 function renderDetection(run) {
   const body = el("detection-body");
   const ids = Object.keys(ruleState);
-  if (!ids.length && (!run || !run.report || !("rules_generated" in (run.report || {})))) {
-    body.innerHTML = '<div class="empty">No Detection Engineering activity on this run.</div>';
+  const lifecycleResults = run && run.lifecycle && Array.isArray(run.lifecycle.results) ? run.lifecycle.results : [];
+  const lifecycleDet = lifecycleResults.filter(r => r.detection_result);
+
+  if (!ids.length && !lifecycleDet.length) {
+    body.innerHTML = '<div class="empty">No detection rule was generated because no finding on this run has reached Detection Engineering review yet.</div>';
     return;
   }
+
   let rows = ids.map(id => {
     const r = ruleState[id];
     return `<tr><td>${esc(id)}</td><td>${esc(r.rule_format || "—")}</td><td>${esc(r.dedup_status || "—")}</td>
       <td class="pill ${r.validation_status === 'rejected' ? 'rejected' : 'done'}">${esc(r.validation_status || "draft")}</td>
       <td class="pill done">${esc(r.deployment_state || "NOT_DEPLOYED")}</td></tr>`;
   }).join("");
+  const liveTable = ids.length
+    ? `<table><thead><tr><th>Detection ID</th><th>Format</th><th>Dedup</th><th>Validation</th><th>Deployment</th></tr></thead><tbody>${rows}</tbody></table>`
+    : "";
+
+  // Real, per-finding rollup from run.lifecycle.results[].detection_result --
+  // this is the authoritative post-run view and is shown even when no live
+  // detection_rule_created/detection_rule_validated SSE event ever fired for
+  // this run, so this card is never dishonestly empty when Detection
+  // Engineering actually ran.
+  const lifecycleRows = lifecycleDet.map(r => {
+    const det = r.detection_result;
+    const ruleGenerated = det.outcome === "candidate_ready";
+    const reasonText = DETECTION_REASON_TEXT[det.reason] || det.reason || "—";
+    const ruleDetail = ruleGenerated && det.rule
+      ? ` &mdash; Format: ${esc(det.rule.rule_format || "—")} · Validation: ${esc(det.rule.validation_status || "—")} · Human review: ${esc(det.rule.human_approval_state || "—")} · Deployment: ${esc(det.rule.deployment_state || "NOT_DEPLOYED")}`
+      : "";
+    return `
+    <div class="row"><span class="k">${esc(r.finding_id)}</span><span>${ruleGenerated ? "Rule candidate created" : "No rule generated"}</span></div>
+    <div class="surface-note" style="margin:0 0 8px">Reason: ${esc(reasonText)}${ruleDetail}</div>`;
+  }).join("");
+
   const summary = run && run.report ? `<div class="row"><span class="k">Human review required</span><span>${run.human_review_required ? "yes" : "no"}</span></div>` : "";
-  body.innerHTML = `${summary}<table><thead><tr><th>Detection ID</th><th>Format</th><th>Dedup</th><th>Validation</th><th>Deployment</th></tr></thead><tbody>${rows || ""}</tbody></table>`;
+  body.innerHTML = `${summary}${liveTable}${lifecycleRows}`;
 }
 
 function appendFeed(event) {
@@ -1152,11 +1561,13 @@ async function refreshSelectedRun() {
   if (!currentRunId) return;
   try {
     const run = await api(`/api/runs/${currentRunId}`);
+    renderOverview(run);
     renderStatus(run);
     renderPipeline(run);
     renderTools(run);
     renderFindings(run);
     renderDetection(run);
+    renderTi(null, run);
     renderAttackSurface(run);
     renderHttpEnrichment(run);
     renderLifecycle(run);
@@ -1197,7 +1608,7 @@ async function selectRun(runId) {
   el("feed-body").innerHTML = '<div class="empty">Loading…</div>';
   el("governor-body").innerHTML = '<div class="empty">No Governor evaluation yet.</div>';
   if (!runId) {
-    renderStatus(null); renderPipeline(null); renderTools(null); renderFindings(null); renderDetection(null); renderTi(null); renderEvaluation(null); renderAttackSurface(null); renderHttpEnrichment(null); renderLifecycle(null); renderAiActivity(null);
+    renderOverview(null); renderStatus(null); renderPipeline(null); renderTools(null); renderFindings(null); renderDetection(null); renderTi(null); renderEvaluation(null); renderAttackSurface(null); renderHttpEnrichment(null); renderLifecycle(null); renderAiActivity(null);
     return;
   }
   // Fetch and replay full event history FIRST so observedEventTypes is
@@ -1338,7 +1749,7 @@ async function loadSystemInfo() {
   } catch (e) { renderReadiness(null); /* backend unreachable; health badge already reflects this */ }
 }
 
-renderStatus(null); renderPipeline(null); renderTools(null); renderFindings(null); renderDetection(null); renderTi(null); renderAttackSurface(null); renderHttpEnrichment(null); renderLifecycle(null); renderAiActivity(null);
+renderOverview(null); renderStatus(null); renderPipeline(null); renderTools(null); renderFindings(null); renderDetection(null); renderTi(null); renderAttackSurface(null); renderHttpEnrichment(null); renderLifecycle(null); renderAiActivity(null);
 checkHealth();
 loadSystemInfo();
 refreshRunList();

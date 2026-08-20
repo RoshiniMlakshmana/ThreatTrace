@@ -108,9 +108,9 @@ class TestLoadsAndStructure:
 
 class TestRequiredSections:
     @pytest.mark.parametrize("heading", [
-        "A. System Status", "B. Pipeline", "C. Live Event Feed", "D. Tool Activity",
+        "A. System Status", "B. Pipeline", "C. Technical Event Log", "D. Tool Activity",
         "E. Security Governor", "F. Findings", "G. Threat Intelligence Context",
-        "H. Detection Engineering", "I. Limitations",
+        "H. Detection Engineering", "I. Scope &amp; Safety",
     ])
     def test_004_section_headings_present(self, dashboard_html, heading):
         assert heading in dashboard_html
@@ -985,7 +985,12 @@ class TestArchitectureExplainer:
         assert "How ThreatTrace Works" in dashboard_html
 
     def test_016_pipeline_diagram_text_present(self, dashboard_html):
-        for phrase in ("AI proposes/reasons", "Policy checks", "Governor authorizes/blocks", "Deterministic tools execute", "Human reviews"):
+        for phrase in (
+            "Discover", "Validate Scope", "Security Tools", "Normalize Evidence",
+            "Correlate Findings", "Prioritize", "Purple Recommendation", "Human Review",
+            "AI may propose/reason", "Policy + the Security Governor control execution",
+            "Human approves final outcomes",
+        ):
             assert phrase in dashboard_html
 
     def test_017_uses_details_element_expandable(self, dashboard_html):
@@ -993,7 +998,7 @@ class TestArchitectureExplainer:
 
         match = re.search(r'id="card-architecture".*?</section>', dashboard_html, re.DOTALL)
         assert match is not None
-        assert "<details>" in match.group(0)
+        assert "<details" in match.group(0)
 
 
 class TestHttpEnrichmentCard:
@@ -1056,10 +1061,61 @@ class TestFindingExplainability:
     def test_024_mitre_attck_never_forced_onto_config_finding(self, dashboard_html):
         import re
 
-        match = re.search(r"report\.canonical_findings\.map.*?\n  \}\)\.join", dashboard_html, re.DOTALL)
+        match = re.search(r"function renderFindingBlock\(f, run\) \{.*?\n\}", dashboard_html, re.DOTALL)
         assert match is not None
         assert "f.mitre_attack_mapping" in match.group(0)
         assert "Not mapped" in match.group(0)
+
+    def test_025_beginner_first_level_fields_present_not_only_in_details(self, dashboard_script):
+        run = _completed_run(report={"canonical_findings": [{
+            "finding_id": "CF-1", "title": "CSP Header Not Set", "technical_severity": "medium",
+            "confidence": "high", "tools_used": ["http_assessor"], "host": "localhost", "port": 3000,
+            "path": "/", "vulnerability_class": "security_header_misconfiguration",
+            "evidence_sources": [{"source_tool": "http_assessor"}], "status": "requires_human_review",
+        }]})
+        html = _render_element(dashboard_script, "findings-body", f"renderFindings({json.dumps(run)})")
+        assert "Why it matters" in html
+        assert "clickjacking" in html  # deterministic FINDING_CLASS_IMPACT text for this class
+        assert "What to do" in html
+        assert "localhost:3000" in html
+        assert "Technical Details" in html
+
+    def test_026_technical_fields_preserved_inside_details(self, dashboard_script):
+        run = _completed_run(report={"canonical_findings": [{
+            "finding_id": "CF-7", "title": "SQL Injection", "technical_severity": "high", "confidence": "high",
+            "tools_used": ["nuclei"], "evidence_sources": [{"source_tool": "nuclei"}], "status": "requires_human_review",
+            "cwe": "CWE-89", "owasp_category": "A03:2021", "cve": ["CVE-2024-1234"], "mitre_attack_mapping": None,
+        }]})
+        html = _render_element(dashboard_script, "findings-body", f"renderFindings({json.dumps(run)})")
+        import re
+        match = re.search(r"<summary>Technical Details</summary>.*?</details>", html, re.DOTALL)
+        assert match is not None
+        assert "CF-7" in match.group(0)
+        assert "CWE-89" in match.group(0)
+
+    def test_027_recommended_action_from_purple_result_when_present(self, dashboard_script):
+        run = _completed_run(report={"canonical_findings": [{
+            "finding_id": "CF-1", "title": "CSP Header Not Set", "technical_severity": "medium",
+            "confidence": "high", "tools_used": ["http_assessor"],
+            "evidence_sources": [{"source_tool": "http_assessor"}], "status": "requires_human_review",
+        }]}, lifecycle={
+            "results": [{
+                "finding_id": "CF-1",
+                "purple_result": {"outcome": "recommendation_created", "recommendations": ["Set a strict Content-Security-Policy header."]},
+            }],
+        })
+        html = _render_element(dashboard_script, "findings-body", f"renderFindings({json.dumps(run)})")
+        assert "Set a strict Content-Security-Policy header." in html
+        assert "No remediation recommendation" not in html
+
+    def test_028_recommended_action_honest_empty_state_when_absent(self, dashboard_script):
+        run = _completed_run(report={"canonical_findings": [{
+            "finding_id": "CF-1", "title": "CSP Header Not Set", "technical_severity": "medium",
+            "confidence": "high", "tools_used": ["http_assessor"],
+            "evidence_sources": [{"source_tool": "http_assessor"}], "status": "requires_human_review",
+        }]})
+        html = _render_element(dashboard_script, "findings-body", f"renderFindings({json.dumps(run)})")
+        assert "No remediation recommendation has been generated for this finding yet." in html
 
 
 class TestAttackSurfaceHumanSummary:
@@ -1116,3 +1172,292 @@ class TestAttackSurfaceHumanSummary:
         })
         html = _render_element(dashboard_script, "attack-surface-body", f"renderAttackSurface({json.dumps(run_empty)})")
         assert "ThreatTrace discovered 0 application resources" in html
+
+
+def _lifecycle_run_for_honesty_tests(results):
+    return _completed_run(
+        status="awaiting_human_review", current_stage="human_review",
+        report={"canonical_findings": [{"finding_id": r["finding_id"], "title": f"Finding {r['finding_id']}"} for r in results]},
+        lifecycle={
+            "lifecycle_version": "1", "total_canonical_findings": len(results),
+            "findings_selected": [r["finding_id"] for r in results], "results": results,
+        },
+    )
+
+
+class TestTiDetectionHonestyUpgrades:
+    """G/H previously only reflected the legacy single-trigger SSE flow
+    (`lastTi`/`ruleState`) and fell back to a flatly dishonest "No ...
+    activity on this run" empty state even when a Full Security
+    Lifecycle run had genuinely run Threat Intel / Detection Engineering
+    review for every selected finding. renderTi/renderDetection now also
+    read run.lifecycle.results so that case is never misrepresented."""
+
+    def test_ti_never_says_no_activity_when_lifecycle_ti_ran(self, dashboard_script):
+        run = _lifecycle_run_for_honesty_tests([{
+            "finding_id": "CF-1",
+            "ti_result": {"outcome": "reviewed_no_match", "real_query_performed": True, "queried_cve": "CVE-2024-9999"},
+        }])
+        html = _render_element(dashboard_script, "ti-body", f"renderTi(null, {json.dumps(run)})")
+        assert "No Threat Intelligence activity on this run." not in html
+        assert "No matching intel" in html
+        assert "CVE-2024-9999" in html
+
+    def test_ti_empty_state_explains_why_when_nothing_ran(self, dashboard_script):
+        run = _completed_run(lifecycle=None)
+        html = _render_element(dashboard_script, "ti-body", f"renderTi(null, {json.dumps(run)})")
+        assert "no finding on this run has reached Threat Intelligence review yet" in html
+
+    def test_detection_never_says_no_activity_when_lifecycle_detection_ran(self, dashboard_script):
+        run = _lifecycle_run_for_honesty_tests([{
+            "finding_id": "CF-1",
+            "detection_result": {"outcome": "not_applicable", "reason": "telemetry_gap", "rule": None},
+        }])
+        html = _render_element(dashboard_script, "detection-body", f"renderDetection({json.dumps(run)})")
+        assert "No Detection Engineering activity on this run." not in html
+        assert "Required telemetry for this finding class is not available" in html
+
+    def test_detection_empty_state_explains_why_when_nothing_ran(self, dashboard_script):
+        run = _completed_run(lifecycle=None)
+        html = _render_element(dashboard_script, "detection-body", f"renderDetection({json.dumps(run)})")
+        assert "no finding on this run has reached Detection Engineering review yet" in html
+
+    def test_detection_rule_candidate_shows_format_validation_deployment(self, dashboard_script):
+        run = _lifecycle_run_for_honesty_tests([{
+            "finding_id": "CF-1",
+            "detection_result": {
+                "outcome": "candidate_ready", "reason": "rule_generated",
+                "rule": {"rule_format": "sigma", "validation_status": "syntax_validated", "human_approval_state": "pending", "deployment_state": "NOT_DEPLOYED"},
+            },
+        }])
+        html = _render_element(dashboard_script, "detection-body", f"renderDetection({json.dumps(run)})")
+        assert "sigma" in html
+        assert "syntax_validated" in html
+        assert "NOT_DEPLOYED" in html
+
+
+class TestLifecycleDetailRichness:
+    """L now shows every field visibly (never hover-only), including
+    priority, hunt telemetry breakdown, and a Purple Team success-
+    criteria explanation -- section 10/11 of the dashboard usability
+    checkpoint."""
+
+    def test_priority_and_telemetry_visible(self, dashboard_script):
+        run = _lifecycle_run_for_honesty_tests([{
+            "finding_id": "CF-1",
+            "case": {"case_id": "SH-CF-1", "approval_state": "pending"},
+            "prioritization": {"operational_priority": "high", "priority_direction": "raised", "priority_reasons": ["Internet-facing"]},
+            "ti_result": {"outcome": "no_relevant_intel", "real_query_performed": False},
+            "hunt_result": {"outcome": "telemetry_gap", "hunt_hypothesis": "x", "required_telemetry": ["web_server_logs"], "available_telemetry": [], "missing_telemetry": ["web_server_logs"]},
+            "detection_result": {"outcome": "not_applicable", "reason": "telemetry_gap", "rule": None},
+            "red_validation_result": {"outcome": "controlled_validation_unavailable"},
+            "purple_result": {"outcome": "recommendation_created", "recommendations": ["Instrument web_server_logs."]},
+        }])
+        html = _render_element(dashboard_script, "lifecycle-body", f"renderLifecycle({json.dumps(run)})")
+        assert "high" in html
+        assert "Internet-facing" in html
+        assert "web_server_logs" in html
+        assert "Success criteria" in html
+        assert "NOT remediation applied" in html
+
+    def test_human_review_counts_visible(self, dashboard_script):
+        run = _lifecycle_run_for_honesty_tests([
+            {"finding_id": "CF-1", "case": {"case_id": "SH-1", "approval_state": "pending"}},
+            {"finding_id": "CF-2", "case": {"case_id": "SH-2", "approval_state": "approved", "approval_reference": "analyst1"}},
+        ])
+        html = _render_element(dashboard_script, "lifecycle-body", f"renderLifecycle({json.dumps(run)})")
+        assert "2 finding(s) selected -- 1 reviewed, 1 awaiting review" in html
+
+
+class TestPriorityReasonObjectShape:
+    """Live-validation defect: real core.context_prioritization.
+    prioritize_finding output has priority_reasons as a list of
+    {code, modifier, message} objects, never plain strings. The dashboard
+    used to do priority_reasons.join("; "), which rendered the literal
+    text "[object Object]" for every reason on a real run. This must
+    never happen again, for either the real object shape or the legacy/
+    test string shape."""
+
+    def _run_with_reasons(self, priority_reasons):
+        return _lifecycle_run_for_honesty_tests([{
+            "finding_id": "CF-1",
+            "case": {"case_id": "SH-CF-1", "approval_state": "pending"},
+            "prioritization": {
+                "operational_priority": "low", "priority_direction": "lowered",
+                "priority_reasons": priority_reasons,
+            },
+        }])
+
+    def test_real_object_reason_message_renders(self, dashboard_script):
+        run = self._run_with_reasons([
+            {"code": "LOW_CRITICALITY_ASSET", "modifier": -1, "message": "The affected asset is caller-classified as low criticality."},
+        ])
+        html = _render_element(dashboard_script, "lifecycle-body", f"renderLifecycle({json.dumps(run)})")
+        assert "The affected asset is caller-classified as low criticality." in html
+        assert "[object Object]" not in html
+
+    def test_multiple_real_object_reasons_render_cleanly(self, dashboard_script):
+        run = self._run_with_reasons([
+            {"code": "CANDIDATE_FINDING", "modifier": -1, "message": "The finding is a candidate; deterministic confirmation is incomplete."},
+            {"code": "ISOLATED_ENVIRONMENT", "modifier": -1, "message": "The caller-supplied environment is non-production and considered isolated."},
+            {"code": "CONTEXT_INCOMPLETE", "modifier": 0, "message": "One or more organization-context fields were supplied as 'unknown'."},
+        ])
+        html = _render_element(dashboard_script, "lifecycle-body", f"renderLifecycle({json.dumps(run)})")
+        assert "The finding is a candidate; deterministic confirmation is incomplete." in html
+        assert "The caller-supplied environment is non-production and considered isolated." in html
+        assert "One or more organization-context fields were supplied as &#39;unknown&#39;." in html or "One or more organization-context fields were supplied as 'unknown'." in html
+        assert "[object Object]" not in html
+
+    def test_object_reason_falls_back_to_code_when_message_missing(self, dashboard_script):
+        run = self._run_with_reasons([{"code": "SOME_REASON_CODE", "modifier": -1}])
+        html = _render_element(dashboard_script, "lifecycle-body", f"renderLifecycle({json.dumps(run)})")
+        assert "SOME_REASON_CODE" in html
+        assert "[object Object]" not in html
+
+    def test_legacy_string_reasons_still_work(self, dashboard_script):
+        run = self._run_with_reasons(["Internet-facing", "High business impact"])
+        html = _render_element(dashboard_script, "lifecycle-body", f"renderLifecycle({json.dumps(run)})")
+        assert "Internet-facing" in html
+        assert "High business impact" in html
+        assert "[object Object]" not in html
+
+    def test_no_object_object_anywhere_in_dashboard_html(self, dashboard_html):
+        assert "[object Object]" not in dashboard_html
+
+
+class TestNonSelectedFindingExplanation:
+    """Findings K.3/K.4 of the live-validation follow-up: a canonical
+    finding that Full Security Lifecycle selection did not carry into
+    run.lifecycle.results must clearly explain *why* it has no Purple
+    recommendation (bounded selection, not missing functionality) --
+    and must never receive a fabricated recommendation."""
+
+    def _run_with_selection(self, *, total, selected_ids, selected_results):
+        canonical_findings = [
+            {"finding_id": f"CF-{i}", "title": f"Finding {i}", "technical_severity": "low",
+             "tools_used": ["http_assessor"], "evidence_sources": [{"source_tool": "http_assessor"}],
+             "status": "requires_human_review"}
+            for i in range(1, total + 1)
+        ]
+        return _completed_run(
+            status="awaiting_human_review", current_stage="human_review",
+            report={"canonical_findings": canonical_findings},
+            lifecycle={
+                "lifecycle_version": "1", "total_canonical_findings": total,
+                "findings_selected": selected_ids, "results": selected_results,
+            },
+        )
+
+    def test_selected_finding_shows_actual_purple_recommendation(self, dashboard_script):
+        run = self._run_with_selection(
+            total=8, selected_ids=["CF-1"],
+            selected_results=[{"finding_id": "CF-1", "purple_result": {"outcome": "recommendation_created", "recommendations": ["Set a strict CSP header."]}}],
+        )
+        html = _render_element(dashboard_script, "findings-body", f"renderFindings({json.dumps(run)})")
+        assert "Set a strict CSP header." in html
+        assert "Purple Team recommendation -- not yet applied" in html
+
+    def test_non_selected_finding_explains_lifecycle_selection(self, dashboard_script):
+        run = self._run_with_selection(
+            total=8, selected_ids=["CF-1"],
+            selected_results=[{"finding_id": "CF-1", "purple_result": {"outcome": "recommendation_created", "recommendations": ["Set a strict CSP header."]}}],
+        )
+        html = _render_element(dashboard_script, "findings-body", f"renderFindings({json.dumps(run)})")
+        assert "No Purple recommendation generated because this finding was not selected for downstream lifecycle review in this run." in html
+        assert "not selected for downstream lifecycle review" in html
+
+    def test_selected_count_derived_not_hardcoded(self, dashboard_script):
+        run = self._run_with_selection(
+            total=8, selected_ids=["CF-1", "CF-2", "CF-3"],
+            selected_results=[
+                {"finding_id": "CF-1", "purple_result": {"outcome": "recommendation_created", "recommendations": ["x"]}},
+                {"finding_id": "CF-2", "purple_result": {"outcome": "recommendation_created", "recommendations": ["y"]}},
+                {"finding_id": "CF-3", "purple_result": {"outcome": "recommendation_created", "recommendations": ["z"]}},
+            ],
+        )
+        html = _render_element(dashboard_script, "findings-body", f"renderFindings({json.dumps(run)})")
+        assert "3 of 8 findings were selected." in html
+
+        run_different = self._run_with_selection(total=5, selected_ids=["CF-1"], selected_results=[
+            {"finding_id": "CF-1", "purple_result": {"outcome": "recommendation_created", "recommendations": ["x"]}},
+        ])
+        html_different = _render_element(dashboard_script, "findings-body", f"renderFindings({json.dumps(run_different)})")
+        assert "1 of 5 findings were selected." in html_different
+        assert "3 of 8 findings were selected." not in html_different
+
+    def test_non_selected_finding_never_receives_fabricated_remediation(self, dashboard_script):
+        run = self._run_with_selection(
+            total=2, selected_ids=["CF-1"],
+            selected_results=[{"finding_id": "CF-1", "purple_result": {"outcome": "recommendation_created", "recommendations": ["Set a strict CSP header."]}}],
+        )
+        html = _render_element(dashboard_script, "findings-body", f"renderFindings({json.dumps(run)})")
+
+        blocks = html.split('<div class="finding-block">')
+        non_selected_block = next(b for b in blocks if "Finding ID</span><span>CF-2" in b)
+        assert "Set a strict CSP header." not in non_selected_block
+        assert "No Purple recommendation generated" in non_selected_block
+
+    def test_canonical_evidence_remains_visible_for_non_selected_finding(self, dashboard_script):
+        run = self._run_with_selection(
+            total=8, selected_ids=["CF-1"],
+            selected_results=[{"finding_id": "CF-1", "purple_result": {"outcome": "recommendation_created", "recommendations": ["Set a strict CSP header."]}}],
+        )
+        html = _render_element(dashboard_script, "findings-body", f"renderFindings({json.dumps(run)})")
+        assert "Finding 8" in html
+        assert "CF-8" in html
+        assert "http_assessor" in html
+
+
+class TestAiActivitySummaryLine:
+    def test_ai_used_line_no_when_no_ai_invoked(self, dashboard_script):
+        run = _lifecycle_run_for_honesty_tests([{
+            "finding_id": "CF-1",
+            "detection_result": {"outcome": "not_applicable", "reason": "telemetry_gap", "rule": None},
+        }])
+        html = _render_element(dashboard_script, "ai-activity-body", f"renderAiActivity({json.dumps(run)})")
+        assert "AI used in this run?" in html
+        assert ">NO<" in html
+
+    def test_ai_used_line_yes_when_ai_invoked(self, dashboard_script):
+        run = _lifecycle_run_for_honesty_tests([{
+            "finding_id": "CF-1",
+            "detection_result": {"outcome": "candidate_ready", "reason": "rule_generated", "rule": {"deployment_state": "NOT_DEPLOYED"}},
+        }])
+        html = _render_element(dashboard_script, "ai-activity-body", f"renderAiActivity({json.dumps(run)})")
+        assert ">YES<" in html
+
+
+class TestEmptyStatesExplainWhy:
+    """Section 18 of the dashboard usability checkpoint: every empty
+    state must explain why, not merely state that nothing happened."""
+
+    def test_governor_empty_state_explains_when_it_will_appear(self, dashboard_script):
+        html = _render_element(dashboard_script, "governor-body", "renderGovernor(null)")
+        assert "this appears once the first tool-execution request" in html
+
+    def test_attack_surface_empty_state_explains_why(self, dashboard_script):
+        run = _completed_run(attack_surface=None)
+        html = _render_element(dashboard_script, "attack-surface-body", f"renderAttackSurface({json.dumps(run)})")
+        assert "has not run (or has not yet completed)" in html
+
+    def test_http_enrichment_explains_httpx_not_selected(self, dashboard_script):
+        run = _completed_run(http_enrichment=None, executed_tools=["nmap"])
+        html = _render_element(dashboard_script, "http-enrichment-body", f"renderHttpEnrichment({json.dumps(run)})")
+        assert "httpx was not selected to run for this target/mode" in html
+
+    def test_http_enrichment_explains_ran_but_no_record(self, dashboard_script):
+        run = _completed_run(http_enrichment=None, executed_tools=["httpx"])
+        html = _render_element(dashboard_script, "http-enrichment-body", f"renderHttpEnrichment({json.dumps(run)})")
+        assert "httpx ran but produced no enrichment record" in html
+
+    def test_lifecycle_no_findings_selected_explains_count(self, dashboard_script):
+        run = _completed_run(lifecycle={
+            "lifecycle_version": "1", "total_canonical_findings": 4,
+            "findings_selected": [], "results": [],
+        })
+        html = _render_element(dashboard_script, "lifecycle-body", f"renderLifecycle({json.dumps(run)})")
+        assert "0 of 4 canonical findings met the selection criteria" in html
+
+    def test_benchmark_empty_state_explains_when_it_appears(self, dashboard_script):
+        html = _render_element(dashboard_script, "evaluation-body", "renderEvaluation(null)")
+        assert "becomes available once the run's report is complete" in html
