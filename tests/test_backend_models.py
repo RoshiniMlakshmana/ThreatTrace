@@ -10,6 +10,7 @@ from backend.models import (
     DEFAULT_EXTERNAL_TARGET_ALLOWED_TOOLS,
     DEMO_TARGET_DISPLAY_ALIAS,
     DEMO_TARGET_ENV_VAR,
+    EXECUTION_ACTIVE_STATUSES,
     EXTERNAL_TARGET_ELIGIBLE_TOOL_IDS,
     RUN_STATUSES,
     TERMINAL_STATUSES,
@@ -103,6 +104,16 @@ class TestApplyRunTransition:
 
     def test_011_terminal_statuses_subset_of_run_statuses(self):
         assert TERMINAL_STATUSES.issubset(RUN_STATUSES)
+
+    def test_011b_execution_active_statuses_derived_correctly(self):
+        assert EXECUTION_ACTIVE_STATUSES.issubset(RUN_STATUSES)
+        assert EXECUTION_ACTIVE_STATUSES.isdisjoint(TERMINAL_STATUSES)
+        assert "awaiting_human_review" not in EXECUTION_ACTIVE_STATUSES
+        assert EXECUTION_ACTIVE_STATUSES == RUN_STATUSES - TERMINAL_STATUSES - {"awaiting_human_review"}
+        # created must remain execution-active: the concurrency slot is
+        # acquired the instant a run is created, before the background
+        # workflow thread has picked it up at all.
+        assert "created" in EXECUTION_ACTIVE_STATUSES
 
 
 class TestBuildEvent:

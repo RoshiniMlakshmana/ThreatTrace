@@ -86,6 +86,18 @@ RUN_STATUSES = frozenset({
 
 TERMINAL_STATUSES = frozenset({"completed", "blocked", "failed", "cancelled"})
 
+# A run's *execution* concurrency slot (backend.run_store's single
+# active-offensive-assessment lock) must reflect whether a tool/workflow
+# is actually still running -- not merely whether the run record itself
+# has reached a terminal status. "awaiting_human_review" is a real,
+# already-existing RUN_STATUSES member that means execution has fully
+# finished and the run is now waiting on a human decision, not occupying
+# any scanner/workflow resource; it is deliberately excluded here, same
+# as every terminal status. Derived from RUN_STATUSES itself (never a
+# separately hand-maintained list) so this set can never silently drift
+# out of sync with the real status vocabulary above.
+EXECUTION_ACTIVE_STATUSES = RUN_STATUSES - TERMINAL_STATUSES - {"awaiting_human_review"}
+
 EVENT_TYPES = frozenset({
     "run_created",
     "run_started",

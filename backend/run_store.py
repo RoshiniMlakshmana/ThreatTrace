@@ -24,18 +24,25 @@ purely so the API layer can return a clean `400` instead of a `404` for
 an obviously malformed id, and so a dedicated regression test can
 assert the rejection directly.
 
-## One active offensive-assessment run at a time
+## One active offensive-assessment *execution* at a time
 
 `try_acquire_bug_bounty_slot`/`release_bug_bounty_slot` implement
 Section 27's concurrency bound: at most one `run_type == "bug_bounty"`
 run (the only run type that actually executes a real network-capable
-tool against the local Juice Shop container) may be active at once.
-`transition` automatically releases the slot the instant a bug-bounty
-run reaches a terminal status (see `backend.models.TERMINAL_STATUSES`)
--- the orchestrator never has to remember to release it itself, so a
-crashed/failed run can never permanently wedge the slot. `run_type ==
-"detection"` runs never touch this slot at all; they never execute an
-offensive tool.
+tool against the local Juice Shop container) may be *executing* at
+once. This is an execution guard, not a run-history guard -- it answers
+"is a tool/workflow actually running right now," never "does some
+historical run remain unreviewed." `transition` automatically releases
+the slot the instant a bug-bounty run's status leaves
+`backend.models.EXECUTION_ACTIVE_STATUSES`: either because it reached a
+terminal status (see `backend.models.TERMINAL_STATUSES`), or because it
+reached `"awaiting_human_review"` -- execution has genuinely finished at
+that point; the run is only waiting on a human decision, so it must not
+continue to block a new assessment from starting. The orchestrator never
+has to remember to release it itself, so a crashed/failed run -- or one
+sitting unreviewed indefinitely -- can never permanently wedge the slot.
+`run_type == "detection"` runs never touch this slot at all; they never
+execute an offensive tool.
 
 `RunStoreError`, `RunStore`, `generate_run_id`, `is_valid_run_id` are
 this module's public symbols (plus its fixed retention constant).
@@ -49,7 +56,7 @@ import threading
 from collections import OrderedDict
 from typing import Any
 
-from backend.models import RUN_TYPES, RunModelError, apply_run_transition, build_run
+from backend.models import EXECUTION_ACTIVE_STATUSES, RUN_TYPES, RunModelError, apply_run_transition, build_run
 
 MAX_RUNS_RETAINED = 100
 
@@ -147,17 +154,18 @@ class RunStore:
     def transition(self, *, run_id: Any, new_status: Any, timestamp: Any = None, **field_updates: Any) -> dict[str, Any]:
         """Apply `backend.models.apply_run_transition` to the stored
         run for `run_id`, store the result, and return a copy. If
-        `new_status` is terminal and the run is a `"bug_bounty"` run
-        currently holding the concurrency slot, the slot is released
-        automatically as part of the same locked operation.
+        `new_status` leaves `backend.models.EXECUTION_ACTIVE_STATUSES`
+        (a terminal status, or `"awaiting_human_review"`) and the run is
+        a `"bug_bounty"` run currently holding the concurrency slot, the
+        slot is released automatically as part of the same locked
+        operation -- a run awaiting human review no longer occupies the
+        execution slot, even though it remains fully in run history.
 
         Raises `RunStoreError` (`RUN_NOT_FOUND`) for an unknown
         `run_id`, or propagates `backend.models.RunModelError` unchanged
         for an invalid transition (e.g. re-entering `"created"`, or
         transitioning an already-terminal run).
         """
-        from backend.models import TERMINAL_STATUSES
-
         with self._lock:
             run = self._runs.get(run_id)
             if run is None:
@@ -166,7 +174,7 @@ class RunStore:
             updated = apply_run_transition(run=run, new_status=new_status, timestamp=timestamp, **field_updates)
             self._runs[run_id] = updated
 
-            if updated["status"] in TERMINAL_STATUSES and updated["run_type"] == "bug_bounty":
+            if updated["run_type"] == "bug_bounty" and updated["status"] not in EXECUTION_ACTIVE_STATUSES:
                 if self._active_bug_bounty_run_id == run_id:
                     self._active_bug_bounty_run_id = None
 
@@ -207,7 +215,10 @@ class RunStore:
                 self._active_bug_bounty_run_id = None
 
     def active_bug_bounty_run_id(self) -> str | None:
-        """Return the run id currently holding the concurrency slot, or
-        `None` if free."""
+        """Return the run id currently holding the execution concurrency
+        slot, or `None` if free. Reflects whether a tool/workflow is
+        actually executing right now -- a run sitting at
+        `"awaiting_human_review"` never holds this, regardless of how
+        long it has been waiting for a decision."""
         with self._lock:
             return self._active_bug_bounty_run_id

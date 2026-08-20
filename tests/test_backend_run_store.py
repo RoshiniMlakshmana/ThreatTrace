@@ -149,6 +149,89 @@ class TestConcurrencySlot:
         store.transition(run_id=detection_run["run_id"], new_status="completed", completed_at="t2")
         assert store.active_bug_bounty_run_id() == bb_run["run_id"]
 
+    def test_024_slot_releases_on_awaiting_human_review(self):
+        store = RunStore()
+        run = store.create_run(run_type="bug_bounty", created_at="t0")
+        store.try_acquire_bug_bounty_slot(run_id=run["run_id"])
+        store.transition(run_id=run["run_id"], new_status="awaiting_human_review", current_stage="human_review")
+        assert store.active_bug_bounty_run_id() is None
+
+    def test_025_new_run_can_acquire_slot_while_old_run_awaits_review(self):
+        store = RunStore()
+        run_a = store.create_run(run_type="bug_bounty", created_at="t0")
+        store.try_acquire_bug_bounty_slot(run_id=run_a["run_id"])
+        store.transition(run_id=run_a["run_id"], new_status="awaiting_human_review", current_stage="human_review")
+
+        run_b = store.create_run(run_type="bug_bounty", created_at="t1")
+        assert store.try_acquire_bug_bounty_slot(run_id=run_b["run_id"]) is True
+        assert store.active_bug_bounty_run_id() == run_b["run_id"]
+
+    def test_026_awaiting_review_run_stays_in_history_and_gettable(self):
+        store = RunStore()
+        run = store.create_run(run_type="bug_bounty", created_at="t0")
+        store.try_acquire_bug_bounty_slot(run_id=run["run_id"])
+        store.transition(run_id=run["run_id"], new_status="awaiting_human_review", current_stage="human_review")
+
+        assert store.get_run(run_id=run["run_id"])["status"] == "awaiting_human_review"
+        assert any(r["run_id"] == run["run_id"] for r in store.list_runs())
+
+    def test_027_reviewing_old_run_after_new_run_starts_does_not_disturb_new_runs_slot(self):
+        store = RunStore()
+        run_a = store.create_run(run_type="bug_bounty", created_at="t0")
+        store.try_acquire_bug_bounty_slot(run_id=run_a["run_id"])
+        store.transition(run_id=run_a["run_id"], new_status="awaiting_human_review", current_stage="human_review")
+
+        run_b = store.create_run(run_type="bug_bounty", created_at="t1")
+        store.try_acquire_bug_bounty_slot(run_id=run_b["run_id"])
+
+        # Reviewing/completing run A (the old, already-slot-released run)
+        # later must never touch run B's slot ownership.
+        updated_a = store.transition(run_id=run_a["run_id"], new_status="completed", completed_at="t2")
+        assert updated_a["status"] == "completed"
+        assert store.active_bug_bounty_run_id() == run_b["run_id"]
+
+    def test_028_multiple_runs_can_independently_await_review(self):
+        store = RunStore()
+        run_a = store.create_run(run_type="bug_bounty", created_at="t0")
+        store.try_acquire_bug_bounty_slot(run_id=run_a["run_id"])
+        store.transition(run_id=run_a["run_id"], new_status="awaiting_human_review", current_stage="human_review")
+
+        run_b = store.create_run(run_type="bug_bounty", created_at="t1")
+        store.try_acquire_bug_bounty_slot(run_id=run_b["run_id"])
+        store.transition(run_id=run_b["run_id"], new_status="awaiting_human_review", current_stage="human_review")
+
+        assert store.get_run(run_id=run_a["run_id"])["status"] == "awaiting_human_review"
+        assert store.get_run(run_id=run_b["run_id"])["status"] == "awaiting_human_review"
+        assert store.active_bug_bounty_run_id() is None
+
+    def test_029_no_two_executions_run_concurrently_even_across_review_transitions(self):
+        store = RunStore()
+        run_a = store.create_run(run_type="bug_bounty", created_at="t0")
+        assert store.try_acquire_bug_bounty_slot(run_id=run_a["run_id"]) is True
+
+        run_b = store.create_run(run_type="bug_bounty", created_at="t1")
+        # Run A is still executing (never reached awaiting_human_review or
+        # terminal) -- run B must be rejected.
+        assert store.try_acquire_bug_bounty_slot(run_id=run_b["run_id"]) is False
+
+        store.transition(run_id=run_a["run_id"], new_status="awaiting_human_review", current_stage="human_review")
+        # Now run B can acquire it, and a third run C must be rejected
+        # while B genuinely executes.
+        assert store.try_acquire_bug_bounty_slot(run_id=run_b["run_id"]) is True
+        run_c = store.create_run(run_type="bug_bounty", created_at="t2")
+        assert store.try_acquire_bug_bounty_slot(run_id=run_c["run_id"]) is False
+
+    def test_030_completed_blocked_failed_cancelled_do_not_block_new_run(self):
+        for terminal_status in ("completed", "blocked", "failed", "cancelled"):
+            store = RunStore()
+            run = store.create_run(run_type="bug_bounty", created_at="t0")
+            store.try_acquire_bug_bounty_slot(run_id=run["run_id"])
+            store.transition(run_id=run["run_id"], new_status=terminal_status, completed_at="t1")
+            assert store.active_bug_bounty_run_id() is None, terminal_status
+
+            run2 = store.create_run(run_type="bug_bounty", created_at="t2")
+            assert store.try_acquire_bug_bounty_slot(run_id=run2["run_id"]) is True, terminal_status
+
 
 class TestUpdateFields:
     def test_021_update_fields_leaves_status_unchanged(self):

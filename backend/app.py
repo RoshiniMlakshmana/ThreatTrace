@@ -126,6 +126,18 @@ def _error_code_from_message(message: str) -> str:
     return message.split(":", 1)[0].strip() if ":" in message else "ERROR"
 
 
+def _concurrent_run_active_error() -> "_ApiError":
+    """Builds the real `409 CONCURRENT_RUN_ACTIVE` error, naming the
+    actual run id currently holding the execution slot (never a
+    historical/awaiting-review run -- see
+    `backend.run_store.RunStore.active_bug_bounty_run_id`) so a caller
+    -- including the dashboard's own error banner -- can tell the
+    operator exactly which run to wait on, instead of a generic message."""
+    active_id = _run_store.active_bug_bounty_run_id()
+    detail = f" ({active_id})" if active_id else ""
+    return _ApiError(409, "CONCURRENT_RUN_ACTIVE", f"Another security assessment is currently executing{detail}.")
+
+
 async def _read_json_body(request: Request) -> dict[str, Any]:
     body = b""
     async for chunk in request.stream():
@@ -270,7 +282,15 @@ async def system_info(request: Request) -> Response:
         # `runtime.tool_runtime.evaluate_tool_readiness` computed above,
         # never a separate/weaker check.
         "tools": {tool_id: result["state"] for tool_id, result in tools.items()},
+        # Execution-active only -- a run sitting at "awaiting_human_review"
+        # never holds this (see backend.run_store.RunStore.transition /
+        # backend.models.EXECUTION_ACTIVE_STATUSES). Never conflate this
+        # with "any historical run remains unreviewed" -- that is exactly
+        # what pending_human_review_count reports instead.
         "active_bug_bounty_run_id": _run_store.active_bug_bounty_run_id(),
+        "pending_human_review_count": sum(
+            1 for run in _run_store.list_runs() if run["status"] == "awaiting_human_review"
+        ),
         "limitations": [
             "local development/research interface -- not a production-authenticated control plane",
             "run history is in-memory only and is lost on backend restart",
@@ -293,7 +313,7 @@ async def create_bug_bounty_run(request: Request) -> Response:
         raise _ApiError(400, _error_code_from_message(str(exc)), str(exc))
 
     if _run_store.active_bug_bounty_run_id() is not None:
-        raise _ApiError(409, "CONCURRENT_RUN_ACTIVE", "Another Bug Bounty run is already active.")
+        raise _concurrent_run_active_error()
 
     run = _run_store.create_run(run_type="bug_bounty", created_at=_now())
     if not _run_store.try_acquire_bug_bounty_slot(run_id=run["run_id"]):
@@ -301,7 +321,7 @@ async def create_bug_bounty_run(request: Request) -> Response:
             run_id=run["run_id"], new_status="blocked", completed_at=_now(),
             limitations=["CONCURRENT_RUN_ACTIVE: another Bug Bounty run claimed the slot first."],
         )
-        raise _ApiError(409, "CONCURRENT_RUN_ACTIVE", "Another Bug Bounty run is already active.")
+        raise _concurrent_run_active_error()
 
     _event_bus.publish(
         run_id=run["run_id"], event_type="run_created", timestamp=_now(), stage="intake",
@@ -366,7 +386,7 @@ async def create_security_lifecycle_run(request: Request) -> Response:
         raise _ApiError(400, "INVALID_DETECTION_LLM_PROPOSALS", "detection_llm_proposals must be a JSON object.")
 
     if _run_store.active_bug_bounty_run_id() is not None:
-        raise _ApiError(409, "CONCURRENT_RUN_ACTIVE", "Another Bug Bounty run is already active.")
+        raise _concurrent_run_active_error()
 
     run = _run_store.create_run(run_type="bug_bounty", created_at=_now())
     if not _run_store.try_acquire_bug_bounty_slot(run_id=run["run_id"]):
@@ -374,7 +394,7 @@ async def create_security_lifecycle_run(request: Request) -> Response:
             run_id=run["run_id"], new_status="blocked", completed_at=_now(),
             limitations=["CONCURRENT_RUN_ACTIVE: another Bug Bounty run claimed the slot first."],
         )
-        raise _ApiError(409, "CONCURRENT_RUN_ACTIVE", "Another Bug Bounty run is already active.")
+        raise _concurrent_run_active_error()
 
     lifecycle_mode = "full_security_lifecycle_external_target" if external_scope_bundle is not None else "full_security_lifecycle"
     _event_bus.publish(
@@ -427,7 +447,7 @@ async def create_authorized_target_run(request: Request) -> Response:
     target = scope_bundle["bug_bounty_scope"]["target"]
 
     if _run_store.active_bug_bounty_run_id() is not None:
-        raise _ApiError(409, "CONCURRENT_RUN_ACTIVE", "Another Bug Bounty run is already active.")
+        raise _concurrent_run_active_error()
 
     run = _run_store.create_run(run_type="bug_bounty", created_at=_now())
     if not _run_store.try_acquire_bug_bounty_slot(run_id=run["run_id"]):
@@ -435,7 +455,7 @@ async def create_authorized_target_run(request: Request) -> Response:
             run_id=run["run_id"], new_status="blocked", completed_at=_now(),
             limitations=["CONCURRENT_RUN_ACTIVE: another Bug Bounty run claimed the slot first."],
         )
-        raise _ApiError(409, "CONCURRENT_RUN_ACTIVE", "Another Bug Bounty run is already active.")
+        raise _concurrent_run_active_error()
 
     _event_bus.publish(
         run_id=run["run_id"], event_type="run_created", timestamp=_now(), stage="intake",

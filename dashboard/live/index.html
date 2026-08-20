@@ -99,6 +99,9 @@
   .finding-why { font-size: 13px; color: var(--text); margin: 8px 0 0; }
   .finding-action { font-size: 13px; margin: 8px 0 0; padding: 8px 10px; background: var(--panel-2); border-left: 3px solid var(--accent); border-radius: 4px; }
   .lifecycle-subsection-title { font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); margin: 12px 0 4px; border-top: 1px solid var(--border); padding-top: 8px; }
+  .run-banner { padding: 8px 20px; font-size: 13px; border-bottom: 1px solid var(--border); }
+  .run-banner.blocked { background: rgba(245, 185, 66, 0.12); color: var(--warn); border-bottom-color: var(--warn); }
+  .run-banner.error { background: rgba(255, 92, 108, 0.12); color: var(--bad); border-bottom-color: var(--bad); }
 </style>
 </head>
 <body>
@@ -127,6 +130,7 @@
     <summary>Advanced: submit a Detection run (JSON)</summary>
   </details>
 </div>
+<div id="run-start-banner" class="run-banner" style="display:none"></div>
 <div class="controls" id="external-target-form" style="display:none">
   <input id="ext-target" type="text" style="min-width:260px" placeholder="https://security-test.example.com/" title="Authorized External Target URL">
   <input id="ext-hosts" type="text" placeholder="Allowed host(s), comma-separated" title="scope.hosts">
@@ -1668,6 +1672,34 @@ function _buildExternalTargetBody() {
   };
 }
 
+// Tracks the real execution-active run id from GET /api/system's own
+// active_bug_bounty_run_id -- never a guess. A run sitting at
+// awaiting_human_review is never reflected here (see
+// backend.run_store.RunStore.transition), so these two buttons stay
+// enabled while only review-pending runs exist, and are disabled only
+// while a tool/workflow is genuinely still executing.
+let executionActiveRunId = null;
+let lastBannerKind = null;
+
+function setRunBanner(kind, text) {
+  lastBannerKind = kind;
+  const banner = el("run-start-banner");
+  if (!text) { banner.style.display = "none"; return; }
+  banner.className = "run-banner " + kind;
+  banner.textContent = text;
+  banner.style.display = "";
+}
+
+function updateRunStartAvailability() {
+  el("bb-start").disabled = !!executionActiveRunId;
+  el("lifecycle-start").disabled = !!executionActiveRunId;
+  if (executionActiveRunId) {
+    setRunBanner("blocked", `Another security assessment is currently executing: ${executionActiveRunId}. New Bug Bounty Run and Run Full Security Lifecycle are disabled until it reaches human review or finishes.`);
+  } else if (lastBannerKind === "blocked") {
+    setRunBanner(null, null);
+  }
+}
+
 el("bb-start").addEventListener("click", async () => {
   el("bb-start").disabled = true;
   try {
@@ -1685,13 +1717,17 @@ el("bb-start").addEventListener("click", async () => {
         method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ target }),
       });
     }
+    setRunBanner(null, null);
     await refreshRunList();
     el("run-select").value = result.run_id;
     await selectRun(result.run_id);
   } catch (e) {
-    alert("Could not start run: " + (e.body ? e.body.message : e.message));
+    const msg = e.body ? e.body.message : e.message;
+    alert("Could not start run: " + msg);
+    setRunBanner("error", "New run was not started. " + msg);
+    if (e.body && e.body.error_code === "CONCURRENT_RUN_ACTIVE") await loadSystemInfo();
   } finally {
-    el("bb-start").disabled = false;
+    el("bb-start").disabled = !!executionActiveRunId;
   }
 });
 
@@ -1704,13 +1740,17 @@ el("lifecycle-start").addEventListener("click", async () => {
     const result = await api("/api/runs/security-lifecycle", {
       method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
     });
+    setRunBanner(null, null);
     await refreshRunList();
     el("run-select").value = result.run_id;
     await selectRun(result.run_id);
   } catch (e) {
-    alert("Could not start Full Security Lifecycle run: " + (e.body ? e.body.message : e.message));
+    const msg = e.body ? e.body.message : e.message;
+    alert("Could not start Full Security Lifecycle run: " + msg);
+    setRunBanner("error", "New run was not started. " + msg);
+    if (e.body && e.body.error_code === "CONCURRENT_RUN_ACTIVE") await loadSystemInfo();
   } finally {
-    el("lifecycle-start").disabled = false;
+    el("lifecycle-start").disabled = !!executionActiveRunId;
   }
 });
 
@@ -1746,6 +1786,8 @@ async function loadSystemInfo() {
     systemToolReadiness = sys.tools || {};
     renderReadiness(sys.categories || []);
     renderTools(currentRunId ? await api(`/api/runs/${currentRunId}`).catch(() => null) : null);
+    executionActiveRunId = sys.active_bug_bounty_run_id || null;
+    updateRunStartAvailability();
   } catch (e) { renderReadiness(null); /* backend unreachable; health badge already reflects this */ }
 }
 

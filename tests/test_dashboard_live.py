@@ -1408,6 +1408,84 @@ class TestNonSelectedFindingExplanation:
         assert "http_assessor" in html
 
 
+def _run_start_availability_state(dashboard_script, execution_active_run_id, last_banner_kind=None):
+    """Installs stateful (persistent-instance, style-object-bearing) stubs
+    for #bb-start/#lifecycle-start/#run-start-banner, sets the module-level
+    executionActiveRunId (and optionally seeds lastBannerKind to simulate an
+    already-shown banner), calls the real updateRunStartAvailability(), and
+    returns the resulting button/banner state."""
+    seed = f"lastBannerKind = {json.dumps(last_banner_kind)};" if last_banner_kind is not None else ""
+    expr = f"""(function() {{
+        const elements = {{}};
+        function makeEl(id) {{
+            const e = {{ style: {{}}, className: '', textContent: '', disabled: false }};
+            elements[id] = e;
+            return e;
+        }}
+        makeEl('bb-start'); makeEl('lifecycle-start'); makeEl('run-start-banner');
+        const real = document.getElementById;
+        document.getElementById = (id) => elements[id] || real(id);
+        {seed}
+        executionActiveRunId = {json.dumps(execution_active_run_id)};
+        updateRunStartAvailability();
+        document.getElementById = real;
+        return {{
+            bbDisabled: elements['bb-start'].disabled,
+            lifecycleDisabled: elements['lifecycle-start'].disabled,
+            bannerDisplay: elements['run-start-banner'].style.display,
+            bannerText: elements['run-start-banner'].textContent,
+            bannerClass: elements['run-start-banner'].className,
+        }};
+    }})()"""
+    return _eval_js(dashboard_script, expr)
+
+
+class TestRunStartAvailability:
+    """Section 6/7 of the concurrency-slot fix: the dashboard must
+    disable New Bug Bounty Run / Run Full Security Lifecycle only while
+    a real execution-active run exists (GET /api/system's real
+    active_bug_bounty_run_id, which no longer includes an
+    awaiting_human_review run), and must show a clear, real-run-id-naming
+    banner while blocked."""
+
+    def test_buttons_disabled_and_banner_shown_when_execution_active(self, dashboard_script):
+        state = _run_start_availability_state(dashboard_script, "RUN-abc123")
+        assert state["bbDisabled"] is True
+        assert state["lifecycleDisabled"] is True
+        assert state["bannerDisplay"] == ""
+        assert "RUN-abc123" in state["bannerText"]
+        assert "currently executing" in state["bannerText"]
+        assert "blocked" in state["bannerClass"]
+
+    def test_buttons_enabled_and_no_blocking_banner_when_no_execution_active(self, dashboard_script):
+        state = _run_start_availability_state(dashboard_script, None)
+        assert state["bbDisabled"] is False
+        assert state["lifecycleDisabled"] is False
+
+    def test_previously_blocked_banner_clears_once_execution_finishes(self, dashboard_script):
+        state = _run_start_availability_state(dashboard_script, None, last_banner_kind="blocked")
+        assert state["bbDisabled"] is False
+        assert state["lifecycleDisabled"] is False
+        assert state["bannerDisplay"] == "none"
+
+    def test_error_banner_helper_produces_visible_unmistakable_message(self, dashboard_script):
+        expr = """(function() {
+            const elements = {};
+            function makeEl(id) { const e = { style: {}, className: '', textContent: '', disabled: false }; elements[id] = e; return e; }
+            makeEl('run-start-banner');
+            const real = document.getElementById;
+            document.getElementById = (id) => elements[id] || real(id);
+            setRunBanner("error", "New run was not started. Another security assessment is currently executing (RUN-xyz789).");
+            document.getElementById = real;
+            return { display: elements['run-start-banner'].style.display, text: elements['run-start-banner'].textContent, cls: elements['run-start-banner'].className };
+        })()"""
+        result = _eval_js(dashboard_script, expr)
+        assert result["display"] == ""
+        assert "New run was not started" in result["text"]
+        assert "RUN-xyz789" in result["text"]
+        assert "error" in result["cls"]
+
+
 class TestAiActivitySummaryLine:
     def test_ai_used_line_no_when_no_ai_invoked(self, dashboard_script):
         run = _lifecycle_run_for_honesty_tests([{
