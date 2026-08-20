@@ -837,6 +837,132 @@ class TestLifecycleRefreshFix:
         assert not any("/api/runs/RUN-test" in c for c in calls)
 
 
+class TestRunRefreshResilience:
+    """Fix for a confirmed production defect: a completed Authorized
+    External Target run (RUN-45c711a47e8d930b0c3d18ee0e392e4c) stayed
+    displayed as running/tool_execution because the dashboard relied
+    entirely on the live SSE stream to learn a run had finished, with no
+    fallback if that stream ever missed/dropped the terminal event
+    (a real risk over a multi-minute multi-tool scan -- network blips, a
+    backgrounded tab, a proxy buffering/killing the long-lived
+    connection). Unlike /api/system (already polled every 15s), the
+    selected run's own authoritative state was never periodically
+    reconciled. pollSelectedRunIfActive() closes that gap, and
+    refreshInFlight prevents it from ever overlapping with an
+    SSE-triggered refresh into a duplicate request storm."""
+
+    def _fetch_calls_for(self, dashboard_script, *, run, setup_js, action_js, settle_ms=50):
+        script = _NODE_STUBS + dashboard_script + f"""
+(async function() {{
+    let calls = [];
+    global.fetch = async (url) => {{
+        calls.push(url);
+        if (String(url).includes('/evaluation')) {{
+            return {{ ok: true, json: async () => ({{ evaluation_state: "evaluated" }}) }};
+        }}
+        return {{ ok: true, json: async () => ({json.dumps(run)}) }};
+    }};
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    calls = [];
+    {setup_js}
+    {action_js}
+    await new Promise((resolve) => setTimeout(resolve, {settle_ms}));
+    console.log(JSON.stringify(calls));
+}})();
+"""
+        return json.loads(_run_node(script))
+
+    def _run_fetches(self, calls):
+        return [c for c in calls if "/api/runs/RUN-test" in c and "/evaluation" not in c]
+
+    def test_external_bug_bounty_completion_refreshes_ui(self, dashboard_script):
+        run = _completed_run(status="completed", current_stage="complete", target_summary="http://dvwa/")
+        calls = self._fetch_calls_for(
+            dashboard_script, run=run,
+            setup_js='currentRunId = "RUN-test";',
+            action_js='handleEvent({event_type: "run_completed", timestamp: "t", source_component: "orchestrator", summary: "x", sanitized_payload: {}});',
+        )
+        assert self._run_fetches(calls)
+
+    def test_demo_bug_bounty_completion_still_refreshes(self, dashboard_script):
+        run = _completed_run(status="completed", current_stage="complete", target_summary="http://localhost:3000")
+        calls = self._fetch_calls_for(
+            dashboard_script, run=run,
+            setup_js='currentRunId = "RUN-test";',
+            action_js='handleEvent({event_type: "run_completed", timestamp: "t", source_component: "orchestrator", summary: "x", sanitized_payload: {}});',
+        )
+        assert self._run_fetches(calls)
+
+    def test_lifecycle_awaiting_human_review_refreshes(self, dashboard_script):
+        run = _completed_run(status="awaiting_human_review", current_stage="human_review")
+        calls = self._fetch_calls_for(
+            dashboard_script, run=run,
+            setup_js='currentRunId = "RUN-test";',
+            action_js='handleEvent({event_type: "human_review_required", timestamp: "t", source_component: "orchestrator", summary: "x", sanitized_payload: {}});',
+        )
+        assert self._run_fetches(calls)
+
+    @pytest.mark.parametrize("status,event_type", [
+        ("failed", "run_failed"), ("blocked", "run_blocked"), ("cancelled", "run_cancelled"),
+    ])
+    def test_failed_blocked_cancelled_refresh(self, dashboard_script, status, event_type):
+        run = _completed_run(status=status, current_stage=status)
+        calls = self._fetch_calls_for(
+            dashboard_script, run=run,
+            setup_js='currentRunId = "RUN-test";',
+            action_js=f'handleEvent({{event_type: {json.dumps(event_type)}, timestamp: "t", source_component: "orchestrator", summary: "x", sanitized_payload: {{}}}});',
+        )
+        assert self._run_fetches(calls)
+
+    def test_missed_sse_recovered_by_bounded_polling(self, dashboard_script):
+        # No event is ever fired here -- only the polling fallback runs,
+        # exactly reproducing the confirmed production scenario: the
+        # backend already shows "completed", the dashboard's last-known
+        # status is still "running", and no SSE message ever arrives.
+        run = _completed_run(status="completed", current_stage="complete", target_summary="http://dvwa/")
+        calls = self._fetch_calls_for(
+            dashboard_script, run=run,
+            setup_js='currentRunId = "RUN-test"; lastKnownRunStatus = "running";',
+            action_js='pollSelectedRunIfActive();',
+        )
+        assert self._run_fetches(calls)
+
+    def test_polling_stops_once_terminal_or_awaiting_review(self, dashboard_script):
+        run = _completed_run(status="completed", current_stage="complete")
+        calls = self._fetch_calls_for(
+            dashboard_script, run=run,
+            setup_js='currentRunId = "RUN-test"; lastKnownRunStatus = "completed";',
+            action_js='pollSelectedRunIfActive();',
+        )
+        assert not self._run_fetches(calls)
+
+    def test_polling_never_replaces_selected_run(self, dashboard_script):
+        run = _completed_run(status="running", current_stage="tool_execution")
+        script = _NODE_STUBS + dashboard_script + f"""
+(async function() {{
+    global.fetch = async (url) => ({{ ok: true, json: async () => ({json.dumps(run)}) }});
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    currentRunId = "RUN-test";
+    lastKnownRunStatus = "running";
+    pollSelectedRunIfActive();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    console.log(JSON.stringify({{ currentRunId }}));
+}})();
+"""
+        result = json.loads(_run_node(script))
+        assert result["currentRunId"] == "RUN-test"
+
+    def test_no_duplicate_refresh_storm(self, dashboard_script):
+        run = _completed_run(status="running", current_stage="tool_execution")
+        calls = self._fetch_calls_for(
+            dashboard_script, run=run,
+            setup_js='currentRunId = "RUN-test"; lastKnownRunStatus = "running";',
+            action_js='refreshSelectedRun(); refreshSelectedRun(); refreshSelectedRun();',
+            settle_ms=80,
+        )
+        assert len(self._run_fetches(calls)) == 1
+
+
 # ---------------------------------------------------------------------------
 # Final Pre-Release Block: explainability features (AI Activity panel,
 # httpx enrichment, Attack Surface human summary, finding CWE/OWASP/

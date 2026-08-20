@@ -1561,10 +1561,30 @@ function handleEvent(event) {
   }
 }
 
+// Real statuses (backend.models.RUN_STATUSES) under which a selected
+// run's state can no longer change on its own -- terminal, plus
+// awaiting_human_review (execution has genuinely finished; only a human
+// decision changes anything further). Anything NOT in this set is
+// treated as still execution-active for polling purposes, deliberately
+// erring toward "poll it" for any future status this list doesn't yet
+// know about, rather than silently going stale.
+const RUN_NON_EXECUTION_STATUSES = new Set(["completed", "failed", "blocked", "cancelled", "awaiting_human_review"]);
+
+let lastKnownRunStatus = null;
+let refreshInFlight = false;
+
 async function refreshSelectedRun() {
   if (!currentRunId) return;
+  // Guards against an SSE-driven call and a polling-driven call landing
+  // at the same moment (e.g. a burst of terminal-adjacent events arriving
+  // right as the bounded poll below also fires) from ever overlapping
+  // into two concurrent /api/runs/{id} fetches -- last-render-wins is
+  // harmless, but firing the same request twice at once never helps.
+  if (refreshInFlight) return;
+  refreshInFlight = true;
   try {
     const run = await api(`/api/runs/${currentRunId}`);
+    lastKnownRunStatus = run.status;
     renderOverview(run);
     renderStatus(run);
     renderPipeline(run);
@@ -1586,6 +1606,24 @@ async function refreshSelectedRun() {
     if (run.report) loadEvaluation(currentRunId);
     else renderEvaluation(null);
   } catch (e) { /* run may have been evicted; ignore */ }
+  finally { refreshInFlight = false; }
+}
+
+// Resilience fallback for a missed SSE event (real risk over a
+// multi-minute multi-tool scan: network blips, a backgrounded browser
+// tab, or a proxy that buffers/kills long-lived connections can all
+// silently drop the terminal event without the dashboard ever finding
+// out). Only polls the ALREADY-selected run -- never changes
+// currentRunId/el("run-select").value itself -- and only while that
+// run's last-known status is still execution-active, so this is a
+// bounded, self-stopping fallback, never a permanent extra poll once a
+// run reaches a terminal/awaiting_human_review state. Works identically
+// for Demo/Authorized External Target and Bug Bounty/Full Lifecycle --
+// it is driven purely by run.status, never by run_type or target.
+function pollSelectedRunIfActive() {
+  if (!currentRunId) return;
+  if (RUN_NON_EXECUTION_STATUSES.has(lastKnownRunStatus)) return;
+  refreshSelectedRun();
 }
 
 function openStream(runId) {
@@ -1605,6 +1643,7 @@ function openStream(runId) {
 
 async function selectRun(runId) {
   currentRunId = runId;
+  lastKnownRunStatus = null;
   feedCount = 0;
   Object.keys(ruleState).forEach(k => delete ruleState[k]);
   lastTi = null;
@@ -1798,6 +1837,7 @@ refreshRunList();
 setInterval(checkHealth, 8000);
 setInterval(refreshRunList, 5000);
 setInterval(loadSystemInfo, 15000);
+setInterval(pollSelectedRunIfActive, 5000);
 </script>
 
 </body>
