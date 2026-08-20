@@ -372,7 +372,7 @@ The current v0.1 interface is **not production-authenticated** — there is no l
 - Structural rule-syntax validation is not detection-efficacy validation.
 - Live validation has been performed primarily on **Windows**, against the local Juice Shop container — see [Cross-Platform Status](#cross-platform-status).
 - Authorized External Target mode's SSRF protection resolves and rejects loopback/link-local/private/reserved destinations before connecting, but does not pin the validated IP for the subsequent connection — a narrow DNS-rebinding race between validation and connect is a known, disclosed limitation (see `adapters/bug_bounty_http.py`), not a claim of full rebinding resistance.
-- No LICENSE file is currently present in this repository — see [License](#license).
+- Not yet externally security-reviewed and not intended for production/multi-user deployment as-is — see [Internal network deployment](#internal-network-deployment) for what's still missing.
 
 ## Repository Structure
 
@@ -422,11 +422,13 @@ Historical pass counts reported in per-block docs (e.g. *"at the Block 15J-K che
 
 ## Current Maturity
 
-**Research prototype / pre-release** (see [`VERSION`](VERSION) — `0.1.0-dev`; this does not yet follow strict release discipline and should not be treated as a stable API contract). ThreatTrace has been developed and live-validated on Windows against local, authorized targets (a local Juice Shop container, a local ZAP container). It has not undergone external security review, has no production authentication, and is not intended for deployment outside a local research/lab environment. See [docs/architecture.md](docs/architecture.md) for the full block-by-block build history and [SECURITY.md](SECURITY.md) for the current security model.
+**ThreatTrace v0.1.0 — research prototype / early release** (see [`VERSION`](VERSION)). This does not yet follow strict release discipline and should not be treated as a stable API contract. ThreatTrace has been developed and live-validated on Windows against local, authorized targets (a local Juice Shop container, a local ZAP container). It has not undergone external security review, has no production authentication, and is not intended for deployment outside a local research/lab environment. See [docs/architecture.md](docs/architecture.md) for the full block-by-block build history and [SECURITY.md](SECURITY.md) for the current security model.
 
 ## License
 
-No LICENSE file currently exists in this repository. A license must be selected before this project is publicly described as "open source" — until one is added, all rights are reserved by default and the terms under which this code may be used, modified, or redistributed are undefined.
+**License: Apache-2.0.** See [`LICENSE`](LICENSE) for the full, unmodified license text. This license covers ThreatTrace's own source code in this repository only — it does not relicense Nmap, Nuclei, ZAP, httpx, Katana, or OWASP Juice Shop, each of which remains under its own upstream project's own license (see [docs/licensing-notes.md](docs/licensing-notes.md) for the full third-party licensing review, including why no `NOTICE` file is included).
+
+Copyright 2026 Roshini Gowda.
 
 ## Responsible-Use Notice
 

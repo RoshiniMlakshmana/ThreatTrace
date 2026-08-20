@@ -1,6 +1,25 @@
 # Licensing Notes
 
-**Status: no `LICENSE` file exists at the repository root.** This is a packaging decision that requires the repository owner's explicit choice — it is deliberately **not** made by this checkpoint. Per this block's own instructions: "DO NOT choose one silently unless prior project context explicitly selected one." No prior project context selected one, so none was added.
+**Status: `LICENSE` (Apache License, Version 2.0, unmodified official text) is present at the repository root as of v0.1.0.** The repository owner explicitly chose Apache-2.0; this was not inferred, defaulted, or chosen automatically by any earlier checkpoint (see the superseded note preserved below for that history).
+
+## NOTICE file: not added, and not currently required
+
+Apache-2.0's NOTICE-propagation obligation (License Section 4(d)) is triggered only when *redistributing* a Work that itself shipped with a NOTICE file — i.e. when this repository vendors/ships someone else's Apache-licensed source as part of its own distribution. That does not happen here:
+
+- `references/atomic-red-team/` and `references/hayabusa-sample-evtx/` are **not tracked by git** (`.gitignore` excludes both under "Third-party repositories") — nothing from either is actually distributed as part of this repository's own history or releases.
+- Nmap, Nuclei, ZAP, httpx, Katana, and OWASP Juice Shop are never vendored as source/binaries inside this git repository. Nuclei/httpx/Katana binaries are downloaded from their own official GitHub releases *during the Docker image build* (see `Dockerfile`); Nmap is installed from the Debian package repository at build time; ZAP and Juice Shop run as their own official, separately-pulled Docker images (`zaproxy/zap-stable`, `bkimminich/juice-shop`) via `docker-compose.yml`. None of their source or binary content is committed to, or distributed from, this repository.
+
+Since no tracked, distributed content in this repository carries an inbound NOTICE obligation, adding a NOTICE file would only manufacture attribution claims this repository has no actual basis for. None was added. If that changes in the future (e.g. vendoring real third-party source directly into the tree), this decision should be revisited.
+
+## Third-party tool licensing stays separate from ThreatTrace's own license
+
+ThreatTrace's Apache-2.0 license covers ThreatTrace's own source code in this repository only. It does not relicense, and must never be read as relicensing, Nmap, Nuclei, ZAP, httpx, Katana, or OWASP Juice Shop — each remains under its own upstream project's own license, unaffected by anything in this repository. See each project's own repository for its actual license terms.
+
+---
+
+*The section below is preserved as historical record of the pre-v0.1.0 checkpoint's own reasoning, before the owner made the Apache-2.0 decision above.*
+
+**Status (superseded): no `LICENSE` file exists at the repository root.** This is a packaging decision that requires the repository owner's explicit choice — it is deliberately **not** made by this checkpoint. Per this block's own instructions: "DO NOT choose one silently unless prior project context explicitly selected one." No prior project context selected one, so none was added.
 
 ## Why this matters before any public/open-source step
 
