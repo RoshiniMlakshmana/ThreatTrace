@@ -9,8 +9,8 @@ This is a **deployment refinement, not a security-boundary change**: every safet
 Prerequisites on the host: **Docker** (with Compose v2, i.e. `docker compose`, not the standalone `docker-compose`) and **Git**. Nothing else.
 
 ```bash
-git clone <repo-url>
-cd Threattrace
+git clone https://github.com/RoshiniMlakshmana/ThreatTrace.git
+cd ThreatTrace
 docker compose up -d --build
 ```
 

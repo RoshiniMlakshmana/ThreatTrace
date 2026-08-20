@@ -36,7 +36,7 @@ Resolution used for this validation: the two known install directories were adde
 
 Investigation began identically to Nmap's (same PATH-only discovery method, same session-PATH absence). However, a second, independent fact was discovered during live validation:
 
-- Early in this session, a direct invocation of the previously-known path (`C:\Users\roshi\AppData\Local\ThreatTrace\tools\nuclei\nuclei.exe -version`) **succeeded**, printing real output: `Nuclei Engine Version: v3.11.1`.
+- Early in this session, a direct invocation of the previously-known path (`<user-profile>\AppData\Local\ThreatTrace\tools\nuclei\nuclei.exe -version`) **succeeded**, printing real output: `Nuclei Engine Version: v3.11.1`.
 - Minutes later, in the same session, the identical direct invocation **failed**: `No such file or directory`. A directory listing and recursive `find` for `nuclei.exe` under that path and its parent both returned **nothing** — the binary itself no longer exists on disk.
 
 **Root cause: the Nuclei binary was genuinely removed from disk between the two checks within this same session.** The most plausible explanation is antivirus/Windows Defender quarantine of a downloaded security-scanner binary — a well-documented behavior for tools like Nuclei that are frequently flagged as "HackTool" — but this was not conclusively confirmed (a best-effort Windows Defender detection-history query returned no output). Regardless of the exact cause, this is **not a ThreatTrace code defect**: `adapters.bug_bounty_nuclei._find_nuclei_executable()` and `runtime.tool_runtime.check_nuclei` are, again, both plain `shutil.which("nuclei")` calls with no divergence, and both correctly and honestly reported the binary's genuine absence once it was gone.

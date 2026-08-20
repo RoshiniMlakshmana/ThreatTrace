@@ -27,7 +27,7 @@ Every stage above is either a deterministic Python module or a real, bounded ext
 **Prerequisites:** [Git](https://git-scm.com/) and [Docker](https://docs.docker.com/get-docker/) (with Compose v2). Nothing else — no Python, Nmap, Nuclei, httpx, Katana, or ZAP install required.
 
 ```bash
-git clone <repo-url>
+git clone https://github.com/RoshiniMlakshmana/ThreatTrace.git
 cd ThreatTrace
 docker compose up -d --build
 ```
@@ -277,8 +277,8 @@ The default, recommended way to run ThreatTrace is **Docker** — no host instal
 **Prerequisites:** [Docker](https://docs.docker.com/get-docker/) (with Compose v2) and Git. Nothing else.
 
 ```bash
-git clone <repo-url>
-cd Threattrace
+git clone https://github.com/RoshiniMlakshmana/ThreatTrace.git
+cd ThreatTrace
 docker compose up -d --build
 ```
 
