@@ -37,7 +37,7 @@ global.document = {
 };
 global.fetch = async () => ({ ok: true, json: async () => ({ runs: [], tools: {}, categories: [] }) });
 global.setInterval = () => {};
-global.EventSource = function () { this.close = () => {}; };
+global.EventSource = function () { this.close = () => {}; this.addEventListener = () => {}; };
 global.alert = () => {};
 global.window = { prompt: () => null };
 global.HTMLElement = class {};
@@ -840,16 +840,19 @@ class TestLifecycleRefreshFix:
 class TestRunRefreshResilience:
     """Fix for a confirmed production defect: a completed Authorized
     External Target run (RUN-45c711a47e8d930b0c3d18ee0e392e4c) stayed
-    displayed as running/tool_execution because the dashboard relied
-    entirely on the live SSE stream to learn a run had finished, with no
-    fallback if that stream ever missed/dropped the terminal event
-    (a real risk over a multi-minute multi-tool scan -- network blips, a
-    backgrounded tab, a proxy buffering/killing the long-lived
-    connection). Unlike /api/system (already polled every 15s), the
-    selected run's own authoritative state was never periodically
-    reconciled. pollSelectedRunIfActive() closes that gap, and
-    refreshInFlight prevents it from ever overlapping with an
-    SSE-triggered refresh into a duplicate request storm."""
+    displayed as running/tool_execution because the dashboard relied on
+    the live SSE stream to learn a run had finished, with only a
+    status-gated polling fallback (pollSelectedRunIfActive, gated on a
+    frontend-cached lastKnownRunStatus). That gate was itself a residual
+    staleness risk: the frontend's cached belief about the run's status
+    could be wrong (a failed fetch that never updated it, a stale value
+    left over from a race), and polling would then silently never
+    correct it. GET /api/runs/{selected_run_id} is now the single,
+    unconditional source of truth -- pollSelectedRun() re-fetches the
+    selected run every 5s regardless of any status the frontend
+    currently believes, and refreshInFlight is the only guard (against
+    overlapping requests, never against re-fetching a "terminal-looking"
+    run)."""
 
     def _fetch_calls_for(self, dashboard_script, *, run, setup_js, action_js, settle_ms=50):
         script = _NODE_STUBS + dashboard_script + f"""
@@ -875,76 +878,96 @@ class TestRunRefreshResilience:
     def _run_fetches(self, calls):
         return [c for c in calls if "/api/runs/RUN-test" in c and "/evaluation" not in c]
 
-    def test_external_bug_bounty_completion_refreshes_ui(self, dashboard_script):
+    # 1: stale running UI + backend completed -> corrects automatically via poll
+    def test_stale_running_ui_corrects_to_completed_via_poll(self, dashboard_script):
         run = _completed_run(status="completed", current_stage="complete", target_summary="http://dvwa/")
         calls = self._fetch_calls_for(
             dashboard_script, run=run,
             setup_js='currentRunId = "RUN-test";',
-            action_js='handleEvent({event_type: "run_completed", timestamp: "t", source_component: "orchestrator", summary: "x", sanitized_payload: {}});',
+            action_js='pollSelectedRun();',
         )
         assert self._run_fetches(calls)
 
-    def test_demo_bug_bounty_completion_still_refreshes(self, dashboard_script):
-        run = _completed_run(status="completed", current_stage="complete", target_summary="http://localhost:3000")
-        calls = self._fetch_calls_for(
-            dashboard_script, run=run,
-            setup_js='currentRunId = "RUN-test";',
-            action_js='handleEvent({event_type: "run_completed", timestamp: "t", source_component: "orchestrator", summary: "x", sanitized_payload: {}});',
-        )
-        assert self._run_fetches(calls)
-
-    def test_lifecycle_awaiting_human_review_refreshes(self, dashboard_script):
+    # 2: stale running UI + backend awaiting_human_review -> corrects via poll
+    def test_stale_running_ui_corrects_to_awaiting_human_review_via_poll(self, dashboard_script):
         run = _completed_run(status="awaiting_human_review", current_stage="human_review")
         calls = self._fetch_calls_for(
             dashboard_script, run=run,
             setup_js='currentRunId = "RUN-test";',
-            action_js='handleEvent({event_type: "human_review_required", timestamp: "t", source_component: "orchestrator", summary: "x", sanitized_payload: {}});',
+            action_js='pollSelectedRun();',
         )
         assert self._run_fetches(calls)
 
-    @pytest.mark.parametrize("status,event_type", [
-        ("failed", "run_failed"), ("blocked", "run_blocked"), ("cancelled", "run_cancelled"),
-    ])
-    def test_failed_blocked_cancelled_refresh(self, dashboard_script, status, event_type):
-        run = _completed_run(status=status, current_stage=status)
-        calls = self._fetch_calls_for(
-            dashboard_script, run=run,
-            setup_js='currentRunId = "RUN-test";',
-            action_js=f'handleEvent({{event_type: {json.dumps(event_type)}, timestamp: "t", source_component: "orchestrator", summary: "x", sanitized_payload: {{}}}});',
-        )
-        assert self._run_fetches(calls)
-
-    def test_missed_sse_recovered_by_bounded_polling(self, dashboard_script):
-        # No event is ever fired here -- only the polling fallback runs,
-        # exactly reproducing the confirmed production scenario: the
-        # backend already shows "completed", the dashboard's last-known
-        # status is still "running", and no SSE message ever arrives.
+    # 3: missed SSE does not matter -- no event is ever fired, only the
+    # unconditional poll runs, reproducing the confirmed production
+    # scenario exactly (backend already "completed", no SSE message ever
+    # arrives to tell the dashboard).
+    def test_missed_sse_does_not_matter(self, dashboard_script):
         run = _completed_run(status="completed", current_stage="complete", target_summary="http://dvwa/")
         calls = self._fetch_calls_for(
             dashboard_script, run=run,
-            setup_js='currentRunId = "RUN-test"; lastKnownRunStatus = "running";',
-            action_js='pollSelectedRunIfActive();',
+            setup_js='currentRunId = "RUN-test";',
+            action_js='pollSelectedRun();',
         )
         assert self._run_fetches(calls)
 
-    def test_polling_stops_once_terminal_or_awaiting_review(self, dashboard_script):
+    # 4: a closed/dead EventSource does not matter -- polling is fully
+    # independent of SSE connection state.
+    def test_closed_eventsource_does_not_matter(self, dashboard_script):
         run = _completed_run(status="completed", current_stage="complete")
         calls = self._fetch_calls_for(
             dashboard_script, run=run,
-            setup_js='currentRunId = "RUN-test"; lastKnownRunStatus = "completed";',
-            action_js='pollSelectedRunIfActive();',
+            setup_js='currentRunId = "RUN-test"; eventSource = null;',
+            action_js='pollSelectedRun();',
         )
-        assert not self._run_fetches(calls)
+        assert self._run_fetches(calls)
 
-    def test_polling_never_replaces_selected_run(self, dashboard_script):
+    # 5: the key architectural change -- a run the UI has ALREADY
+    # observed as terminal continues to be reconciled on every poll
+    # tick, never permanently exempted. Two consecutive, fully-settled
+    # poll calls against an already-completed run must each issue their
+    # own real fetch.
+    def test_terminal_runs_continue_to_be_reconciled(self, dashboard_script):
+        run = _completed_run(status="completed", current_stage="complete")
+        calls = self._fetch_calls_for(
+            dashboard_script, run=run,
+            setup_js='currentRunId = "RUN-test";',
+            action_js='await refreshSelectedRun(); await refreshSelectedRun();',
+            settle_ms=80,
+        )
+        assert len(self._run_fetches(calls)) == 2
+
+    # 6: selecting a run immediately fetches it (pre-existing selectRun
+    # behavior, still true under the new architecture).
+    def test_selection_change_immediately_fetches_selected_run(self, dashboard_script):
+        run = _completed_run(status="running", current_stage="tool_execution")
+        script = _NODE_STUBS + dashboard_script + f"""
+(async function() {{
+    let calls = [];
+    global.fetch = async (url) => {{
+        calls.push(String(url));
+        if (String(url).includes('/events')) {{ return {{ ok: true, json: async () => ({{ events: [] }}) }}; }}
+        return {{ ok: true, json: async () => ({json.dumps(run)}) }};
+    }};
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    calls = [];
+    await selectRun("RUN-test");
+    console.log(JSON.stringify(calls));
+}})();
+"""
+        calls = json.loads(_run_node(script))
+        assert self._run_fetches(calls)
+
+    # 7: old selected run is never replaced automatically -- polling
+    # only ever re-fetches currentRunId, it never mutates it.
+    def test_old_selected_run_never_replaced_automatically(self, dashboard_script):
         run = _completed_run(status="running", current_stage="tool_execution")
         script = _NODE_STUBS + dashboard_script + f"""
 (async function() {{
     global.fetch = async (url) => ({{ ok: true, json: async () => ({json.dumps(run)}) }});
     await new Promise((resolve) => setTimeout(resolve, 0));
     currentRunId = "RUN-test";
-    lastKnownRunStatus = "running";
-    pollSelectedRunIfActive();
+    pollSelectedRun();
     await new Promise((resolve) => setTimeout(resolve, 50));
     console.log(JSON.stringify({{ currentRunId }}));
 }})();
@@ -952,15 +975,68 @@ class TestRunRefreshResilience:
         result = json.loads(_run_node(script))
         assert result["currentRunId"] == "RUN-test"
 
-    def test_no_duplicate_refresh_storm(self, dashboard_script):
+    # 8: refreshInFlight prevents duplicate concurrent requests --
+    # firing three overlapping calls in the same synchronous tick only
+    # issues one real fetch.
+    def test_refresh_in_flight_prevents_duplicate_requests(self, dashboard_script):
         run = _completed_run(status="running", current_stage="tool_execution")
         calls = self._fetch_calls_for(
             dashboard_script, run=run,
-            setup_js='currentRunId = "RUN-test"; lastKnownRunStatus = "running";',
+            setup_js='currentRunId = "RUN-test";',
             action_js='refreshSelectedRun(); refreshSelectedRun(); refreshSelectedRun();',
             settle_ms=80,
         )
         assert len(self._run_fetches(calls)) == 1
+
+    # 9: exactly one polling interval is ever registered for the
+    # selected run (never duplicated if the script were re-evaluated).
+    def test_only_one_polling_interval_registered(self, dashboard_html):
+        assert dashboard_html.count("setInterval(pollSelectedRun,") == 1
+
+    # 10: the manual Refresh button, when present, triggers the same
+    # real authoritative fetch -- UX convenience only, never required
+    # for correctness (the unconditional poll already guarantees it).
+    def test_manual_refresh_button_wired_and_functional(self, dashboard_html, dashboard_script):
+        assert 'id="manual-refresh"' in dashboard_html
+        assert 'el("manual-refresh").addEventListener("click"' in dashboard_html
+
+        run = _completed_run(status="completed", current_stage="complete")
+        calls = self._fetch_calls_for(
+            dashboard_script, run=run,
+            setup_js='currentRunId = "RUN-test";',
+            action_js='refreshSelectedRun();',  # what the manual-refresh click handler invokes
+        )
+        assert self._run_fetches(calls)
+
+    # 11: SSE still provides faster updates when available -- a
+    # terminal/lifecycle event still triggers an immediate refresh
+    # rather than waiting for the next 5s poll tick.
+    @pytest.mark.parametrize("event_type", ["run_completed", "run_failed", "run_blocked", "run_cancelled", "human_review_required"])
+    def test_sse_still_provides_faster_updates_when_available(self, dashboard_script, event_type):
+        run = _completed_run(status="completed", current_stage="complete", target_summary="http://dvwa/")
+        calls = self._fetch_calls_for(
+            dashboard_script, run=run,
+            setup_js='currentRunId = "RUN-test";',
+            action_js=f'handleEvent({{event_type: {json.dumps(event_type)}, timestamp: "t", source_component: "orchestrator", summary: "x", sanitized_payload: {{}}}});',
+        )
+        assert self._run_fetches(calls)
+
+    def test_last_synced_indicator_updates_after_refresh(self, dashboard_script):
+        run = _completed_run(status="completed", current_stage="complete")
+        expr = f"""(function() {{
+            const elements = {{}};
+            function makeEl(id) {{ const e = {{ style: {{}}, className: '', textContent: '', innerHTML: '', disabled: false }}; elements[id] = e; return e; }}
+            makeEl('last-synced');
+            const real = document.getElementById;
+            document.getElementById = (id) => elements[id] || real(id);
+            lastSyncedAt = new Date();
+            renderLastSynced();
+            document.getElementById = real;
+            return elements['last-synced'].textContent;
+        }})()"""
+        text = _eval_js(dashboard_script, expr)
+        assert text.startswith("Last synced: ")
+        assert text != "Last synced: never"
 
 
 # ---------------------------------------------------------------------------

@@ -159,6 +159,10 @@
 
   <section class="card" id="card-status">
     <h2>A. System Status</h2>
+    <div class="surface-note" style="display:flex;align-items:center;gap:8px;margin:0 0 8px">
+      <span id="last-synced">Last synced: never</span>
+      <button id="manual-refresh" type="button">Refresh</button>
+    </div>
     <div id="status-body" class="empty">No active run.</div>
   </section>
 
@@ -1561,30 +1565,48 @@ function handleEvent(event) {
   }
 }
 
-// Real statuses (backend.models.RUN_STATUSES) under which a selected
-// run's state can no longer change on its own -- terminal, plus
-// awaiting_human_review (execution has genuinely finished; only a human
-// decision changes anything further). Anything NOT in this set is
-// treated as still execution-active for polling purposes, deliberately
-// erring toward "poll it" for any future status this list doesn't yet
-// know about, rather than silently going stale.
-const RUN_NON_EXECUTION_STATUSES = new Set(["completed", "failed", "blocked", "cancelled", "awaiting_human_review"]);
-
-let lastKnownRunStatus = null;
+// GET /api/runs/{selected_run_id} is the single source of truth for the
+// selected run's displayed state. Correctness must never depend on
+// receiving an SSE event -- SSE (handleEvent -> refreshSelectedRun) is
+// purely a low-latency optimization on top of this. The previous design
+// gated polling on the frontend's own cached lastKnownRunStatus (skipping
+// once it looked terminal); that reintroduced exactly the class of bug
+// this design replaces, because the frontend's cached belief about the
+// run's state can itself be stale (a failed fetch that never updated it,
+// a race with a previous selection, or simply the one event that would
+// have corrected it never arriving). Polling below is now unconditional
+// on any frontend-held status -- the backend response is authoritative
+// every single time, including for a run the UI currently believes is
+// completed/failed/blocked/cancelled/awaiting_human_review.
 let refreshInFlight = false;
+let lastSyncedAt = null;
+
+function _formatSyncedTime(date) {
+  const hh = String(date.getHours()).padStart(2, "0");
+  const mm = String(date.getMinutes()).padStart(2, "0");
+  const ss = String(date.getSeconds()).padStart(2, "0");
+  return `${hh}:${mm}:${ss}`;
+}
+
+function renderLastSynced() {
+  const indicator = el("last-synced");
+  indicator.textContent = lastSyncedAt ? `Last synced: ${_formatSyncedTime(lastSyncedAt)}` : "Last synced: never";
+}
 
 async function refreshSelectedRun() {
   if (!currentRunId) return;
-  // Guards against an SSE-driven call and a polling-driven call landing
-  // at the same moment (e.g. a burst of terminal-adjacent events arriving
-  // right as the bounded poll below also fires) from ever overlapping
-  // into two concurrent /api/runs/{id} fetches -- last-render-wins is
-  // harmless, but firing the same request twice at once never helps.
+  // Single in-flight guard: at most one selected-run fetch outstanding
+  // at a time. SSE-triggered calls, the unconditional 5s poll, manual
+  // Refresh clicks, and selection changes all funnel through this same
+  // function and therefore all share this one guard -- an SSE-triggered
+  // refresh landing while the poll is already mid-flight (or vice versa)
+  // simply no-ops rather than firing a second concurrent request.
   if (refreshInFlight) return;
   refreshInFlight = true;
   try {
     const run = await api(`/api/runs/${currentRunId}`);
-    lastKnownRunStatus = run.status;
+    lastSyncedAt = new Date();
+    renderLastSynced();
     renderOverview(run);
     renderStatus(run);
     renderPipeline(run);
@@ -1609,20 +1631,12 @@ async function refreshSelectedRun() {
   finally { refreshInFlight = false; }
 }
 
-// Resilience fallback for a missed SSE event (real risk over a
-// multi-minute multi-tool scan: network blips, a backgrounded browser
-// tab, or a proxy that buffers/kills long-lived connections can all
-// silently drop the terminal event without the dashboard ever finding
-// out). Only polls the ALREADY-selected run -- never changes
-// currentRunId/el("run-select").value itself -- and only while that
-// run's last-known status is still execution-active, so this is a
-// bounded, self-stopping fallback, never a permanent extra poll once a
-// run reaches a terminal/awaiting_human_review state. Works identically
-// for Demo/Authorized External Target and Bug Bounty/Full Lifecycle --
-// it is driven purely by run.status, never by run_type or target.
-function pollSelectedRunIfActive() {
+// Unconditional authoritative poll -- called every 5s regardless of
+// what the frontend currently believes the selected run's status is
+// (see comment above refreshInFlight). Never switches currentRunId;
+// only ever re-fetches whichever run is already selected.
+function pollSelectedRun() {
   if (!currentRunId) return;
-  if (RUN_NON_EXECUTION_STATUSES.has(lastKnownRunStatus)) return;
   refreshSelectedRun();
 }
 
@@ -1643,7 +1657,8 @@ function openStream(runId) {
 
 async function selectRun(runId) {
   currentRunId = runId;
-  lastKnownRunStatus = null;
+  lastSyncedAt = null;
+  renderLastSynced();
   feedCount = 0;
   Object.keys(ruleState).forEach(k => delete ruleState[k]);
   lastTi = null;
@@ -1819,6 +1834,11 @@ el("cancel-run").addEventListener("click", async () => {
   catch (e) { alert("Could not cancel: " + (e.body ? e.body.message : e.message)); }
 });
 
+// UX only -- manual immediate sync. Correctness never depends on this
+// being clicked; the unconditional 5s poll already guarantees the same
+// authoritative refresh on its own.
+el("manual-refresh").addEventListener("click", () => { refreshSelectedRun(); });
+
 async function loadSystemInfo() {
   try {
     const sys = await api("/api/system");
@@ -1831,13 +1851,14 @@ async function loadSystemInfo() {
 }
 
 renderOverview(null); renderStatus(null); renderPipeline(null); renderTools(null); renderFindings(null); renderDetection(null); renderTi(null); renderAttackSurface(null); renderHttpEnrichment(null); renderLifecycle(null); renderAiActivity(null);
+renderLastSynced();
 checkHealth();
 loadSystemInfo();
 refreshRunList();
 setInterval(checkHealth, 8000);
 setInterval(refreshRunList, 5000);
 setInterval(loadSystemInfo, 15000);
-setInterval(pollSelectedRunIfActive, 5000);
+setInterval(pollSelectedRun, 5000);
 </script>
 
 </body>
